@@ -251,9 +251,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        # Reset model caches for partial-frame update
-        if hasattr(self, 'model') and hasattr(self.model, 'reset_cache'):
-            self.model.reset_cache()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -574,24 +571,6 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
-        # Experimental: cache for patch embeddings (center-patch partial update)
-        self._frame_counter = 0
-        self._cached_img_embs = {}  # Dict[int, Tensor] - cached embeddings per image index
-
-    def reset_cache(self):
-        """Reset cached embeddings. Should be called when the environment resets."""
-        self._frame_counter = 0
-        self._cached_img_embs = {}
-        # Also reset VLM KV cache
-        self.vlm_with_expert._prefix_kv_cache = {
-            "past_key_values": None,
-            "prefix_pad_masks": None,
-            "position_ids": None,
-            "batch_size": None,
-            "device": None,
-            "frame_counter": 0,
-        }
-
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
@@ -615,79 +594,15 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def _merge_center_outer_patches(
-        self, new_emb: "torch.Tensor", cached_emb: "torch.Tensor", center_ratio: float
-    ) -> "torch.Tensor":
-        """Merge center patches from new_emb with outer patches from cached_emb.
-        
-        Uses Straight-Through Estimator (STE): forward pass uses cached values for outer
-        patches, but gradients flow through to new_emb for all patches.
-        
-        Args:
-            new_emb: New embeddings from current frame, shape (B, num_patches, hidden_dim)
-            cached_emb: Cached embeddings from previous frame, same shape
-            center_ratio: Fraction of patches (by area) to take from center. 
-                         E.g., 0.5 means center sqrt(0.5) ≈ 0.707 of each side.
-        
-        Returns:
-            Merged embeddings with center from new, outer from cached (with STE gradient).
-        """
-        bsize, num_patches, hidden_dim = new_emb.shape
-        
-        # Calculate patch grid dimensions (assuming square grid)
-        patches_per_side = int(round(num_patches ** 0.5))
-        if patches_per_side * patches_per_side != num_patches:
-            # Non-square patch grid, fall back to full update
-            return new_emb
-        
-        # Calculate center region size based on center_ratio (area ratio)
-        # center_ratio = (center_side / patches_per_side)^2
-        # So center_side = patches_per_side * sqrt(center_ratio)
-        center_side = int(patches_per_side * (center_ratio ** 0.5))
-        center_side = max(1, min(center_side, patches_per_side))  # Clamp to valid range
-        
-        # Calculate offset to center the region
-        offset = (patches_per_side - center_side) // 2
-        
-        # Build mask: True for center patches, False for outer patches
-        center_mask = torch.zeros(num_patches, dtype=torch.bool, device=new_emb.device)
-        for row in range(offset, offset + center_side):
-            for col in range(offset, offset + center_side):
-                idx = row * patches_per_side + col
-                center_mask[idx] = True
-        
-        # Expand mask to match embedding shape: (1, num_patches, 1)
-        center_mask = center_mask.view(1, num_patches, 1)
-        
-        # STE: forward uses cached for outer, but gradient flows through new_emb
-        # merged = center_mask * new_emb + ~center_mask * cached_emb  (no gradient to outer)
-        # With STE: merged = new_emb + (~center_mask * (cached_emb - new_emb)).detach()
-        # This way: forward = center uses new, outer uses cached
-        #           backward = gradient flows entirely to new_emb
-        outer_diff = (cached_emb - new_emb).detach()  # detach the difference
-        merged = new_emb + (~center_mask) * outer_diff
-        
-        return merged
-
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: "torch.Tensor" = None
-    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
-        
-        Experimental: When center_patch_ratio < 1.0 and we have cached embeddings,
-        only recompute embeddings for the center region of the image patches,
-        and reuse cached embeddings for the outer region.
         """
         embs = []
         pad_masks = []
         att_masks = []
-        
-        # Determine if this is a full update frame
-        full_update_interval = self.config.full_update_interval
-        is_full_update = (self._frame_counter % full_update_interval == 0) if full_update_interval > 0 else True
-        center_patch_ratio = self.config.center_patch_ratio
-        
         for _img_idx, (
             img,
             img_mask,
@@ -707,28 +622,8 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            # Get image embedding (with optional center-patch caching)
-            img_emb_new = self.vlm_with_expert.embed_image(img)
-            
-            # Apply center-patch caching logic
-            cached_emb = self._cached_img_embs.get(_img_idx)
-            use_caching = center_patch_ratio < 1.0  # Only cache when partial update is enabled
-            
-            if not use_caching:
-                # No caching: use new embeddings directly (equivalent to original code)
-                img_emb = img_emb_new
-            elif is_full_update or cached_emb is None:
-                # Full update frame or first frame: use all new embeddings
-                img_emb = img_emb_new
-                self._cached_img_embs[_img_idx] = img_emb_new.detach().clone()
-            else:
-                # Partial update: merge center (new) + outer (cached)
-                img_emb = self._merge_center_outer_patches(
-                    new_emb=img_emb_new,
-                    cached_emb=cached_emb,
-                    center_ratio=center_patch_ratio,
-                )
-                self._cached_img_embs[_img_idx] = img_emb.detach().clone()
+            img_emb = self.vlm_with_expert.embed_image(img)
+            img_emb = img_emb
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -942,9 +837,6 @@ class VLAFlowMatching(nn.Module):
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
-        # Increment frame counter for next call
-        self._frame_counter += 1
 
         return x_t
 

@@ -244,6 +244,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
 @dataclass
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
+    task_ids: list[int] | None = None  # optional: restrict to specific task indices (e.g., [0, 3] for tasks 0 and 3)
     fps: int = 30
     episode_length: int | None = None
     obs_type: str = "pixels_agent_pos"
@@ -325,6 +326,7 @@ class LiberoEnv(EnvConfig):
         return {
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
+            "task_ids": self.task_ids,
         }
 
 
