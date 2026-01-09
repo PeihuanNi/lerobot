@@ -20,9 +20,9 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForImageTextToText,
-    AutoProcessor
+    AutoProcessor,
+    SmolVLMForConditionalGeneration,
 )
-from src.lerobot.policies.smolvla.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
