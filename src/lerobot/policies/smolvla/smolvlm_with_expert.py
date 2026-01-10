@@ -233,7 +233,18 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.train_expert_only:
             self.vlm.eval()
 
-    def embed_image(self, image: torch.Tensor):
+    def reset_vision_cache(self):
+        vision_model = self.get_vlm_model().vision_model
+        if hasattr(vision_model, "reset_partial_update_cache"):
+            vision_model.reset_partial_update_cache()
+
+    def embed_image(
+        self,
+        image: torch.Tensor,
+        center_patch_ratio: float | None = None,
+        force_full_update: bool = False,
+        cache_key: int | None = None,
+    ):
         patch_attention_mask = None
         # Get sequence from the vision encoder
         image_hidden_states = (
@@ -241,6 +252,9 @@ class SmolVLMWithExpertModel(nn.Module):
             .vision_model(
                 pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
                 patch_attention_mask=patch_attention_mask,
+                center_patch_ratio=center_patch_ratio,
+                force_full_update=force_full_update,
+                cache_key=cache_key if cache_key is not None else 0,
             )
             .last_hidden_state
         )

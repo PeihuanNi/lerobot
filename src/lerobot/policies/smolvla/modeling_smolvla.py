@@ -574,14 +574,14 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
-        # Experimental: cache for patch embeddings (center-patch partial update)
+        # Frame counter for partial-update scheduling.
         self._frame_counter = 0
-        self._cached_img_embs = {}  # Dict[int, Tensor] - cached embeddings per image index
 
     def reset_cache(self):
         """Reset cached embeddings. Should be called when the environment resets."""
         self._frame_counter = 0
-        self._cached_img_embs = {}
+        if hasattr(self.vlm_with_expert, "reset_vision_cache"):
+            self.vlm_with_expert.reset_vision_cache()
         # Also reset VLM KV cache
         self.vlm_with_expert._prefix_kv_cache = {
             "past_key_values": None,
@@ -675,9 +675,7 @@ class VLAFlowMatching(nn.Module):
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         
-        Experimental: When center_patch_ratio < 1.0 and we have cached embeddings,
-        only recompute embeddings for the center region of the image patches,
-        and reuse cached embeddings for the outer region.
+        Experimental: allow the vision encoder to reuse cached tokens outside the center region.
         """
         embs = []
         pad_masks = []
@@ -707,28 +705,13 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            # Get image embedding (with optional center-patch caching)
-            img_emb_new = self.vlm_with_expert.embed_image(img)
-            
-            # Apply center-patch caching logic
-            cached_emb = self._cached_img_embs.get(_img_idx)
-            use_caching = center_patch_ratio < 1.0  # Only cache when partial update is enabled
-            
-            if not use_caching:
-                # No caching: use new embeddings directly (equivalent to original code)
-                img_emb = img_emb_new
-            elif is_full_update or cached_emb is None:
-                # Full update frame or first frame: use all new embeddings
-                img_emb = img_emb_new
-                self._cached_img_embs[_img_idx] = img_emb_new.detach().clone()
-            else:
-                # Partial update: merge center (new) + outer (cached)
-                img_emb = self._merge_center_outer_patches(
-                    new_emb=img_emb_new,
-                    cached_emb=cached_emb,
-                    center_ratio=center_patch_ratio,
-                )
-                self._cached_img_embs[_img_idx] = img_emb.detach().clone()
+            # Get image embedding (vision encoder handles partial updates internally).
+            img_emb = self.vlm_with_expert.embed_image(
+                img,
+                center_patch_ratio=center_patch_ratio,
+                force_full_update=is_full_update,
+                cache_key=_img_idx,
+            )
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
