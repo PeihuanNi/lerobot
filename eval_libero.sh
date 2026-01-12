@@ -1,8 +1,15 @@
-TOKENIZERS_PARALLELISM=false MUJOCO_GL=egl PYOPENGL_PLATFORM=egl lerobot-eval \
+ PYTHONUNBUFFERED=1 PYTHONPATH=/home/nipeihuan/lerobot TOKENIZERS_PARALLELISM=false MUJOCO_GL=egl PYOPENGL_PLATFORM=egl lerobot-eval \
   --policy.path=/home/nipeihuan/lerobot/outputs/train/spatial/checkpoints/last/pretrained_model \
   --policy.n_action_steps=10 \
+  --policy.center_patch_ratio=0.8 \
+  --policy.full_update_interval=5 \
+  --policy.enable_partial_update=true \
+  --policy.reuse_log_interval=0 \
   --env.type=libero \
   --env.task=libero_spatial \
   --env.task_id='[0]' \
   --eval.batch_size=1 \
-  --eval.n_episodes=100
+  --eval.n_episodes=100 \
+  --eval.max_episodes_rendered=100 \
+  --eval.render_reuse_mask=true \
+  --eval.render_reuse_camera=image

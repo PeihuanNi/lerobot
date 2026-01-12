@@ -56,6 +56,12 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Maximum number of episodes to render into videos (0 disables video rendering).
+    max_episodes_rendered: int = 10
+    # Whether to overlay reuse/update masks on rendered videos (debug-only).
+    render_reuse_mask: bool = False
+    # Which camera key to use when overlaying reuse/update masks.
+    render_reuse_camera: str = "image"
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

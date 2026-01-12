@@ -238,11 +238,21 @@ class SmolVLMWithExpertModel(nn.Module):
         if hasattr(vision_model, "reset_partial_update_cache"):
             vision_model.reset_partial_update_cache()
 
+    def get_last_update_mask(self, cache_key: int = 0):
+        vision_model = self.get_vlm_model().vision_model
+        if hasattr(vision_model, "get_last_update_mask"):
+            return vision_model.get_last_update_mask(cache_key)
+        return None
+
     def embed_image(
         self,
         image: torch.Tensor,
         center_patch_ratio: float | None = None,
         force_full_update: bool = False,
+        full_update_interval: int | None = None,
+        enable_partial_update: bool = True,
+        reuse_log_interval: int | None = None,
+        cache_name: str | None = None,
         cache_key: int | None = None,
     ):
         patch_attention_mask = None
@@ -254,6 +264,10 @@ class SmolVLMWithExpertModel(nn.Module):
                 patch_attention_mask=patch_attention_mask,
                 center_patch_ratio=center_patch_ratio,
                 force_full_update=force_full_update,
+                full_update_interval=full_update_interval,
+                enable_partial_update=enable_partial_update,
+                reuse_log_interval=reuse_log_interval,
+                cache_name=cache_name,
                 cache_key=cache_key if cache_key is not None else 0,
             )
             .last_hidden_state

@@ -409,6 +409,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """
         images = []
         img_masks = []
+        img_keys = []
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
@@ -433,6 +434,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
             images.append(img)
             img_masks.append(mask)
+            img_keys.append(key.split(".")[-1])
 
         # Create image features not present in the batch
         # as fully 0 padded images.
@@ -443,6 +445,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
             mask = torch.zeros_like(mask)
             images.append(img)
             img_masks.append(mask)
+            img_keys.append(missing_img_keys[num_empty_cameras].split(".")[-1])
+
+        if hasattr(self, "model"):
+            self.model._last_image_keys = img_keys
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
@@ -680,16 +686,24 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-        
-        # Determine if this is a full update frame
+
         full_update_interval = self.config.full_update_interval
-        is_full_update = (self._frame_counter % full_update_interval == 0) if full_update_interval > 0 else True
         center_patch_ratio = self.config.center_patch_ratio
-        
+        enable_partial_update = self.config.enable_partial_update
+        reuse_log_interval = self.config.reuse_log_interval
+
+        self._last_update_masks = {}
+
+        image_keys = getattr(self, "_last_image_keys", None)
         for _img_idx, (
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
+            image_key = None
+            if image_keys and _img_idx < len(image_keys):
+                image_key = image_keys[_img_idx]
+            else:
+                image_key = f"image{_img_idx}"
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -709,9 +723,15 @@ class VLAFlowMatching(nn.Module):
             img_emb = self.vlm_with_expert.embed_image(
                 img,
                 center_patch_ratio=center_patch_ratio,
-                force_full_update=is_full_update,
+                full_update_interval=full_update_interval,
+                enable_partial_update=enable_partial_update,
+                reuse_log_interval=reuse_log_interval,
+                cache_name=image_key,
                 cache_key=_img_idx,
             )
+            update_mask = self.vlm_with_expert.get_last_update_mask(_img_idx)
+            if update_mask is not None:
+                self._last_update_masks[image_key] = update_mask
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]

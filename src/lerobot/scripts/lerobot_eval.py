@@ -49,6 +49,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import math
 import threading
 import time
 from collections import defaultdict
@@ -68,6 +69,7 @@ import torch
 from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
+from transformers.utils import logging as hf_logging
 
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
@@ -257,6 +259,8 @@ def eval_policy(
     n_episodes: int,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
+    render_reuse_mask: bool = False,
+    render_reuse_camera: str | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
 ) -> dict:
@@ -267,6 +271,8 @@ def eval_policy(
         n_episodes: The number of episodes to evaluate.
         max_episodes_rendered: Maximum number of episodes to render into videos.
         videos_dir: Where to save rendered videos.
+        render_reuse_mask: Whether to overlay reuse/update masks on rendered videos.
+        render_reuse_camera: Camera key to use when overlaying reuse/update masks.
         return_episode_data: Whether to return episode data for online training. Incorporates the data into
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
@@ -297,6 +303,48 @@ def eval_policy(
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
+    def _select_reuse_mask() -> tuple[np.ndarray | None, str | None]:
+        model = getattr(policy, "model", None)
+        if model is None:
+            return None, None
+        mask_dict = getattr(model, "_last_update_masks", None)
+        if not mask_dict:
+            return None, None
+        if render_reuse_camera and render_reuse_camera in mask_dict:
+            return mask_dict[render_reuse_camera], render_reuse_camera
+        # fallback to first available
+        first_key = next(iter(mask_dict))
+        return mask_dict[first_key], first_key
+
+    def _expand_mask_to_frame(mask_grid: np.ndarray, frame_shape: tuple[int, int]) -> np.ndarray:
+        mask_grid = mask_grid.astype(bool)
+        frame_h, frame_w = frame_shape
+        grid_h, grid_w = mask_grid.shape
+        if grid_h == 0 or grid_w == 0:
+            return np.zeros((frame_h, frame_w), dtype=bool)
+        scale_h = int(math.ceil(frame_h / grid_h))
+        scale_w = int(math.ceil(frame_w / grid_w))
+        mask = np.repeat(np.repeat(mask_grid, scale_h, axis=0), scale_w, axis=1)
+        return mask[:frame_h, :frame_w]
+
+    def _overlay_reuse_mask(frames: np.ndarray, masks: np.ndarray) -> np.ndarray:
+        # frames: (t, h, w, c), masks: (t, gh, gw)
+        update_color = np.array([255, 0, 0], dtype=np.float32)
+        reuse_color = np.array([0, 0, 255], dtype=np.float32)
+        update_alpha = 0.1
+        reuse_alpha = 0.1
+
+        out = frames.astype(np.float32).copy()
+        for idx, (frame, mask_grid) in enumerate(zip(out, masks, strict=False)):
+            update_mask = _expand_mask_to_frame(mask_grid, frame.shape[:2])
+            reuse_mask = ~update_mask
+            if update_mask.any():
+                frame[update_mask] = frame[update_mask] * (1.0 - update_alpha) + update_color * update_alpha
+            if reuse_mask.any():
+                frame[reuse_mask] = frame[reuse_mask] * (1.0 - reuse_alpha) + reuse_color * reuse_alpha
+            out[idx] = frame
+        return out.astype(np.uint8)
+
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
@@ -308,6 +356,13 @@ def eval_policy(
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+        if render_reuse_mask:
+            mask, _ = _select_reuse_mask()
+            if mask is None:
+                ep_masks.append(None)
+            else:
+                mask_np = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
+                ep_masks.append(mask_np[:n_to_render_now])
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
@@ -322,6 +377,8 @@ def eval_policy(
         # step.
         if max_episodes_rendered > 0:
             ep_frames: list[np.ndarray] = []
+            if render_reuse_mask:
+                ep_masks: list[np.ndarray | None] = []
 
         if start_seed is None:
             seeds = None
@@ -383,8 +440,11 @@ def eval_policy(
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
-            for stacked_frames, done_index in zip(
-                batch_stacked_frames, done_indices.flatten().tolist(), strict=False
+            batch_stacked_masks = None
+            if render_reuse_mask and ep_masks and all(mask is not None for mask in ep_masks):
+                batch_stacked_masks = np.stack(ep_masks, axis=1)
+            for ep_idx, (stacked_frames, done_index) in enumerate(
+                zip(batch_stacked_frames, done_indices.flatten().tolist(), strict=False)
             ):
                 if n_episodes_rendered >= max_episodes_rendered:
                     break
@@ -392,11 +452,15 @@ def eval_policy(
                 videos_dir.mkdir(parents=True, exist_ok=True)
                 video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
                 video_paths.append(str(video_path))
+                render_frames = stacked_frames[: done_index + 1]  # + 1 to capture the last observation
+                if batch_stacked_masks is not None:
+                    mask_seq = batch_stacked_masks[ep_idx][: done_index + 1]
+                    render_frames = _overlay_reuse_mask(render_frames, mask_seq)
                 thread = threading.Thread(
                     target=write_video,
                     args=(
                         str(video_path),
-                        stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                        render_frames,
                         env.unwrapped.metadata["render_fps"],
                     ),
                 )
@@ -545,8 +609,10 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
+            render_reuse_mask=cfg.eval.render_reuse_mask,
+            render_reuse_camera=cfg.eval.render_reuse_camera,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )
@@ -589,6 +655,8 @@ def eval_one(
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
+    render_reuse_mask: bool,
+    render_reuse_camera: str | None,
     return_episode_data: bool,
     start_seed: int | None,
 ) -> TaskMetrics:
@@ -606,6 +674,8 @@ def eval_one(
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
+        render_reuse_mask=render_reuse_mask,
+        render_reuse_camera=render_reuse_camera,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
@@ -632,6 +702,8 @@ def run_one(
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
+    render_reuse_mask: bool,
+    render_reuse_camera: str | None,
     return_episode_data: bool,
     start_seed: int | None,
 ):
@@ -656,6 +728,8 @@ def run_one(
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
+        render_reuse_mask=render_reuse_mask,
+        render_reuse_camera=render_reuse_camera,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
@@ -676,6 +750,8 @@ def eval_policy_all(
     *,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
+    render_reuse_mask: bool = False,
+    render_reuse_camera: str | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
@@ -732,6 +808,8 @@ def eval_policy_all(
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
+        render_reuse_mask=render_reuse_mask,
+        render_reuse_camera=render_reuse_camera,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
@@ -793,6 +871,9 @@ def eval_policy_all(
 
 def main():
     init_logging()
+    # Route transformers logs to the root logger (console + file), without double handlers.
+    hf_logging.enable_propagation()
+    hf_logging.disable_default_handler()
     register_third_party_plugins()
     eval_main()
 
