@@ -59,6 +59,19 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
 
 
 class SmolVLMWithExpertModel(nn.Module):
+    @staticmethod
+    def _force_attn_implementation(model, attn_impl: str) -> None:
+        if hasattr(model, "set_attn_implementation"):
+            model.set_attn_implementation(attn_impl)
+            return
+        config = getattr(model, "config", None)
+        if config is not None:
+            config._attn_implementation = attn_impl
+            for sub_name in ("vision_config", "text_config"):
+                sub_cfg = getattr(config, sub_name, None)
+                if sub_cfg is not None:
+                    sub_cfg._attn_implementation = attn_impl
+
     def __init__(
         self,
         model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
@@ -81,10 +94,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
             )
+            self._force_attn_implementation(self.vlm, "eager")
             config = self.vlm.config
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
+            self._force_attn_implementation(self.vlm, "eager")
         self.processor = AutoProcessor.from_pretrained(model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
@@ -244,6 +259,18 @@ class SmolVLMWithExpertModel(nn.Module):
             return vision_model.get_last_update_mask(cache_key)
         return None
 
+    def get_last_attn_maps(self, cache_key: int = 0):
+        vision_model = self.get_vlm_model().vision_model
+        if hasattr(vision_model, "get_last_attn_maps"):
+            return vision_model.get_last_attn_maps(cache_key)
+        return None
+
+    def get_last_reuse_analysis(self, cache_key: int = 0):
+        vision_model = self.get_vlm_model().vision_model
+        if hasattr(vision_model, "get_last_reuse_analysis"):
+            return vision_model.get_last_reuse_analysis(cache_key)
+        return None
+
     def embed_image(
         self,
         image: torch.Tensor,
@@ -252,10 +279,14 @@ class SmolVLMWithExpertModel(nn.Module):
         full_update_interval: int | None = None,
         enable_partial_update: bool = True,
         reuse_log_interval: int | None = None,
+        record_attn: bool = False,
+        attn_reduce: str | None = None,
         cache_name: str | None = None,
         cache_key: int | None = None,
     ):
         patch_attention_mask = None
+        if attn_reduce is None:
+            attn_reduce = "mean_heads_queries"
         # Get sequence from the vision encoder
         image_hidden_states = (
             self.get_vlm_model()
@@ -267,6 +298,8 @@ class SmolVLMWithExpertModel(nn.Module):
                 full_update_interval=full_update_interval,
                 enable_partial_update=enable_partial_update,
                 reuse_log_interval=reuse_log_interval,
+                record_attn=record_attn,
+                attn_reduce=attn_reduce,
                 cache_name=cache_name,
                 cache_key=cache_key if cache_key is not None else 0,
             )

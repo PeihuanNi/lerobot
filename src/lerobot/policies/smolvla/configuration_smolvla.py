@@ -107,12 +107,16 @@ class SmolVLAConfig(PreTrainedConfig):
     rtc_config: RTCConfig | None = None
     # Frame-level partial update settings (experimental)
     # Fraction of patches (center square) to fully update each frame. 0.5 means center half of patches per side.
-    center_patch_ratio: float = 0.85
+    center_patch_ratio: float = 0.7
     # Perform a full update of all tokens every `full_update_interval` frames. Set to 1 to always full-update.
-    full_update_interval: int = 5
+    full_update_interval: int = 2
     enable_partial_update: bool = True
     # Log reuse statistics every N frames. Set to 0 to disable.
-    reuse_log_interval: int = 10
+    reuse_log_interval: int = 0
+    # Record per-layer attention maps from the vision encoder (debug-only).
+    record_attn: bool = False
+    # Reduction strategy for attention weights: none, mean_heads, mean_heads_queries.
+    attn_reduce: str = "mean_heads_queries"
 
     def __post_init__(self):
         super().__post_init__()

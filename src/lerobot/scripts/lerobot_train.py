@@ -462,6 +462,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         max_episodes_rendered=cfg.eval.max_episodes_rendered,
                         render_reuse_mask=cfg.eval.render_reuse_mask,
                         render_reuse_camera=cfg.eval.render_reuse_camera,
+                        save_attn_maps=cfg.eval.save_attn_maps,
+                        attn_save_interval=cfg.eval.attn_save_interval,
+                        attn_camera=cfg.eval.attn_camera,
+                        render_attn_heatmap=cfg.eval.render_attn_heatmap,
+                        attn_heatmap_layer=cfg.eval.attn_heatmap_layer,
+                        attn_heatmap_alpha=cfg.eval.attn_heatmap_alpha,
+                        attn_dir=cfg.output_dir / "eval" / f"attn_step_{step_id}",
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
                     )

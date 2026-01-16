@@ -311,12 +311,13 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
+        output_attentions: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, _ = self.self_attn(
+        hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             **kwargs,
@@ -328,12 +329,15 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        if output_attentions:
+            return hidden_states, attn_weights
         return hidden_states
 
     def forward_with_kv(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
+        output_attentions: bool = False,
     ) -> tuple[torch.FloatTensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -354,7 +358,7 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         if self.self_attn.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.self_attn.config._attn_implementation]
 
-        attn_output, _ = attention_interface(
+        attn_output, attn_weights = attention_interface(
             self.self_attn,
             queries,
             keys,
@@ -374,6 +378,8 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        if output_attentions:
+            return hidden_states, keys, values, attn_weights
         return hidden_states, keys, values
 
     def forward_partial(
@@ -385,8 +391,11 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         cached_output: torch.Tensor,
         cached_key_states: torch.Tensor,
         cached_value_states: torch.Tensor,
+        output_attentions: bool = False,
     ) -> tuple[torch.FloatTensor, torch.Tensor, torch.Tensor]:
         if update_indices.numel() == 0:
+            if output_attentions:
+                return cached_output, cached_key_states, cached_value_states, None
             return cached_output, cached_key_states, cached_value_states
 
         residual = hidden_states
@@ -410,7 +419,7 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
         value_states[:, :, update_indices, :] = values
 
         attn_mask = attention_mask_updated if attention_mask is not None else None
-        attn_output, _ = eager_attention_forward(
+        attn_output, attn_weights = eager_attention_forward(
             self.self_attn,
             queries,
             key_states,
@@ -428,6 +437,8 @@ class SmolVLMEncoderLayer(GradientCheckpointingLayer):
 
         outputs = cached_output.clone()
         outputs[:, update_indices, :] = updated
+        if output_attentions:
+            return outputs, key_states, value_states, attn_weights
         return outputs, key_states, value_states
 
 
@@ -449,6 +460,7 @@ class SmolVLMEncoder(nn.Module):
         attention_mask_updated: Optional[torch.Tensor] = None,
         return_layer_outputs: bool = False,
         return_kv_cache: bool = False,
+        return_attn_weights: bool = False,
     ) -> Union[tuple, BaseModelOutput]:
         """
         Args:
@@ -470,24 +482,45 @@ class SmolVLMEncoder(nn.Module):
                 Whether to return per-layer hidden states for caching.
             return_kv_cache (`bool`, *optional*, defaults to `False`):
                 Whether to return per-layer key/value tensors for caching.
+            return_attn_weights (`bool`, *optional*, defaults to `False`):
+                Whether to return per-layer attention weight tensors.
         """
         hidden_states = inputs_embeds
         layer_outputs = [] if return_layer_outputs else None
         kv_cache = [] if return_kv_cache else None
+        attn_weights_list = [] if return_attn_weights else None
 
         if update_mask is None or cache is None:
             for encoder_layer in self.layers:
                 if return_kv_cache:
-                    hidden_states, key_states, value_states = encoder_layer.forward_with_kv(
-                        hidden_states,
-                        attention_mask,
-                    )
+                    if return_attn_weights:
+                        hidden_states, key_states, value_states, attn_weights = encoder_layer.forward_with_kv(
+                            hidden_states,
+                            attention_mask,
+                            output_attentions=True,
+                        )
+                        attn_weights_list.append(attn_weights)
+                    else:
+                        hidden_states, key_states, value_states = encoder_layer.forward_with_kv(
+                            hidden_states,
+                            attention_mask,
+                        )
                     kv_cache.append((key_states, value_states))
                 else:
-                    hidden_states = encoder_layer(hidden_states, attention_mask)
+                    if return_attn_weights:
+                        hidden_states, attn_weights = encoder_layer(
+                            hidden_states,
+                            attention_mask,
+                            output_attentions=True,
+                        )
+                        attn_weights_list.append(attn_weights)
+                    else:
+                        hidden_states = encoder_layer(hidden_states, attention_mask)
                 if return_layer_outputs:
                     layer_outputs.append(hidden_states)
             output = BaseModelOutput(last_hidden_state=hidden_states)
+            if return_attn_weights:
+                return output, layer_outputs, kv_cache, attn_weights_list
             if return_layer_outputs or return_kv_cache:
                 return output, layer_outputs, kv_cache
             return output
@@ -495,12 +528,28 @@ class SmolVLMEncoder(nn.Module):
         if use_ste:
             for layer_idx, encoder_layer in enumerate(self.layers):
                 if return_kv_cache:
-                    new_hidden_states, key_states, value_states = encoder_layer.forward_with_kv(
-                        hidden_states,
-                        attention_mask,
-                    )
+                    if return_attn_weights:
+                        new_hidden_states, key_states, value_states, attn_weights = encoder_layer.forward_with_kv(
+                            hidden_states,
+                            attention_mask,
+                            output_attentions=True,
+                        )
+                        attn_weights_list.append(attn_weights)
+                    else:
+                        new_hidden_states, key_states, value_states = encoder_layer.forward_with_kv(
+                            hidden_states,
+                            attention_mask,
+                        )
                 else:
-                    new_hidden_states = encoder_layer(hidden_states, attention_mask)
+                    if return_attn_weights:
+                        new_hidden_states, attn_weights = encoder_layer(
+                            hidden_states,
+                            attention_mask,
+                            output_attentions=True,
+                        )
+                        attn_weights_list.append(attn_weights)
+                    else:
+                        new_hidden_states = encoder_layer(hidden_states, attention_mask)
                 cached_output = cache["layer_outputs"][layer_idx]
                 hidden_states = merge_with_cache(new_hidden_states, cached_output, update_mask, use_ste=True)
                 if return_layer_outputs:
@@ -512,6 +561,8 @@ class SmolVLMEncoder(nn.Module):
                     value_states = merge_kv_with_cache(value_states, cached_value_states, update_mask, use_ste=True)
                     kv_cache.append((key_states, value_states))
             output = BaseModelOutput(last_hidden_state=hidden_states)
+            if return_attn_weights:
+                return output, layer_outputs, kv_cache, attn_weights_list
             if return_layer_outputs or return_kv_cache:
                 return output, layer_outputs, kv_cache
             return output
@@ -520,21 +571,36 @@ class SmolVLMEncoder(nn.Module):
             cached_output = cache["layer_outputs"][layer_idx]
             cached_key_states = cache["key_states"][layer_idx]
             cached_value_states = cache["value_states"][layer_idx]
-            hidden_states, key_states, value_states = encoder_layer.forward_partial(
-                hidden_states,
-                attention_mask,
-                update_indices,
-                attention_mask_updated,
-                cached_output,
-                cached_key_states,
-                cached_value_states,
-            )
+            if return_attn_weights:
+                hidden_states, key_states, value_states, attn_weights = encoder_layer.forward_partial(
+                    hidden_states,
+                    attention_mask,
+                    update_indices,
+                    attention_mask_updated,
+                    cached_output,
+                    cached_key_states,
+                    cached_value_states,
+                    output_attentions=True,
+                )
+                attn_weights_list.append(attn_weights)
+            else:
+                hidden_states, key_states, value_states = encoder_layer.forward_partial(
+                    hidden_states,
+                    attention_mask,
+                    update_indices,
+                    attention_mask_updated,
+                    cached_output,
+                    cached_key_states,
+                    cached_value_states,
+                )
             if return_layer_outputs:
                 layer_outputs.append(hidden_states)
             if return_kv_cache:
                 kv_cache.append((key_states, value_states))
 
         output = BaseModelOutput(last_hidden_state=hidden_states)
+        if return_attn_weights:
+            return output, layer_outputs, kv_cache, attn_weights_list
         if return_layer_outputs or return_kv_cache:
             return output, layer_outputs, kv_cache
         return output
@@ -579,6 +645,29 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
         if cache is None:
             return None
         return cache.get("last_update_mask_grid")
+
+    def get_last_attn_maps(self, cache_key: int = 0):
+        cache = self._partial_update_cache.get(cache_key)
+        if cache is None:
+            return None
+        return cache.get("last_attn_maps")
+
+    def get_last_reuse_analysis(self, cache_key: int = 0):
+        cache = self._partial_update_cache.get(cache_key)
+        if cache is None:
+            return None
+        return cache.get("last_reuse_analysis")
+
+    def _reduce_attn_maps(self, attn_weights, attn_reduce: str):
+        if attn_weights is None:
+            return None
+        if attn_reduce == "none":
+            return attn_weights
+        if attn_reduce == "mean_heads":
+            return attn_weights.mean(dim=1)
+        if attn_reduce == "mean_heads_queries":
+            return attn_weights.mean(dim=1).mean(dim=1)
+        raise ValueError(f"Unknown attn_reduce={attn_reduce}")
 
     def _compute_center_update_mask(
         self, patch_attention_mask: torch.BoolTensor, center_patch_ratio: float
@@ -646,6 +735,8 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
         force_full_update = kwargs.pop("force_full_update", False)
         enable_partial_update = kwargs.pop("enable_partial_update", True)
         reuse_log_interval = kwargs.pop("reuse_log_interval", 10)
+        record_attn = kwargs.pop("record_attn", False)
+        attn_reduce = kwargs.pop("attn_reduce", "mean_heads_queries")
         cache_key = kwargs.pop("cache_key", 0)
         if cache_key is None:
             cache_key = 0
@@ -706,12 +797,13 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
 
         cache = self._partial_update_cache.get(cache_key) if use_partial_update else None
         frame_counter = cache.get("frame_counter", 0) if cache is not None else 0
+        last_full_frame = cache.get("last_full_frame", 0) if cache is not None else 0
         if use_partial_update:
             frame_counter += 1
         scheduled_full_update = (
             full_update_interval is not None
             and full_update_interval > 0
-            and frame_counter % full_update_interval == 0
+            and (frame_counter - last_full_frame) >= full_update_interval
         )
 
         num_patches = patch_attention_mask.shape[1]
@@ -836,46 +928,236 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
         else:
             attention_mask_full = patch_attention_mask
 
+        def _build_attn_maps(attn_weights_list):
+            if not attn_weights_list:
+                return None
+            num_tokens = patch_attention_mask.shape[1]
+            update_indices_cpu = (
+                update_indices.detach().to("cpu") if update_indices is not None else None
+            )
+            cached_attn_maps = cache.get("last_attn_maps") if cache is not None else None
+            attn_maps = []
+            for layer_idx, attn_weights in enumerate(attn_weights_list):
+                if attn_weights is None:
+                    attn_maps.append(None)
+                    continue
+                reduced = self._reduce_attn_maps(attn_weights, attn_reduce)
+                if reduced is None:
+                    attn_maps.append(None)
+                    continue
+                reduced_cpu = reduced.detach().to("cpu")
+                if attn_reduce == "mean_heads":
+                    if reduced_cpu.dim() == 3 and reduced_cpu.shape[1] != num_tokens:
+                        full_map = None
+                        if cached_attn_maps is not None and layer_idx < len(cached_attn_maps):
+                            cached_layer = cached_attn_maps[layer_idx]
+                            if cached_layer is not None:
+                                if torch.is_tensor(cached_layer):
+                                    cached_layer = cached_layer.detach().to("cpu")
+                                else:
+                                    cached_layer = torch.as_tensor(cached_layer)
+                                if cached_layer.shape == (batch_size, num_tokens, num_tokens):
+                                    full_map = cached_layer.clone()
+                        if full_map is None:
+                            full_map = torch.zeros(
+                                (batch_size, num_tokens, num_tokens),
+                                dtype=reduced_cpu.dtype,
+                            )
+                        if update_indices_cpu is not None:
+                            full_map[:, update_indices_cpu, :] = reduced_cpu
+                        reduced_cpu = full_map
+                elif attn_reduce == "mean_heads_queries":
+                    if reduced_cpu.dim() == 2 and reduced_cpu.shape[-1] == num_tokens:
+                        reduced_cpu = reduced_cpu.view(
+                            batch_size,
+                            patch_attention_mask_grid.shape[1],
+                            patch_attention_mask_grid.shape[2],
+                        )
+                attn_maps.append(reduced_cpu)
+            return attn_maps
+
         render_update_mask_grid = None
         if use_partial_update:
             if full_update:
                 render_update_mask_grid = torch.ones_like(patch_attention_mask_grid, dtype=torch.bool)
-                encoder_outputs, layer_outputs, kv_cache = self.encoder(
-                    inputs_embeds=hidden_states,
-                    attention_mask=attention_mask_full,
-                    return_layer_outputs=True,
-                    return_kv_cache=True,
-                )
+                if record_attn:
+                    encoder_outputs, layer_outputs, kv_cache, attn_weights_list = self.encoder(
+                        inputs_embeds=hidden_states,
+                        attention_mask=attention_mask_full,
+                        return_layer_outputs=True,
+                        return_kv_cache=True,
+                        return_attn_weights=True,
+                    )
+                else:
+                    encoder_outputs, layer_outputs, kv_cache = self.encoder(
+                        inputs_embeds=hidden_states,
+                        attention_mask=attention_mask_full,
+                        return_layer_outputs=True,
+                        return_kv_cache=True,
+                    )
+                    attn_weights_list = None
             else:
                 render_update_mask_grid = update_mask.view(
                     batch_size, patch_attention_mask_grid.shape[1], patch_attention_mask_grid.shape[2]
                 )
                 if use_ste:
-                    encoder_outputs, layer_outputs, kv_cache = self.encoder(
-                        inputs_embeds=hidden_states,
-                        attention_mask=attention_mask_full,
-                        update_mask=update_mask,
-                        cache=cache,
-                        use_ste=True,
-                        return_layer_outputs=True,
-                        return_kv_cache=True,
-                    )
+                    if record_attn:
+                        encoder_outputs, layer_outputs, kv_cache, attn_weights_list = self.encoder(
+                            inputs_embeds=hidden_states,
+                            attention_mask=attention_mask_full,
+                            update_mask=update_mask,
+                            cache=cache,
+                            use_ste=True,
+                            return_layer_outputs=True,
+                            return_kv_cache=True,
+                            return_attn_weights=True,
+                        )
+                    else:
+                        encoder_outputs, layer_outputs, kv_cache = self.encoder(
+                            inputs_embeds=hidden_states,
+                            attention_mask=attention_mask_full,
+                            update_mask=update_mask,
+                            cache=cache,
+                            use_ste=True,
+                            return_layer_outputs=True,
+                            return_kv_cache=True,
+                        )
+                        attn_weights_list = None
                 else:
                     attention_mask_updated = (
                         attention_mask_full[:, :, update_indices, :] if attention_mask_full is not None else None
                     )
-                    encoder_outputs, layer_outputs, kv_cache = self.encoder(
-                        inputs_embeds=hidden_states,
-                        attention_mask=attention_mask_full,
-                        update_mask=update_mask,
-                        cache=cache,
-                        use_ste=False,
-                        update_indices=update_indices,
-                        attention_mask_updated=attention_mask_updated,
-                        return_layer_outputs=True,
-                        return_kv_cache=True,
-                    )
+                    if record_attn:
+                        encoder_outputs, layer_outputs, kv_cache, attn_weights_list = self.encoder(
+                            inputs_embeds=hidden_states,
+                            attention_mask=attention_mask_full,
+                            update_mask=update_mask,
+                            cache=cache,
+                            use_ste=False,
+                            update_indices=update_indices,
+                            attention_mask_updated=attention_mask_updated,
+                            return_layer_outputs=True,
+                            return_kv_cache=True,
+                            return_attn_weights=True,
+                        )
+                    else:
+                        encoder_outputs, layer_outputs, kv_cache = self.encoder(
+                            inputs_embeds=hidden_states,
+                            attention_mask=attention_mask_full,
+                            update_mask=update_mask,
+                            cache=cache,
+                            use_ste=False,
+                            update_indices=update_indices,
+                            attention_mask_updated=attention_mask_updated,
+                            return_layer_outputs=True,
+                            return_kv_cache=True,
+                        )
+                        attn_weights_list = None
 
+            last_attn_maps = _build_attn_maps(attn_weights_list) if record_attn else None
+            reuse_analysis = None
+            if record_attn and not full_update and update_mask is not None:
+                with torch.no_grad():
+                    full_hidden_states = self.embeddings(
+                        pixel_values=pixel_values,
+                        patch_attention_mask=patch_attention_mask_grid,
+                    )
+                    full_outputs, full_layer_outputs, _, full_attn_weights_list = self.encoder(
+                        inputs_embeds=full_hidden_states,
+                        attention_mask=attention_mask_full,
+                        return_layer_outputs=True,
+                        return_attn_weights=True,
+                    )
+                full_attn_maps = _build_attn_maps(full_attn_weights_list)
+                update_mask_flat = update_mask.to(dtype=torch.bool)
+
+                patch_diff_tokens = (
+                    full_hidden_states.to(dtype=torch.float32) - hidden_states.to(dtype=torch.float32)
+                ).abs().mean(dim=-1)
+                patch_diff_grid = patch_diff_tokens.view(
+                    batch_size, patch_attention_mask_grid.shape[1], patch_attention_mask_grid.shape[2]
+                )
+
+                def _safe_mean(values: torch.Tensor) -> float | None:
+                    if values.numel() == 0:
+                        return None
+                    return float(values.mean().item())
+
+                update_delta = patch_diff_tokens[update_mask_flat]
+                reuse_delta = patch_diff_tokens[~update_mask_flat]
+                update_delta_mean = _safe_mean(update_delta)
+                reuse_delta_mean = _safe_mean(reuse_delta)
+                if update_delta.numel() > 0 and reuse_delta.numel() > 0:
+                    threshold = float(update_delta.median().item())
+                    missed_update_rate = float((reuse_delta > threshold).float().mean().item())
+                else:
+                    threshold = None
+                    missed_update_rate = 0.0
+
+                layer_token_diff_grids = []
+                layer_channel_diffs = []
+                layer_token_diff_means = []
+                layer_center_means = []
+                layer_outer_means = []
+                for full_layer, partial_layer in zip(full_layer_outputs, layer_outputs, strict=False):
+                    diff = (
+                        full_layer.to(dtype=torch.float32) - partial_layer.to(dtype=torch.float32)
+                    ).abs()
+                    token_diff = diff.mean(dim=-1)
+                    channel_diff = diff.mean(dim=1)
+                    layer_token_diff_means.append(_safe_mean(token_diff))
+                    layer_center_means.append(_safe_mean(token_diff[update_mask_flat]))
+                    layer_outer_means.append(_safe_mean(token_diff[~update_mask_flat]))
+                    layer_token_diff_grids.append(
+                        token_diff.view(
+                            batch_size,
+                            patch_attention_mask_grid.shape[1],
+                            patch_attention_mask_grid.shape[2],
+                        )
+                    )
+                    layer_channel_diffs.append(channel_diff)
+
+                attn_diff_maps = []
+                attn_diff_means = []
+                if full_attn_maps is not None and last_attn_maps is not None:
+                    for full_map, partial_map in zip(full_attn_maps, last_attn_maps, strict=False):
+                        if full_map is None or partial_map is None:
+                            attn_diff_maps.append(None)
+                            attn_diff_means.append(None)
+                            continue
+                        diff = (full_map - partial_map).abs()
+                        attn_diff_maps.append(diff)
+                        attn_diff_means.append(float(diff.mean().item()))
+
+                reuse_analysis = {
+                    "patch_diff_grid": patch_diff_grid.detach().to(device="cpu", dtype=torch.float32),
+                    "layer_token_diff_grids": [
+                        item.detach().to(device="cpu", dtype=torch.float32)
+                        for item in layer_token_diff_grids
+                    ],
+                    "layer_channel_diffs": [
+                        item.detach().to(device="cpu", dtype=torch.float32)
+                        for item in layer_channel_diffs
+                    ],
+                    "attn_diff_maps": [
+                        item.detach().to(device="cpu", dtype=torch.float32) if item is not None else None
+                        for item in attn_diff_maps
+                    ],
+                    "update_mask_grid": render_update_mask_grid.detach().to(device="cpu") if render_update_mask_grid is not None else None,
+                    "metrics": {
+                        "patch_diff_mean": _safe_mean(patch_diff_tokens),
+                        "update_delta_mean": update_delta_mean,
+                        "reuse_delta_mean": reuse_delta_mean,
+                        "missed_update_rate": missed_update_rate,
+                        "missed_update_threshold": threshold,
+                        "patch_center_mean": _safe_mean(patch_diff_tokens[update_mask_flat]),
+                        "patch_outer_mean": _safe_mean(patch_diff_tokens[~update_mask_flat]),
+                        "layer_token_diff_mean": layer_token_diff_means,
+                        "layer_center_mean": layer_center_means,
+                        "layer_outer_mean": layer_outer_means,
+                        "attn_diff_mean": attn_diff_means,
+                    },
+                }
             self._partial_update_cache[cache_key] = {
                 "patch_embeddings": hidden_states.detach(),
                 "layer_outputs": [layer.detach() for layer in layer_outputs],
@@ -884,6 +1166,7 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
                 "batch_size": batch_size,
                 "device": hidden_states.device,
                 "frame_counter": frame_counter,
+                "last_full_frame": frame_counter if full_update else last_full_frame,
                 "last_log_frame": frame_counter if should_log else last_log_frame,
                 "last_mode": mode if use_partial_update else last_mode,
                 "reuse_sum": reuse_sum,
@@ -891,12 +1174,32 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
                 "last_update_mask_grid": (
                     render_update_mask_grid.detach().to("cpu") if render_update_mask_grid is not None else None
                 ),
+                "last_attn_maps": last_attn_maps,
+                "last_reuse_analysis": reuse_analysis,
             }
         else:
-            encoder_outputs = self.encoder(
-                inputs_embeds=hidden_states,
-                attention_mask=attention_mask_full,
-            )
+            if record_attn:
+                encoder_outputs, _, _, attn_weights_list = self.encoder(
+                    inputs_embeds=hidden_states,
+                    attention_mask=attention_mask_full,
+                    return_attn_weights=True,
+                )
+                last_attn_maps = _build_attn_maps(attn_weights_list)
+            else:
+                encoder_outputs = self.encoder(
+                    inputs_embeds=hidden_states,
+                    attention_mask=attention_mask_full,
+                )
+                last_attn_maps = None
+            if record_attn:
+                cache_entry = self._partial_update_cache.setdefault(cache_key, {})
+                cache_entry["last_attn_maps"] = last_attn_maps
+                cache_entry["last_reuse_analysis"] = None
+            else:
+                cache_entry = self._partial_update_cache.get(cache_key)
+                if cache_entry is not None:
+                    cache_entry["last_attn_maps"] = None
+                    cache_entry["last_reuse_analysis"] = None
 
         last_hidden_state = encoder_outputs.last_hidden_state
         last_hidden_state = self.post_layernorm(last_hidden_state)

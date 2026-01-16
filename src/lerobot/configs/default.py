@@ -62,6 +62,18 @@ class EvalConfig:
     render_reuse_mask: bool = False
     # Which camera key to use when overlaying reuse/update masks.
     render_reuse_camera: str = "image"
+    # Save per-layer attention maps for rendered episodes.
+    save_attn_maps: bool = False
+    # Save/overlay attention maps every N forwards (>=1).
+    attn_save_interval: int = 1
+    # Which camera key to use when saving attention maps.
+    attn_camera: str = "image"
+    # Whether to save attention heatmaps as standalone images (no video overlay).
+    render_attn_heatmap: bool = False
+    # Which layer to visualize (0-based, -1 for last, or "all" for every layer).
+    attn_heatmap_layer: int | str = -1
+    # Intensity scale for the saved attention heatmaps.
+    attn_heatmap_alpha: float = 1.0
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

@@ -85,6 +85,9 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
+from PIL import Image, ImageDraw
+
+from lerobot.datasets.image_writer import write_image
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -261,6 +264,13 @@ def eval_policy(
     videos_dir: Path | None = None,
     render_reuse_mask: bool = False,
     render_reuse_camera: str | None = None,
+    save_attn_maps: bool = False,
+    attn_save_interval: int = 1,
+    attn_camera: str | None = None,
+    render_attn_heatmap: bool = False,
+    attn_heatmap_layer: int | str = -1,
+    attn_heatmap_alpha: float = 0.5,
+    attn_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
 ) -> dict:
@@ -273,6 +283,13 @@ def eval_policy(
         videos_dir: Where to save rendered videos.
         render_reuse_mask: Whether to overlay reuse/update masks on rendered videos.
         render_reuse_camera: Camera key to use when overlaying reuse/update masks.
+        save_attn_maps: Whether to save per-layer attention maps to .pth files.
+        attn_save_interval: Save attention maps every N forwards (action chunk inferences).
+        attn_camera: Camera key to use when saving attention maps.
+        render_attn_heatmap: Whether to save attention heatmaps as standalone images (no video overlay).
+        attn_heatmap_layer: Which layer index to visualize (0-based, -1 for last, "mean" for average, or "all").
+        attn_heatmap_alpha: Intensity scale for the saved heatmaps.
+        attn_dir: Where to save attention map .pth files.
         return_episode_data: Whether to return episode data for online training. Incorporates the data into
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
@@ -282,6 +299,13 @@ def eval_policy(
     """
     if max_episodes_rendered > 0 and not videos_dir:
         raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
+    needs_attn = save_attn_maps or render_attn_heatmap
+    if needs_attn and max_episodes_rendered <= 0:
+        raise ValueError("Attention map saving/visualization requires max_episodes_rendered > 0.")
+    if needs_attn and not attn_dir:
+        raise ValueError("If attention maps are enabled, attn_dir must be provided.")
+    attn_save_interval = max(1, attn_save_interval)
+    attn_heatmap_alpha = float(max(0.0, min(attn_heatmap_alpha, 1.0)))
 
     if not isinstance(policy, PreTrainedPolicy):
         raise ValueError(
@@ -302,6 +326,10 @@ def eval_policy(
     all_seeds = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
+    missing_attn_logged = False
+    attn_camera_used: str | None = None
+    reuse_camera_used: str | None = None
+    last_forward_counter: int | None = None
 
     def _select_reuse_mask() -> tuple[np.ndarray | None, str | None]:
         model = getattr(policy, "model", None)
@@ -345,9 +373,287 @@ def eval_policy(
             out[idx] = frame
         return out.astype(np.uint8)
 
+    def _select_attn_maps() -> tuple[list | None, str | None]:
+        model = getattr(policy, "model", None)
+        if model is None:
+            return None, None
+        attn_dict = getattr(model, "_last_attn_maps", None)
+        if not attn_dict:
+            return None, None
+        if attn_camera and attn_camera in attn_dict:
+            return attn_dict[attn_camera], attn_camera
+        first_key = next(iter(attn_dict))
+        return attn_dict[first_key], first_key
+
+    def _select_reuse_analysis() -> tuple[dict | None, str | None]:
+        model = getattr(policy, "model", None)
+        if model is None:
+            return None, None
+        analysis_dict = getattr(model, "_last_reuse_analysis", None)
+        if not analysis_dict:
+            return None, None
+        if attn_camera and attn_camera in analysis_dict:
+            return analysis_dict[attn_camera], attn_camera
+        first_key = next(iter(analysis_dict))
+        return analysis_dict[first_key], first_key
+
+    def _slice_reuse_analysis(analysis: dict, idx: int) -> dict:
+        out: dict[str, Any] = {"metrics": analysis.get("metrics", {})}
+        if "patch_diff_grid" in analysis and analysis["patch_diff_grid"] is not None:
+            out["patch_diff_grid"] = analysis["patch_diff_grid"][idx]
+        if "layer_token_diff_grids" in analysis:
+            out["layer_token_diff_grids"] = [
+                item[idx] if item is not None else None for item in analysis["layer_token_diff_grids"]
+            ]
+        if "layer_channel_diffs" in analysis:
+            out["layer_channel_diffs"] = [
+                item[idx] if item is not None else None for item in analysis["layer_channel_diffs"]
+            ]
+        if "attn_diff_maps" in analysis:
+            out["attn_diff_maps"] = [
+                item[idx] if item is not None else None for item in analysis["attn_diff_maps"]
+            ]
+        if "update_mask_grid" in analysis and analysis["update_mask_grid"] is not None:
+            out["update_mask_grid"] = analysis["update_mask_grid"][idx]
+        return out
+
+    def _select_update_mask_for_attn() -> tuple[np.ndarray | None, str | None]:
+        model = getattr(policy, "model", None)
+        if model is None:
+            return None, None
+        mask_dict = getattr(model, "_last_update_masks", None)
+        if not mask_dict:
+            return None, None
+        if attn_camera and attn_camera in mask_dict:
+            return mask_dict[attn_camera], attn_camera
+        first_key = next(iter(mask_dict))
+        return mask_dict[first_key], first_key
+
+    def _infer_update_modes(update_mask: np.ndarray | None, batch_size: int) -> list[str]:
+        if update_mask is None:
+            return ["full"] * batch_size
+        mask_np = update_mask
+        if torch.is_tensor(mask_np):
+            mask_np = mask_np.detach().cpu().numpy()
+        mask_np = np.asarray(mask_np, dtype=bool)
+        if mask_np.ndim == 2:
+            mask_np = mask_np[None, ...]
+        modes = []
+        for idx in range(min(batch_size, mask_np.shape[0])):
+            grid = mask_np[idx]
+            total = grid.size
+            updated = int(grid.sum())
+            mode = "full" if updated >= total else "partial"
+            modes.append(mode)
+        if len(modes) < batch_size:
+            modes.extend([modes[-1]] * (batch_size - len(modes)))
+        return modes
+
+    def _get_forward_counter() -> int | None:
+        model = getattr(policy, "model", None)
+        if model is None:
+            return None
+        return getattr(model, "_frame_counter", None)
+
+    def _expand_map_to_frame(map_grid: np.ndarray, frame_shape: tuple[int, int]) -> np.ndarray:
+        frame_h, frame_w = frame_shape
+        grid_h, grid_w = map_grid.shape
+        if grid_h == 0 or grid_w == 0:
+            return np.zeros((frame_h, frame_w), dtype=np.float32)
+        scale_h = int(math.ceil(frame_h / grid_h))
+        scale_w = int(math.ceil(frame_w / grid_w))
+        expanded = np.repeat(np.repeat(map_grid, scale_h, axis=0), scale_w, axis=1)
+        return expanded[:frame_h, :frame_w]
+
+    def _render_heatmap_image(
+        layer_map: np.ndarray,
+        frame_shape: tuple[int, int],
+        intensity_scale: float,
+        tick_count: int = 5,
+    ) -> np.ndarray:
+        grid_h, grid_w = layer_map.shape
+        frame_h, frame_w = frame_shape
+        expanded = _expand_map_to_frame(layer_map, frame_shape)
+        intensity = np.clip(expanded * intensity_scale, 0.0, 1.0)
+        heat = np.full((frame_h, frame_w, 3), 255, dtype=np.uint8)
+        inv = (255.0 * (1.0 - intensity)).astype(np.uint8)
+        heat[..., 1] = inv
+        heat[..., 2] = inv
+
+        margin_left = 60
+        margin_right = 90
+        margin_top = 20
+        margin_bottom = 45
+        bar_pad = 10
+        bar_width = 20
+        canvas_w = margin_left + frame_w + bar_pad + bar_width + margin_right
+        canvas_h = margin_top + frame_h + margin_bottom
+
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+        canvas.paste(Image.fromarray(heat), (margin_left, margin_top))
+        draw = ImageDraw.Draw(canvas)
+
+        x0 = margin_left
+        y0 = margin_top
+        x1 = margin_left + frame_w - 1
+        y1 = margin_top + frame_h - 1
+        draw.line([(x0, y1), (x1, y1)], fill=(0, 0, 0), width=1)
+        draw.line([(x0, y0), (x0, y1)], fill=(0, 0, 0), width=1)
+
+        ticks = max(2, tick_count)
+        for i in range(ticks):
+            tx = x0 + int(i * (frame_w - 1) / (ticks - 1))
+            draw.line([(tx, y1), (tx, y1 + 4)], fill=(0, 0, 0), width=1)
+            label_x = str(int(round(i * (grid_w - 1) / (ticks - 1))))
+            draw.text((tx - 6, y1 + 8), label_x, fill=(0, 0, 0))
+
+            ty = y0 + int(i * (frame_h - 1) / (ticks - 1))
+            draw.line([(x0 - 4, ty), (x0, ty)], fill=(0, 0, 0), width=1)
+            label_y = str(int(round(i * (grid_h - 1) / (ticks - 1))))
+            draw.text((x0 - 32, ty - 6), label_y, fill=(0, 0, 0))
+
+        draw.text((x0 + frame_w // 2 - 25, y1 + 25), "X (patch)", fill=(0, 0, 0))
+        draw.text((5, y0 - 2), "Y (patch)", fill=(0, 0, 0))
+
+        bar_x0 = x1 + bar_pad
+        bar_x1 = bar_x0 + bar_width - 1
+        bar = np.full((frame_h, bar_width, 3), 255, dtype=np.uint8)
+        for j in range(frame_h):
+            val = 1.0 - (j / max(frame_h - 1, 1))
+            bar_intensity = np.clip(val * intensity_scale, 0.0, 1.0)
+            inv = int(255.0 * (1.0 - bar_intensity))
+            bar[j, :, 1] = inv
+            bar[j, :, 2] = inv
+        canvas.paste(Image.fromarray(bar), (bar_x0, margin_top))
+        draw.rectangle([bar_x0, y0, bar_x1, y1], outline=(0, 0, 0), width=1)
+        draw.text((bar_x0 - 2, y0 - 14), "attn", fill=(0, 0, 0))
+        scale_steps = 10
+        for i in range(scale_steps + 1):
+            val = 1.0 - (i / scale_steps)
+            ty = y0 + int(i * (frame_h - 1) / scale_steps)
+            draw.line([(bar_x1, ty), (bar_x1 + 4, ty)], fill=(0, 0, 0), width=1)
+            draw.text((bar_x1 + 6, ty - 6), f"{val:.1f}", fill=(0, 0, 0))
+
+        return np.asarray(canvas)
+
+    def _render_matrix_heatmap(
+        matrix: np.ndarray,
+        intensity_scale: float,
+        tick_count: int = 5,
+    ) -> np.ndarray:
+        rows, cols = matrix.shape
+        intensity = np.clip(matrix * intensity_scale, 0.0, 1.0)
+        heat = np.full((rows, cols, 3), 255, dtype=np.uint8)
+        inv = (255.0 * (1.0 - intensity)).astype(np.uint8)
+        heat[..., 1] = inv
+        heat[..., 2] = inv
+
+        margin_left = 60
+        margin_right = 90
+        margin_top = 20
+        margin_bottom = 45
+        bar_pad = 10
+        bar_width = 20
+        canvas_w = margin_left + cols + bar_pad + bar_width + margin_right
+        canvas_h = margin_top + rows + margin_bottom
+
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+        canvas.paste(Image.fromarray(heat), (margin_left, margin_top))
+        draw = ImageDraw.Draw(canvas)
+
+        x0 = margin_left
+        y0 = margin_top
+        x1 = margin_left + cols - 1
+        y1 = margin_top + rows - 1
+        draw.line([(x0, y1), (x1, y1)], fill=(0, 0, 0), width=1)
+        draw.line([(x0, y0), (x0, y1)], fill=(0, 0, 0), width=1)
+
+        ticks = max(2, tick_count)
+        for i in range(ticks):
+            tx = x0 + int(i * (cols - 1) / (ticks - 1))
+            draw.line([(tx, y1), (tx, y1 + 4)], fill=(0, 0, 0), width=1)
+            label_x = str(int(round(i * (cols - 1) / (ticks - 1))))
+            draw.text((tx - 8, y1 + 8), label_x, fill=(0, 0, 0))
+
+            ty = y0 + int(i * (rows - 1) / (ticks - 1))
+            draw.line([(x0 - 4, ty), (x0, ty)], fill=(0, 0, 0), width=1)
+            label_y = str(int(round(i * (rows - 1) / (ticks - 1))))
+            draw.text((x0 - 36, ty - 6), label_y, fill=(0, 0, 0))
+
+        draw.text((x0 + cols // 2 - 25, y1 + 25), "K (token)", fill=(0, 0, 0))
+        draw.text((5, y0 - 2), "Q (token)", fill=(0, 0, 0))
+
+        bar_x0 = x1 + bar_pad
+        bar_x1 = bar_x0 + bar_width - 1
+        bar = np.full((rows, bar_width, 3), 255, dtype=np.uint8)
+        for j in range(rows):
+            val = 1.0 - (j / max(rows - 1, 1))
+            bar_intensity = np.clip(val * intensity_scale, 0.0, 1.0)
+            inv = int(255.0 * (1.0 - bar_intensity))
+            bar[j, :, 1] = inv
+            bar[j, :, 2] = inv
+        canvas.paste(Image.fromarray(bar), (bar_x0, margin_top))
+        draw.rectangle([bar_x0, y0, bar_x1, y1], outline=(0, 0, 0), width=1)
+        draw.text((bar_x0 - 2, y0 - 14), "attn", fill=(0, 0, 0))
+        scale_steps = 10
+        for i in range(scale_steps + 1):
+            val = 1.0 - (i / scale_steps)
+            ty = y0 + int(i * (rows - 1) / scale_steps)
+            draw.line([(bar_x1, ty), (bar_x1 + 4, ty)], fill=(0, 0, 0), width=1)
+            draw.text((bar_x1 + 6, ty - 6), f"{val:.1f}", fill=(0, 0, 0))
+
+        return np.asarray(canvas)
+
+    def _normalize_map(map_array: np.ndarray) -> np.ndarray:
+        map_array = np.nan_to_num(map_array.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        min_val = float(map_array.min())
+        max_val = float(map_array.max())
+        if max_val > min_val:
+            return (map_array - min_val) / (max_val - min_val)
+        return np.zeros_like(map_array, dtype=np.float32)
+
+    def _pick_attn_layer(attn_map: np.ndarray) -> np.ndarray:
+        if attn_map.ndim != 3:
+            raise ValueError("Expected attn_map with shape (layers, h, w).")
+        if isinstance(attn_heatmap_layer, str) and attn_heatmap_layer == "mean":
+            return attn_map.mean(axis=0)
+        layer_idx = int(attn_heatmap_layer)
+        if layer_idx < 0:
+            layer_idx = attn_map.shape[0] + layer_idx
+        layer_idx = max(0, min(layer_idx, attn_map.shape[0] - 1))
+        return attn_map[layer_idx]
+
+    def _collect_attn_episode(
+        attn_seq: list[np.ndarray | None],
+        done_index: int,
+        forward_seq: list[int | None] | None = None,
+        mode_seq: list[str | None] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, list[str] | None] | tuple[None, None, None, None]:
+        maps = []
+        frame_indices = []
+        forward_indices: list[int] = []
+        modes: list[str] = []
+        for frame_idx, attn_map in enumerate(attn_seq[: done_index + 1]):
+            if attn_map is None:
+                continue
+            maps.append(attn_map)
+            frame_indices.append(frame_idx)
+            if forward_seq is not None:
+                forward_idx = forward_seq[frame_idx] if frame_idx < len(forward_seq) else None
+                forward_indices.append(-1 if forward_idx is None else int(forward_idx))
+            if mode_seq is not None:
+                mode_val = mode_seq[frame_idx] if frame_idx < len(mode_seq) else None
+                modes.append("unknown" if mode_val is None else str(mode_val))
+        if not maps:
+            return None, None, None, None
+        forward_arr = np.asarray(forward_indices, dtype=np.int32) if forward_seq is not None else None
+        mode_list = modes if mode_seq is not None else None
+        return np.stack(maps, axis=0), np.asarray(frame_indices, dtype=np.int32), forward_arr, mode_list
+
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
+        nonlocal missing_attn_logged, attn_camera_used, reuse_camera_used, last_forward_counter
         if n_episodes_rendered >= max_episodes_rendered:
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
@@ -363,6 +669,94 @@ def eval_policy(
             else:
                 mask_np = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
                 ep_masks.append(mask_np[:n_to_render_now])
+        if needs_attn:
+            frame_idx = len(ep_frames) - 1
+            forward_counter = _get_forward_counter()
+            if forward_counter is None:
+                forward_counter = frame_idx
+            forward_advanced = (
+                last_forward_counter is None or forward_counter != last_forward_counter
+            )
+            if forward_advanced:
+                last_forward_counter = forward_counter
+            should_capture = forward_advanced and (forward_counter % attn_save_interval == 0)
+            attn_snapshot = None
+            attn_missing_reason = None
+            attn_cam_key = None
+            if should_capture:
+                attn_maps, cam_key = _select_attn_maps()
+                attn_cam_key = cam_key
+                if attn_maps is None:
+                    attn_missing_reason = "no_attn_maps"
+                    if forward_counter > 0 and not missing_attn_logged:
+                        logging.info(
+                            "Attention map capture requested, but no attn maps were produced. "
+                            "Enable policy.record_attn and set policy.attn_reduce."
+                        )
+                        missing_attn_logged = True
+                else:
+                    if cam_key is not None and attn_camera_used is None:
+                        attn_camera_used = cam_key
+                    layer_maps = []
+                    for layer_idx, layer_map in enumerate(attn_maps):
+                        if layer_map is None:
+                            attn_missing_reason = f"layer_{layer_idx}_none"
+                            layer_maps = None
+                            break
+                        if torch.is_tensor(layer_map):
+                            layer_map = layer_map.detach().to(dtype=torch.float32).cpu().numpy()
+                        else:
+                            layer_map = np.asarray(layer_map, dtype=np.float32)
+                        layer_maps.append(layer_map)
+                    if layer_maps:
+                        try:
+                            stacked = np.stack(layer_maps, axis=1)
+                        except ValueError as exc:
+                            attn_missing_reason = f"stack_error:{exc}"
+                            stacked = None
+                        else:
+                            attn_snapshot = stacked[:n_to_render_now]
+                    elif layer_maps == []:
+                        attn_missing_reason = "empty_layer_maps"
+
+            mode_list = None
+            if should_capture:
+                update_mask, _ = _select_update_mask_for_attn()
+                mode_list = _infer_update_modes(update_mask, n_to_render_now)
+            analysis_snapshot = None
+            if should_capture:
+                reuse_analysis, reuse_cam_key = _select_reuse_analysis()
+                if reuse_analysis is not None:
+                    if reuse_cam_key is not None and reuse_camera_used is None:
+                        reuse_camera_used = reuse_cam_key
+                    analysis_snapshot = [
+                        _slice_reuse_analysis(reuse_analysis, idx) for idx in range(n_to_render_now)
+                    ]
+            if should_capture and attn_snapshot is not None:
+                ep_attn_samples.append(attn_snapshot)
+                ep_attn_forward_indices.append(forward_counter)
+                ep_attn_modes.append(mode_list)
+            elif should_capture and attn_snapshot is None and forward_counter > 0:
+                logging.info(
+                    "Attention snapshot missing: forward=%s reason=%s record_attn=%s attn_reduce=%s camera=%s",
+                    forward_counter,
+                    attn_missing_reason or "unknown",
+                    getattr(policy.config, "record_attn", None),
+                    getattr(policy.config, "attn_reduce", None),
+                    attn_cam_key or attn_camera,
+                )
+            else:
+                ep_attn_samples.append(None)
+                ep_attn_forward_indices.append(None)
+                ep_attn_modes.append(None)
+            if should_capture and analysis_snapshot is not None:
+                ep_reuse_analysis_samples.append(analysis_snapshot)
+                ep_reuse_forward_indices.append(forward_counter)
+                ep_reuse_modes.append(mode_list)
+            else:
+                ep_reuse_analysis_samples.append(None)
+                ep_reuse_forward_indices.append(None)
+                ep_reuse_modes.append(None)
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
@@ -379,6 +773,19 @@ def eval_policy(
             ep_frames: list[np.ndarray] = []
             if render_reuse_mask:
                 ep_masks: list[np.ndarray | None] = []
+            ep_attn_samples = None
+            ep_attn_forward_indices = None
+            ep_attn_modes = None
+            ep_reuse_analysis_samples = None
+            ep_reuse_forward_indices = None
+            ep_reuse_modes = None
+            if needs_attn:
+                ep_attn_samples = []
+                ep_attn_forward_indices = []
+                ep_attn_modes = []
+                ep_reuse_analysis_samples = []
+                ep_reuse_forward_indices = []
+                ep_reuse_modes = []
 
         if start_seed is None:
             seeds = None
@@ -443,6 +850,9 @@ def eval_policy(
             batch_stacked_masks = None
             if render_reuse_mask and ep_masks and all(mask is not None for mask in ep_masks):
                 batch_stacked_masks = np.stack(ep_masks, axis=1)
+            batch_attn_samples = ep_attn_samples if ep_attn_samples else None
+            batch_attn_forward_indices = ep_attn_forward_indices if ep_attn_forward_indices else None
+            batch_attn_modes = ep_attn_modes if ep_attn_modes else None
             for ep_idx, (stacked_frames, done_index) in enumerate(
                 zip(batch_stacked_frames, done_indices.flatten().tolist(), strict=False)
             ):
@@ -456,6 +866,217 @@ def eval_policy(
                 if batch_stacked_masks is not None:
                     mask_seq = batch_stacked_masks[ep_idx][: done_index + 1]
                     render_frames = _overlay_reuse_mask(render_frames, mask_seq)
+                attn_stack = None
+                frame_indices = None
+                forward_indices = None
+                mode_list = None
+                if needs_attn and attn_dir is not None and batch_attn_samples is not None:
+                    attn_save_seq = [
+                        step[ep_idx] if step is not None else None
+                        for step in batch_attn_samples[: done_index + 1]
+                    ]
+                    forward_seq = (
+                        [
+                            step if step is not None else None
+                            for step in batch_attn_forward_indices[: done_index + 1]
+                        ]
+                        if batch_attn_forward_indices is not None
+                        else None
+                    )
+                    mode_seq = (
+                        [
+                            step[ep_idx] if step is not None else None
+                            for step in batch_attn_modes[: done_index + 1]
+                        ]
+                        if batch_attn_modes is not None
+                        else None
+                    )
+                    attn_stack, frame_indices, forward_indices, mode_list = _collect_attn_episode(
+                        attn_save_seq,
+                        done_index,
+                        forward_seq=forward_seq,
+                        mode_seq=mode_seq,
+                    )
+                analysis_seq = None
+                analysis_forward_seq = None
+                analysis_mode_seq = None
+                if needs_attn and attn_dir is not None and batch_attn_samples is not None:
+                    analysis_seq = [
+                        step[ep_idx] if step is not None else None
+                        for step in ep_reuse_analysis_samples[: done_index + 1]
+                    ]
+                    analysis_forward_seq = (
+                        [
+                            step if step is not None else None
+                            for step in ep_reuse_forward_indices[: done_index + 1]
+                        ]
+                        if ep_reuse_forward_indices is not None
+                        else None
+                    )
+                    analysis_mode_seq = (
+                        [
+                            step[ep_idx] if step is not None else None
+                            for step in ep_reuse_modes[: done_index + 1]
+                        ]
+                        if ep_reuse_modes is not None
+                        else None
+                    )
+                if save_attn_maps and attn_dir is not None and attn_stack is not None:
+                    attn_dir.mkdir(parents=True, exist_ok=True)
+                    attn_path = attn_dir / f"attn_episode_{n_episodes_rendered}.pth"
+                    attn_meta = {
+                        "attn_maps": torch.from_numpy(attn_stack),
+                        "frame_indices": torch.from_numpy(frame_indices),
+                        "forward_indices": torch.from_numpy(forward_indices) if forward_indices is not None else None,
+                        "update_modes": mode_list,
+                        "camera": attn_camera_used or attn_camera,
+                        "attn_reduce": getattr(policy.config, "attn_reduce", None),
+                        "episode_index": n_episodes_rendered,
+                    }
+                    torch.save(attn_meta, attn_path)
+                if render_attn_heatmap and attn_dir is not None and attn_stack is not None:
+                    cam_tag = attn_camera_used or attn_camera or "camera"
+                    base_heatmap_dir = attn_dir / "heatmaps" / str(cam_tag) / f"episode_{n_episodes_rendered}"
+                    base_heatmap_dir.mkdir(parents=True, exist_ok=True)
+                    save_all_layers = isinstance(attn_heatmap_layer, str) and attn_heatmap_layer == "all"
+                    for idx, (attn_map, frame_idx) in enumerate(zip(attn_stack, frame_indices, strict=False)):
+                        if attn_map.ndim == 2:
+                            layer_items = [(0, attn_map)]
+                        elif attn_map.ndim == 3:
+                            if save_all_layers:
+                                layer_items = list(enumerate(attn_map))
+                            else:
+                                if isinstance(attn_heatmap_layer, str) and attn_heatmap_layer == "mean":
+                                    layer_items = [("mean", attn_map.mean(axis=0))]
+                                else:
+                                    layer_idx = int(attn_heatmap_layer)
+                                    if layer_idx < 0:
+                                        layer_idx = attn_map.shape[0] + layer_idx
+                                    layer_idx = max(0, min(layer_idx, attn_map.shape[0] - 1))
+                                    layer_items = [(layer_idx, attn_map[layer_idx])]
+                        else:
+                            continue
+
+                        forward_idx = int(forward_indices[idx]) if forward_indices is not None else idx
+                        if forward_idx < 0:
+                            forward_idx = idx
+                        mode_tag = "unknown"
+                        if mode_list is not None and idx < len(mode_list):
+                            mode_tag = str(mode_list[idx])
+                        forward_dir = base_heatmap_dir / f"forward_{forward_idx:04d}"
+                        forward_dir.mkdir(parents=True, exist_ok=True)
+                        if save_attn_maps and attn_dir is not None:
+                            forward_pth = forward_dir / f"attn_forward_{forward_idx:04d}_mode_{mode_tag}.pth"
+                            if not forward_pth.exists():
+                                attn_forward_meta = {
+                                    "attn_maps": torch.from_numpy(attn_map),
+                                    "frame_index": int(frame_idx),
+                                    "forward_index": int(forward_idx),
+                                    "update_mode": mode_tag,
+                                    "camera": attn_camera_used or attn_camera,
+                                    "attn_reduce": getattr(policy.config, "attn_reduce", None),
+                                    "episode_index": n_episodes_rendered,
+                                }
+                                torch.save(attn_forward_meta, forward_pth)
+                        for layer_id, layer_map in layer_items:
+                            layer_map = np.nan_to_num(
+                                layer_map.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+                            )
+                            min_val = float(layer_map.min())
+                            max_val = float(layer_map.max())
+                            if max_val > min_val:
+                                layer_map = (layer_map - min_val) / (max_val - min_val)
+                            else:
+                                layer_map = np.zeros_like(layer_map, dtype=np.float32)
+                            layer_dir = forward_dir / f"layer_{layer_id}"
+                            layer_dir.mkdir(parents=True, exist_ok=True)
+                            heatmap_path = layer_dir / f"heatmap_frame_{int(frame_idx):04d}_mode_{mode_tag}.png"
+                            if layer_map.ndim == 2 and layer_map.shape[0] >= 128 and layer_map.shape[1] >= 128:
+                                heatmap_img = _render_matrix_heatmap(
+                                    layer_map,
+                                    attn_heatmap_alpha,
+                                )
+                            else:
+                                heatmap_img = _render_heatmap_image(
+                                    layer_map,
+                                    render_frames[frame_idx].shape[:2],
+                                    attn_heatmap_alpha,
+                                )
+                            write_image(heatmap_img, heatmap_path)
+                if attn_dir is not None and analysis_seq is not None:
+                    analysis_cam_tag = reuse_camera_used or attn_camera_used or attn_camera or "camera"
+                    analysis_base_dir = (
+                        attn_dir / "reuse_analysis" / str(analysis_cam_tag) / f"episode_{n_episodes_rendered}"
+                    )
+                    analysis_base_dir.mkdir(parents=True, exist_ok=True)
+                    for idx, analysis in enumerate(analysis_seq):
+                        if analysis is None:
+                            continue
+                        forward_idx = (
+                            int(analysis_forward_seq[idx])
+                            if analysis_forward_seq is not None and analysis_forward_seq[idx] is not None
+                            else idx
+                        )
+                        mode_tag = "unknown"
+                        if analysis_mode_seq is not None and idx < len(analysis_mode_seq):
+                            mode_val = analysis_mode_seq[idx]
+                            if mode_val is not None:
+                                mode_tag = str(mode_val)
+                        forward_dir = analysis_base_dir / f"forward_{forward_idx:04d}"
+                        forward_dir.mkdir(parents=True, exist_ok=True)
+                        metrics_path = forward_dir / f"reuse_metrics_mode_{mode_tag}.json"
+                        metrics = analysis.get("metrics", {})
+                        with open(metrics_path, "w", encoding="utf-8") as metrics_fp:
+                            json.dump(metrics, metrics_fp, ensure_ascii=False, indent=2)
+
+                        patch_diff_grid = analysis.get("patch_diff_grid")
+                        if patch_diff_grid is not None:
+                            patch_map = _normalize_map(np.asarray(patch_diff_grid))
+                            patch_path = forward_dir / f"patch_diff_mode_{mode_tag}.png"
+                            heatmap_img = _render_heatmap_image(
+                                patch_map,
+                                patch_map.shape,
+                                attn_heatmap_alpha,
+                            )
+                            write_image(heatmap_img, patch_path)
+
+                        layer_token_grids = analysis.get("layer_token_diff_grids", [])
+                        layer_channel_diffs = analysis.get("layer_channel_diffs", [])
+                        attn_diff_maps = analysis.get("attn_diff_maps", [])
+                        for layer_idx in range(max(len(layer_token_grids), len(layer_channel_diffs), len(attn_diff_maps))):
+                            layer_dir = forward_dir / f"layer_{layer_idx}"
+                            layer_dir.mkdir(parents=True, exist_ok=True)
+                            if layer_idx < len(layer_token_grids):
+                                token_grid = layer_token_grids[layer_idx]
+                                if token_grid is not None:
+                                    token_map = _normalize_map(np.asarray(token_grid))
+                                    token_path = layer_dir / f"token_diff_mode_{mode_tag}.png"
+                                    heatmap_img = _render_heatmap_image(
+                                        token_map,
+                                        token_map.shape,
+                                        attn_heatmap_alpha,
+                                    )
+                                    write_image(heatmap_img, token_path)
+                            if layer_idx < len(layer_channel_diffs):
+                                channel_diff = layer_channel_diffs[layer_idx]
+                                if channel_diff is not None:
+                                    channel_map = _normalize_map(np.asarray(channel_diff)[None, :])
+                                    channel_path = layer_dir / f"channel_diff_mode_{mode_tag}.png"
+                                    heatmap_img = _render_matrix_heatmap(
+                                        channel_map,
+                                        attn_heatmap_alpha,
+                                    )
+                                    write_image(heatmap_img, channel_path)
+                            if layer_idx < len(attn_diff_maps):
+                                attn_diff = attn_diff_maps[layer_idx]
+                                if attn_diff is not None:
+                                    attn_map = _normalize_map(np.asarray(attn_diff))
+                                    attn_path = layer_dir / f"attn_diff_mode_{mode_tag}.png"
+                                    heatmap_img = _render_matrix_heatmap(
+                                        attn_map,
+                                        attn_heatmap_alpha,
+                                    )
+                                    write_image(heatmap_img, attn_path)
                 thread = threading.Thread(
                     target=write_video,
                     args=(
@@ -584,6 +1205,8 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     policy.eval()
+    logging.info("Effective policy config: %s", policy.config)
+    logging.info("Effective eval config: %s", asdict(cfg.eval))
 
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
@@ -613,6 +1236,13 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             render_reuse_mask=cfg.eval.render_reuse_mask,
             render_reuse_camera=cfg.eval.render_reuse_camera,
+            save_attn_maps=cfg.eval.save_attn_maps,
+            attn_save_interval=cfg.eval.attn_save_interval,
+            attn_camera=cfg.eval.attn_camera,
+            render_attn_heatmap=cfg.eval.render_attn_heatmap,
+            attn_heatmap_layer=cfg.eval.attn_heatmap_layer,
+            attn_heatmap_alpha=cfg.eval.attn_heatmap_alpha,
+            attn_dir=Path(cfg.output_dir) / "attn",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )
@@ -657,6 +1287,13 @@ def eval_one(
     videos_dir: Path | None,
     render_reuse_mask: bool,
     render_reuse_camera: str | None,
+    save_attn_maps: bool,
+    attn_save_interval: int,
+    attn_camera: str | None,
+    render_attn_heatmap: bool,
+    attn_heatmap_layer: int | str,
+    attn_heatmap_alpha: float,
+    attn_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
 ) -> TaskMetrics:
@@ -676,6 +1313,13 @@ def eval_one(
         videos_dir=task_videos_dir,
         render_reuse_mask=render_reuse_mask,
         render_reuse_camera=render_reuse_camera,
+        save_attn_maps=save_attn_maps,
+        attn_save_interval=attn_save_interval,
+        attn_camera=attn_camera,
+        render_attn_heatmap=render_attn_heatmap,
+        attn_heatmap_layer=attn_heatmap_layer,
+        attn_heatmap_alpha=attn_heatmap_alpha,
+        attn_dir=attn_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
@@ -704,6 +1348,13 @@ def run_one(
     videos_dir: Path | None,
     render_reuse_mask: bool,
     render_reuse_camera: str | None,
+    save_attn_maps: bool,
+    attn_save_interval: int,
+    attn_camera: str | None,
+    render_attn_heatmap: bool,
+    attn_heatmap_layer: int | str,
+    attn_heatmap_alpha: float,
+    attn_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
 ):
@@ -716,6 +1367,10 @@ def run_one(
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
+    task_attn_dir = None
+    if attn_dir is not None:
+        task_attn_dir = attn_dir / f"{task_group}_{task_id}"
+        task_attn_dir.mkdir(parents=True, exist_ok=True)
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
@@ -730,6 +1385,13 @@ def run_one(
         videos_dir=task_videos_dir,
         render_reuse_mask=render_reuse_mask,
         render_reuse_camera=render_reuse_camera,
+        save_attn_maps=save_attn_maps,
+        attn_save_interval=attn_save_interval,
+        attn_camera=attn_camera,
+        render_attn_heatmap=render_attn_heatmap,
+        attn_heatmap_layer=attn_heatmap_layer,
+        attn_heatmap_alpha=attn_heatmap_alpha,
+        attn_dir=task_attn_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
@@ -752,6 +1414,13 @@ def eval_policy_all(
     videos_dir: Path | None = None,
     render_reuse_mask: bool = False,
     render_reuse_camera: str | None = None,
+    save_attn_maps: bool = False,
+    attn_save_interval: int = 1,
+    attn_camera: str | None = None,
+    render_attn_heatmap: bool = False,
+    attn_heatmap_layer: int | str = -1,
+    attn_heatmap_alpha: float = 0.5,
+    attn_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
@@ -810,6 +1479,13 @@ def eval_policy_all(
         videos_dir=videos_dir,
         render_reuse_mask=render_reuse_mask,
         render_reuse_camera=render_reuse_camera,
+        save_attn_maps=save_attn_maps,
+        attn_save_interval=attn_save_interval,
+        attn_camera=attn_camera,
+        render_attn_heatmap=render_attn_heatmap,
+        attn_heatmap_layer=attn_heatmap_layer,
+        attn_heatmap_alpha=attn_heatmap_alpha,
+        attn_dir=attn_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )

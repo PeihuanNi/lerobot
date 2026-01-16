@@ -686,13 +686,16 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-
         full_update_interval = self.config.full_update_interval
         center_patch_ratio = self.config.center_patch_ratio
         enable_partial_update = self.config.enable_partial_update
         reuse_log_interval = self.config.reuse_log_interval
+        record_attn = self.config.record_attn
+        attn_reduce = self.config.attn_reduce
 
         self._last_update_masks = {}
+        self._last_attn_maps = {}
+        self._last_reuse_analysis = {}
 
         image_keys = getattr(self, "_last_image_keys", None)
         for _img_idx, (
@@ -726,12 +729,20 @@ class VLAFlowMatching(nn.Module):
                 full_update_interval=full_update_interval,
                 enable_partial_update=enable_partial_update,
                 reuse_log_interval=reuse_log_interval,
+                record_attn=record_attn,
+                attn_reduce=attn_reduce,
                 cache_name=image_key,
                 cache_key=_img_idx,
             )
             update_mask = self.vlm_with_expert.get_last_update_mask(_img_idx)
             if update_mask is not None:
                 self._last_update_masks[image_key] = update_mask
+            attn_maps = self.vlm_with_expert.get_last_attn_maps(_img_idx)
+            if attn_maps is not None:
+                self._last_attn_maps[image_key] = attn_maps
+            reuse_analysis = self.vlm_with_expert.get_last_reuse_analysis(_img_idx)
+            if reuse_analysis is not None:
+                self._last_reuse_analysis[image_key] = reuse_analysis
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]

@@ -1,15 +1,21 @@
- PYTHONUNBUFFERED=1 PYTHONPATH=/home/nipeihuan/lerobot TOKENIZERS_PARALLELISM=false MUJOCO_GL=egl PYOPENGL_PLATFORM=egl lerobot-eval \
-  --policy.path=/home/nipeihuan/lerobot/outputs/train/spatial/checkpoints/last/pretrained_model \
+PYTHONUNBUFFERED=1 PYTHONPATH=/home/nipeihuan/lerobot TOKENIZERS_PARALLELISM=false MUJOCO_GL=egl PYOPENGL_PLATFORM=egl lerobot-eval \
+  --policy.path=/home/nipeihuan/lerobot/outputs/train/spatial_finetune/checkpoints/last/pretrained_model \
   --policy.n_action_steps=10 \
-  --policy.center_patch_ratio=0.8 \
-  --policy.full_update_interval=5 \
+  --policy.center_patch_ratio=0.7 \
+  --policy.full_update_interval=2 \
   --policy.enable_partial_update=true \
   --policy.reuse_log_interval=0 \
+  --policy.record_attn=false \
   --env.type=libero \
   --env.task=libero_spatial \
-  --env.task_id='[0]' \
   --eval.batch_size=1 \
   --eval.n_episodes=100 \
   --eval.max_episodes_rendered=100 \
-  --eval.render_reuse_mask=true \
-  --eval.render_reuse_camera=image
+  --eval.render_reuse_mask=false \
+  --eval.render_reuse_camera=image \
+  --eval.save_attn_maps=false \
+  --eval.attn_save_interval=1 \
+  --eval.attn_camera=image \
+  --eval.render_attn_heatmap=false \
+  --eval.attn_heatmap_layer=all \
+  --eval.attn_heatmap_alpha=1.0
