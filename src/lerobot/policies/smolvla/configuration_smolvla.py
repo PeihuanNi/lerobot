@@ -105,18 +105,26 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
-    # Frame-level partial update settings (experimental)
-    # Fraction of patches (center square) to fully update each frame. 0.5 means center half of patches per side.
-    center_patch_ratio: float = 0.7
-    # Perform a full update of all tokens every `full_update_interval` frames. Set to 1 to always full-update.
-    full_update_interval: int = 2
-    enable_partial_update: bool = True
-    # Log reuse statistics every N frames. Set to 0 to disable.
-    reuse_log_interval: int = 0
-    # Record per-layer attention maps from the vision encoder (debug-only).
-    record_attn: bool = False
-    # Reduction strategy for attention weights: none, mean_heads, mean_heads_queries.
-    attn_reduce: str = "mean_heads_queries"
+    # Token selection + region perturbation (inference-only, experimental).
+    token_selection_enabled: bool = False
+    token_prune_enabled: bool = True
+    token_temporal_threshold: float | None = 0.9
+    token_spatial_threshold: float | None = 0.9
+    token_spatial_radius: int = 1
+    # Fill strategy for background tokens: "zero", "mean", or "none".
+    background_fill: str = "zero"
+    # Region granularity in patch units (square).
+    region_patch_size: int = 4
+    # Re-evaluate region importance every N forwards. <= 0 disables re-evaluation.
+    region_eval_interval: int = 5
+    # L2 delta threshold for marking a region as important.
+    region_importance_threshold: float = 0.05
+    # Perturbation strategy: "zero", "mean", "prev", or "noise".
+    region_perturbation: str = "zero"
+    # Noise std for "noise" perturbation.
+    region_noise_std: float = 1e-3
+    # Minimum tokens to keep per image when pruning.
+    min_kept_tokens: int = 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -131,6 +139,16 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.token_spatial_radius < 0:
+            raise ValueError("token_spatial_radius must be >= 0.")
+        if self.region_patch_size <= 0:
+            raise ValueError("region_patch_size must be > 0.")
+        if self.min_kept_tokens < 0:
+            raise ValueError("min_kept_tokens must be >= 0.")
+        if self.background_fill not in {"zero", "mean", "none"}:
+            raise ValueError("background_fill must be one of: zero, mean, none.")
+        if self.region_perturbation not in {"zero", "mean", "prev", "noise"}:
+            raise ValueError("region_perturbation must be one of: zero, mean, prev, noise.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

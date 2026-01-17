@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
 from typing import TypedDict
@@ -71,6 +72,7 @@ from lerobot.policies.utils import (
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.utils import get_safe_dtype
 
+logger = logging.getLogger(__name__)
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
@@ -356,6 +358,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def get_last_token_overlay(self, image_index: int = 0) -> dict[str, object] | None:
+        if not hasattr(self, "model"):
+            return None
+        getter = getattr(self.model, "get_last_token_overlay", None)
+        if getter is None:
+            return None
+        return getter(image_index=image_index)
+
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
@@ -580,12 +590,30 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
-        # Frame counter for partial-update scheduling.
+        # Frame counter for token selection scheduling.
         self._frame_counter = 0
+        self._prev_image_tokens: dict[str, torch.Tensor] = {}
+        self._token_keep_masks: dict[str, torch.Tensor] = {}
+        self._token_cache_batch_size: int | None = None
+        self._logged_rtc_skip = False
+        self._last_background_masks: dict[str, torch.Tensor] = {}
+        self._last_important_masks: dict[str, torch.Tensor] = {}
+        self._last_token_masks: dict[str, torch.Tensor] = {}
+        self._last_token_meta: dict[str, dict[str, object]] = {}
+        self._last_overlay_keys: list[str] = []
 
     def reset_cache(self):
         """Reset cached embeddings. Should be called when the environment resets."""
         self._frame_counter = 0
+        self._prev_image_tokens = {}
+        self._token_keep_masks = {}
+        self._token_cache_batch_size = None
+        self._logged_rtc_skip = False
+        self._last_background_masks = {}
+        self._last_important_masks = {}
+        self._last_token_masks = {}
+        self._last_token_meta = {}
+        self._last_overlay_keys = []
         if hasattr(self.vlm_with_expert, "reset_vision_cache"):
             self.vlm_with_expert.reset_vision_cache()
         # Also reset VLM KV cache
@@ -600,6 +628,25 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def get_last_token_overlay(self, image_index: int = 0) -> dict[str, object] | None:
+        if not self._last_overlay_keys:
+            return None
+        if image_index < 0 or image_index >= len(self._last_overlay_keys):
+            return None
+        key = self._last_overlay_keys[image_index]
+        meta = self._last_token_meta.get(key)
+        if meta is None:
+            return None
+        return {
+            "key": key,
+            "grid_h": meta.get("grid_h", 0),
+            "grid_w": meta.get("grid_w", 0),
+            "has_cls": bool(meta.get("has_cls", False)),
+            "background_mask": self._last_background_masks.get(key),
+            "important_mask": self._last_important_masks.get(key),
+            "token_mask": self._last_token_masks.get(key),
+        }
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -675,102 +722,118 @@ class VLAFlowMatching(nn.Module):
         
         return merged
 
-    def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: "torch.Tensor" = None
-    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for SmolVLM transformer processing.
-        
-        Experimental: allow the vision encoder to reuse cached tokens outside the center region.
-        """
-        embs = []
-        pad_masks = []
-        att_masks = []
-        full_update_interval = self.config.full_update_interval
-        center_patch_ratio = self.config.center_patch_ratio
-        enable_partial_update = self.config.enable_partial_update
-        reuse_log_interval = self.config.reuse_log_interval
-        record_attn = self.config.record_attn
-        attn_reduce = self.config.attn_reduce
+    def _ensure_token_cache_state(self, batch_size: int) -> None:
+        if self._token_cache_batch_size is None:
+            self._token_cache_batch_size = batch_size
+            return
+        if self._token_cache_batch_size != batch_size:
+            self._token_cache_batch_size = batch_size
+            self._prev_image_tokens = {}
+            self._token_keep_masks = {}
 
-        self._last_update_masks = {}
-        self._last_attn_maps = {}
-        self._last_reuse_analysis = {}
+    def _infer_patch_grid(self, image: torch.Tensor, num_tokens: int) -> tuple[int, int, bool]:
+        grid_h = 0
+        grid_w = 0
+        has_cls = False
+        vision_model = self.vlm_with_expert.get_vlm_model().vision_model
+        patch_size = getattr(vision_model, "patch_size", None)
+        if patch_size is not None and image is not None:
+            if isinstance(patch_size, (tuple, list)):
+                patch_h = int(patch_size[0])
+                patch_w = int(patch_size[1])
+            else:
+                patch_h = int(patch_size)
+                patch_w = int(patch_size)
+            if patch_h > 0 and patch_w > 0:
+                grid_h = int(image.shape[-2] // patch_h)
+                grid_w = int(image.shape[-1] // patch_w)
+                num_patches = grid_h * grid_w
+                if num_tokens == num_patches + 1:
+                    return grid_h, grid_w, True
+                if num_tokens == num_patches:
+                    return grid_h, grid_w, False
+        side = int(round(num_tokens**0.5))
+        if side * side == num_tokens:
+            return side, side, False
+        if side * side + 1 == num_tokens:
+            return side, side, True
+        return 0, 0, False
 
+    def _encode_images(self, images, img_masks):
+        image_embs: list[torch.Tensor] = []
+        image_token_masks: list[torch.Tensor] = []
+        image_meta: list[dict[str, object]] = []
         image_keys = getattr(self, "_last_image_keys", None)
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
-            image_key = None
+        for _img_idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=False)):
             if image_keys and _img_idx < len(image_keys):
                 image_key = image_keys[_img_idx]
             else:
                 image_key = f"image{_img_idx}"
+
+            img_emb = self.vlm_with_expert.embed_image(
+                img,
+                cache_name=image_key,
+                cache_key=_img_idx,
+            )
+
+            img_emb_dim = img_emb.shape[-1]
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+            bsize, num_img_embs = img_emb.shape[:2]
+            if img_mask is None:
+                img_mask = torch.ones(bsize, dtype=torch.bool, device=img_emb.device)
+            token_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+            grid_h, grid_w, has_cls = self._infer_patch_grid(img, num_img_embs)
+            image_embs.append(img_emb)
+            image_token_masks.append(token_mask)
+            image_meta.append({"key": image_key, "grid_h": grid_h, "grid_w": grid_w, "has_cls": has_cls})
+
+        return image_embs, image_token_masks, image_meta
+
+    def _build_prefix_from_tokens(
+        self, image_embs, image_token_masks, lang_tokens, lang_masks, state: "torch.Tensor" = None
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        for img_emb, img_token_mask in zip(image_embs, image_token_masks, strict=False):
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
                         self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
                     )
                     .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
+                    .expand(img_emb.shape[0], -1, -1)
                 )
                 image_start_mask = torch.ones_like(
                     image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
                 )
-                att_masks += [0] * (image_start_mask.shape[-1])
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
-
-            # Get image embedding (vision encoder handles partial updates internally).
-            img_emb = self.vlm_with_expert.embed_image(
-                img,
-                center_patch_ratio=center_patch_ratio,
-                full_update_interval=full_update_interval,
-                enable_partial_update=enable_partial_update,
-                reuse_log_interval=reuse_log_interval,
-                record_attn=record_attn,
-                attn_reduce=attn_reduce,
-                cache_name=image_key,
-                cache_key=_img_idx,
-            )
-            update_mask = self.vlm_with_expert.get_last_update_mask(_img_idx)
-            if update_mask is not None:
-                self._last_update_masks[image_key] = update_mask
-            attn_maps = self.vlm_with_expert.get_last_attn_maps(_img_idx)
-            if attn_maps is not None:
-                self._last_attn_maps[image_key] = attn_maps
-            reuse_analysis = self.vlm_with_expert.get_last_reuse_analysis(_img_idx)
-            if reuse_analysis is not None:
-                self._last_reuse_analysis[image_key] = reuse_analysis
-
-            # Normalize image embeddings
-            img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+                att_masks += [0] * image_start_mask.shape[1]
 
             embs.append(img_emb)
-            pad_masks.append(img_mask)
+            pad_masks.append(img_token_mask)
+            att_masks += [0] * img_emb.shape[1]
 
-            att_masks += [0] * (num_img_embs)
             if self.add_image_special_tokens:
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
                         self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
                     )
                     .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
+                    .expand(img_emb.shape[0], -1, -1)
                 )
                 image_end_mask = torch.ones_like(
                     image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
                 )
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
-                att_masks += [0] * (image_end_mask.shape[1])
+                att_masks += [0] * image_end_mask.shape[1]
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
@@ -790,7 +853,6 @@ class VLAFlowMatching(nn.Module):
         state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
 
-        # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -804,8 +866,172 @@ class VLAFlowMatching(nn.Module):
             att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
 
         att_masks = att_masks.expand(bsize, -1)
-
         return embs, pad_masks, att_masks
+
+    def _compute_background_mask(
+        self,
+        tokens: torch.Tensor,
+        prev_tokens: torch.Tensor | None,
+        grid_h: int,
+        grid_w: int,
+        has_cls: bool,
+    ) -> torch.Tensor:
+        bsize, num_tokens = tokens.shape[:2]
+        temporal_thresh = self.config.token_temporal_threshold
+        spatial_thresh = self.config.token_spatial_threshold
+        if temporal_thresh is None and spatial_thresh is None:
+            return torch.zeros((bsize, num_tokens), dtype=torch.bool, device=tokens.device)
+
+        tokens_f = tokens.float()
+        temporal_ok = None
+        if temporal_thresh is not None:
+            if prev_tokens is None or prev_tokens.shape != tokens.shape:
+                temporal_ok = torch.zeros((bsize, num_tokens), dtype=torch.bool, device=tokens.device)
+            else:
+                prev_f = prev_tokens.float()
+                temporal_sim = (F.normalize(tokens_f, dim=-1) * F.normalize(prev_f, dim=-1)).sum(dim=-1)
+                temporal_ok = temporal_sim >= temporal_thresh
+
+        spatial_ok = None
+        if spatial_thresh is not None:
+            radius = max(0, int(self.config.token_spatial_radius))
+            if grid_h > 0 and grid_w > 0 and radius > 0:
+                patch_tokens = tokens_f[:, 1:] if has_cls else tokens_f
+                if patch_tokens.shape[1] == grid_h * grid_w:
+                    patch_tokens = patch_tokens.view(bsize, grid_h, grid_w, -1)
+                    x = patch_tokens.permute(0, 3, 1, 2)
+                    kernel = torch.ones(
+                        (x.shape[1], 1, 2 * radius + 1, 2 * radius + 1),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    neighbor_sum = F.conv2d(x, kernel, padding=radius, groups=x.shape[1])
+                    neighbor_sum = neighbor_sum - x
+                    count_kernel = torch.ones(
+                        (1, 1, 2 * radius + 1, 2 * radius + 1),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    ones = torch.ones((1, 1, grid_h, grid_w), dtype=x.dtype, device=x.device)
+                    neighbor_count = F.conv2d(ones, count_kernel, padding=radius) - 1.0
+                    neighbor_count = neighbor_count.clamp(min=1.0)
+                    neighbor_mean = neighbor_sum / neighbor_count
+                    spatial_sim = (x * neighbor_mean).sum(dim=1).view(bsize, grid_h * grid_w)
+                    if has_cls:
+                        spatial_sim = torch.cat(
+                            [torch.zeros((bsize, 1), dtype=spatial_sim.dtype, device=spatial_sim.device), spatial_sim],
+                            dim=1,
+                        )
+                    spatial_ok = spatial_sim >= spatial_thresh
+            if spatial_ok is None:
+                spatial_ok = torch.zeros((bsize, num_tokens), dtype=torch.bool, device=tokens.device)
+
+        if temporal_ok is None:
+            background_mask = spatial_ok
+        elif spatial_ok is None:
+            background_mask = temporal_ok
+        else:
+            background_mask = temporal_ok & spatial_ok
+
+        if has_cls and background_mask.numel() > 0:
+            background_mask[:, 0] = False
+        return background_mask
+
+    def _apply_background_fill(self, tokens: torch.Tensor, background_mask: torch.Tensor) -> torch.Tensor:
+        if background_mask is None or not background_mask.any():
+            return tokens
+        mode = self.config.background_fill
+        if mode == "none":
+            return tokens
+        tokens_out = tokens.clone()
+        if mode == "mean":
+            fill = tokens_out.mean(dim=1, keepdim=True).expand_as(tokens_out)
+        else:
+            fill = torch.zeros_like(tokens_out)
+        tokens_out = torch.where(background_mask.unsqueeze(-1), fill, tokens_out)
+        return tokens_out
+
+    def _apply_background_padding(
+        self, token_mask: torch.Tensor, background_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        if background_mask is None:
+            return token_mask
+        if background_mask.shape != token_mask.shape:
+            return token_mask
+        return token_mask & (~background_mask)
+
+    def _build_region_masks(
+        self, grid_h: int, grid_w: int, has_cls: bool, device: torch.device
+    ) -> torch.Tensor | None:
+        if grid_h <= 0 or grid_w <= 0:
+            return None
+        region_size = max(1, int(self.config.region_patch_size))
+        num_regions_h = (grid_h + region_size - 1) // region_size
+        num_regions_w = (grid_w + region_size - 1) // region_size
+        num_regions = num_regions_h * num_regions_w
+        num_patches = grid_h * grid_w
+        total_tokens = num_patches + (1 if has_cls else 0)
+
+        region_masks = torch.zeros((num_regions, total_tokens), dtype=torch.bool, device=device)
+        patch_idx = torch.arange(num_patches, device=device).view(grid_h, grid_w)
+        region_idx = 0
+        for rh in range(num_regions_h):
+            for rw in range(num_regions_w):
+                r0 = rh * region_size
+                r1 = min((rh + 1) * region_size, grid_h)
+                c0 = rw * region_size
+                c1 = min((rw + 1) * region_size, grid_w)
+                indices = patch_idx[r0:r1, c0:c1].reshape(-1)
+                if has_cls:
+                    indices = indices + 1
+                region_masks[region_idx, indices] = True
+                region_idx += 1
+        return region_masks
+
+    def _prune_tokens_for_image(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        background_mask: torch.Tensor | None,
+        keep_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsize, num_tokens, hidden = tokens.shape
+        if keep_mask.ndim == 1:
+            keep_mask = keep_mask.unsqueeze(0).expand(bsize, -1)
+        if keep_mask.shape[:2] != (bsize, num_tokens):
+            return tokens, token_mask
+        effective_keep = keep_mask & token_mask
+        if background_mask is not None:
+            effective_keep = effective_keep & (~background_mask)
+
+        min_keep = max(1, int(self.config.min_kept_tokens))
+        for b in range(bsize):
+            if int(effective_keep[b].sum().item()) < min_keep:
+                effective_keep[b] = token_mask[b]
+
+        keep_counts = effective_keep.sum(dim=1)
+        max_keep = int(keep_counts.max().item()) if keep_counts.numel() > 0 else 0
+        max_keep = max(1, max_keep)
+        pruned_tokens = tokens.new_zeros((bsize, max_keep, hidden))
+        pruned_masks = torch.zeros((bsize, max_keep), dtype=torch.bool, device=tokens.device)
+
+        for b in range(bsize):
+            idx = torch.nonzero(effective_keep[b], as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            pruned_tokens[b, : idx.numel()] = tokens[b, idx]
+            pruned_masks[b, : idx.numel()] = True
+
+        return pruned_tokens, pruned_masks
+
+    def embed_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, state: "torch.Tensor" = None
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Embed images with SigLIP and language tokens with embedding layer to prepare
+        for SmolVLM transformer processing.
+        """
+        image_embs, image_token_masks, _ = self._encode_images(images, img_masks)
+        return self._build_prefix_from_tokens(image_embs, image_token_masks, lang_tokens, lang_masks, state=state)
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -888,6 +1114,212 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
+    def _run_diffusion(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        noise: torch.Tensor,
+        use_rtc: bool = True,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> torch.Tensor:
+        bsize = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        num_steps = self.config.num_steps
+        dt = -1.0 / num_steps
+        x_t = noise
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                return self.denoise_step(
+                    x_t=input_x_t,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    timestep=current_timestep,
+                )
+
+            if use_rtc and self._rtc_enabled():
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=time,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
+            x_t = x_t + dt * v_t
+
+            if use_rtc and self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        return x_t
+
+    def _evaluate_region_importance(
+        self,
+        image_embs: list[torch.Tensor],
+        image_token_masks: list[torch.Tensor],
+        image_meta: list[dict[str, object]],
+        background_masks: dict[str, torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        state: torch.Tensor,
+        noise: torch.Tensor,
+        baseline_actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor] | None:
+        if self._rtc_enabled():
+            if not self._logged_rtc_skip:
+                logger.info("Region importance evaluation skipped because RTC is enabled.")
+                self._logged_rtc_skip = True
+            return None
+
+        bsize = baseline_actions.shape[0]
+        region_specs: list[tuple[int, int]] = []
+        region_masks_by_image: list[torch.Tensor | None] = []
+
+        for image_idx, meta in enumerate(image_meta):
+            grid_h = int(meta["grid_h"])
+            grid_w = int(meta["grid_w"])
+            has_cls = bool(meta["has_cls"])
+            region_masks = self._build_region_masks(grid_h, grid_w, has_cls, image_embs[image_idx].device)
+            region_masks_by_image.append(region_masks)
+            if region_masks is None:
+                continue
+            for region_idx in range(region_masks.shape[0]):
+                region_mask = region_masks[region_idx]
+                active = bool(region_mask.any().item())
+                if active:
+                    region_specs.append((image_idx, region_idx))
+
+        if not region_specs:
+            return None
+
+        num_variants = len(region_specs)
+        batched_image_embs = [emb.repeat(num_variants, 1, 1) for emb in image_embs]
+        batched_image_masks = [mask.repeat(num_variants, 1) for mask in image_token_masks]
+
+        perturbation = self.config.region_perturbation
+        noise_std = float(self.config.region_noise_std)
+        mean_tokens_by_image: dict[int, torch.Tensor] = {}
+        prev_tokens_by_image: dict[int, torch.Tensor] = {}
+
+        if perturbation in {"mean", "prev"}:
+            for image_idx, meta in enumerate(image_meta):
+                mean_tokens_by_image[image_idx] = image_embs[image_idx].mean(dim=1, keepdim=True).expand_as(
+                    image_embs[image_idx]
+                )
+                prev_tokens = self._prev_image_tokens.get(str(meta["key"]))
+                if prev_tokens is not None and prev_tokens.shape == image_embs[image_idx].shape:
+                    prev_tokens_by_image[image_idx] = prev_tokens
+
+        for variant_idx, (image_idx, region_idx) in enumerate(region_specs):
+            meta = image_meta[image_idx]
+            region_masks = region_masks_by_image[image_idx]
+            if region_masks is None:
+                continue
+            region_mask = region_masks[region_idx]
+            block = slice(variant_idx * bsize, (variant_idx + 1) * bsize)
+            tokens_block = batched_image_embs[image_idx][block]
+            region_token_mask = region_mask[None, :, None]
+            if not region_token_mask.any():
+                continue
+
+            if perturbation == "mean":
+                replacement = mean_tokens_by_image[image_idx]
+            elif perturbation == "prev":
+                replacement = prev_tokens_by_image.get(image_idx)
+                if replacement is None:
+                    replacement = mean_tokens_by_image[image_idx]
+            elif perturbation == "noise":
+                replacement = torch.randn_like(tokens_block) * noise_std
+            else:
+                replacement = torch.zeros_like(tokens_block)
+
+            perturbed = torch.where(region_token_mask, replacement, tokens_block)
+            batched_image_embs[image_idx][block] = perturbed
+
+        lang_tokens_rep = lang_tokens.repeat(num_variants, 1)
+        lang_masks_rep = lang_masks.repeat(num_variants, 1)
+        if state.ndim == 2:
+            state_rep = state.repeat(num_variants, 1)
+        else:
+            state_rep = state.repeat(num_variants, 1, 1)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
+            batched_image_embs, batched_image_masks, lang_tokens_rep, lang_masks_rep, state=state_rep
+        )
+        noise_rep = noise.repeat(num_variants, 1, 1)
+        actions_variants = self._run_diffusion(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, noise_rep, use_rtc=False
+        )
+
+        actions_variants = actions_variants.view(num_variants, bsize, *actions_variants.shape[1:])
+        deltas = torch.norm(actions_variants - baseline_actions[None, ...], dim=(2, 3))
+        important_flags = deltas >= float(self.config.region_importance_threshold)
+
+        keep_masks: dict[str, torch.Tensor] = {}
+        for image_idx, meta in enumerate(image_meta):
+            region_masks = region_masks_by_image[image_idx]
+            if region_masks is None:
+                continue
+            importance = torch.zeros(
+                (bsize, region_masks.shape[0]), dtype=torch.bool, device=baseline_actions.device
+            )
+            for variant_idx, (spec_image_idx, region_idx) in enumerate(region_specs):
+                if spec_image_idx != image_idx:
+                    continue
+                importance[:, region_idx] |= important_flags[variant_idx]
+
+            important_mask = torch.einsum("br,rn->bn", importance.float(), region_masks.float()) > 0
+            if bool(meta["has_cls"]) and important_mask.shape[1] > 0:
+                important_mask[:, 0] = True
+
+            self._last_important_masks[str(meta["key"])] = important_mask.detach()
+
+            interval_keep_mask = important_mask
+            bg_mask = background_masks.get(str(meta["key"]))
+            if bg_mask is not None and bg_mask.shape == important_mask.shape:
+                interval_keep_mask = ~(bg_mask & (~important_mask))
+            keep_masks[str(meta["key"])] = interval_keep_mask
+
+            total_tokens = image_embs[image_idx].shape[1] * bsize
+            if total_tokens > 0:
+                bg_count = int(bg_mask.sum().item()) if bg_mask is not None else 0
+                important_count = int(important_mask.sum().item())
+                logger.info(
+                    "Token selection frame=%d image=%s total=%d bg=%d (%.3f) important=%d (%.3f) regions=%d eval=%d",
+                    self._frame_counter,
+                    meta["key"],
+                    total_tokens,
+                    bg_count,
+                    bg_count / total_tokens,
+                    important_count,
+                    important_count / total_tokens,
+                    region_masks.shape[0],
+                    sum(1 for spec in region_specs if spec[0] == image_idx),
+                )
+
+        return keep_masks
+
     def sample_actions(
         self,
         images,
@@ -906,60 +1338,86 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=self.config.use_cache,
-            fill_kv_cache=True,
-        )
-        num_steps = self.config.num_steps
-        dt = -1.0 / num_steps
+        if not self.config.token_selection_enabled:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, state=state
+            )
+            x_t = self._run_diffusion(
+                prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, **kwargs
+            )
+            self._frame_counter += 1
+            return x_t
 
-        x_t = noise
-        for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+        self._ensure_token_cache_state(bsize)
+        image_embs, image_token_masks, image_meta = self._encode_images(images, img_masks)
+        raw_image_embs = [emb.detach() for emb in image_embs]
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                return self.denoise_step(
-                    x_t=input_x_t,
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    timestep=current_timestep,
+        background_masks: dict[str, torch.Tensor] = {}
+        self._last_overlay_keys = []
+        for emb, token_mask, meta in zip(image_embs, image_token_masks, image_meta, strict=False):
+            prev_tokens = self._prev_image_tokens.get(str(meta["key"]))
+            bg_mask = self._compute_background_mask(
+                emb, prev_tokens, int(meta["grid_h"]), int(meta["grid_w"]), bool(meta["has_cls"])
+            )
+            background_masks[str(meta["key"])] = bg_mask
+            key = str(meta["key"])
+            self._last_background_masks[key] = bg_mask.detach()
+            self._last_token_masks[key] = token_mask.detach()
+            self._last_token_meta[key] = {
+                "grid_h": int(meta["grid_h"]),
+                "grid_w": int(meta["grid_w"]),
+                "has_cls": bool(meta["has_cls"]),
+            }
+            self._last_overlay_keys.append(key)
+
+        eval_interval = int(self.config.region_eval_interval)
+        do_region_eval = eval_interval > 0 and (self._frame_counter % eval_interval == 0)
+
+        if self.config.token_prune_enabled and not do_region_eval and self._token_keep_masks:
+            pruned_embs = []
+            pruned_masks = []
+            for emb, mask, meta in zip(image_embs, image_token_masks, image_meta, strict=False):
+                keep_mask = self._token_keep_masks.get(str(meta["key"]))
+                if keep_mask is None:
+                    pruned_embs.append(emb)
+                    pruned_masks.append(mask)
+                    continue
+                pruned_emb, pruned_mask = self._prune_tokens_for_image(
+                    emb, mask, None, keep_mask
                 )
+                pruned_embs.append(pruned_emb)
+                pruned_masks.append(pruned_mask)
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
+                pruned_embs, pruned_masks, lang_tokens, lang_masks, state=state
+            )
+        else:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
+                image_embs, image_token_masks, lang_tokens, lang_masks, state=state
+            )
 
-            if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
+        x_t = self._run_diffusion(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, **kwargs
+        )
 
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+        if do_region_eval:
+            keep_masks = self._evaluate_region_importance(
+                image_embs,
+                image_token_masks,
+                image_meta,
+                background_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                noise,
+                x_t,
+            )
+            if keep_masks:
+                self._token_keep_masks.update(keep_masks)
 
-            x_t = x_t + dt * v_t
+        for emb, meta in zip(raw_image_embs, image_meta, strict=False):
+            self._prev_image_tokens[str(meta["key"])] = emb
 
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
-        # Increment frame counter for next call
         self._frame_counter += 1
-
         return x_t
 
     def denoise_step(

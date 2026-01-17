@@ -58,22 +58,12 @@ class EvalConfig:
     use_async_envs: bool = False
     # Maximum number of episodes to render into videos (0 disables video rendering).
     max_episodes_rendered: int = 10
-    # Whether to overlay reuse/update masks on rendered videos (debug-only).
-    render_reuse_mask: bool = False
-    # Which camera key to use when overlaying reuse/update masks.
-    render_reuse_camera: str = "image"
-    # Save per-layer attention maps for rendered episodes.
-    save_attn_maps: bool = False
-    # Save/overlay attention maps every N forwards (>=1).
-    attn_save_interval: int = 1
-    # Which camera key to use when saving attention maps.
-    attn_camera: str = "image"
-    # Whether to save attention heatmaps as standalone images (no video overlay).
-    render_attn_heatmap: bool = False
-    # Which layer to visualize (0-based, -1 for last, or "all" for every layer).
-    attn_heatmap_layer: int | str = -1
-    # Intensity scale for the saved attention heatmaps.
-    attn_heatmap_alpha: float = 1.0
+    # Overlay token selection on rendered videos.
+    overlay_token_masks: bool = False
+    # Alpha for token overlay (0 = transparent, 1 = opaque).
+    overlay_alpha: float = 0.35
+    # Which image index to visualize when multiple cameras are present.
+    overlay_image_index: int = 0
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
@@ -85,3 +75,7 @@ class EvalConfig:
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
             )
+        if not (0.0 <= self.overlay_alpha <= 1.0):
+            raise ValueError("eval.overlay_alpha must be between 0 and 1.")
+        if self.overlay_image_index < 0:
+            raise ValueError("eval.overlay_image_index must be >= 0.")

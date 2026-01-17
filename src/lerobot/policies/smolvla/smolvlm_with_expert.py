@@ -147,16 +147,6 @@ class SmolVLMWithExpertModel(nn.Module):
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
-        # Prefix KV cache for partial-frame updates (experimental)
-        self._prefix_kv_cache = {
-            "past_key_values": None,
-            "prefix_pad_masks": None,
-            "position_ids": None,
-            "batch_size": None,
-            "device": None,
-            "frame_counter": 0,
-        }
-
     def get_vlm_model(self):
         return self.vlm.model
 
@@ -193,52 +183,6 @@ class SmolVLMWithExpertModel(nn.Module):
                 params.requires_grad = False
 
 
-    def compute_prefix_kv_cache(
-        self,
-        attention_mask: torch.Tensor,
-        position_ids: torch.LongTensor,
-        prefix_embs: torch.FloatTensor,
-        use_cache: bool = True,
-        fill_kv_cache: bool = True,
-        full_update_interval: int = 10,
-    ):
-        """Compute or reuse prefix key/value cache for partial-frame updates.
-        This is an experimental, lightweight caching strategy: every `full_update_interval`
-        frames we recompute the full prefix KV cache, otherwise we reuse the cached
-        `past_key_values` previously stored. The cache is invalidated on batch-size or
-        device changes.
-        """
-        cache = self._prefix_kv_cache
-        bsize = prefix_embs.shape[0]
-        device = prefix_embs.device
-        cache['frame_counter'] = cache.get('frame_counter', 0) + 1
-        force_full = False
-        if cache.get('past_key_values') is None:
-            force_full = True
-        if cache.get('batch_size') is None or cache.get('batch_size') != bsize or cache.get('device') != device:
-            force_full = True
-        full_update = force_full or (
-            full_update_interval is not None and full_update_interval > 0 and (cache['frame_counter'] % full_update_interval == 0)
-        )
-        if full_update:
-            # Run a fresh forward to fill the KV cache for the prefix
-            outputs, past_key_values = self.forward(
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=use_cache,
-                fill_kv_cache=fill_kv_cache,
-            )
-            cache['past_key_values'] = past_key_values
-            cache['prefix_pad_masks'] = attention_mask
-            cache['position_ids'] = position_ids
-            cache['batch_size'] = bsize
-            cache['device'] = device
-            return past_key_values
-        else:
-            return cache['past_key_values']
-
     def train(self, mode: bool = True):
         super().train(mode)
 
@@ -248,58 +192,19 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.train_expert_only:
             self.vlm.eval()
 
-    def reset_vision_cache(self):
-        vision_model = self.get_vlm_model().vision_model
-        if hasattr(vision_model, "reset_partial_update_cache"):
-            vision_model.reset_partial_update_cache()
-
-    def get_last_update_mask(self, cache_key: int = 0):
-        vision_model = self.get_vlm_model().vision_model
-        if hasattr(vision_model, "get_last_update_mask"):
-            return vision_model.get_last_update_mask(cache_key)
-        return None
-
-    def get_last_attn_maps(self, cache_key: int = 0):
-        vision_model = self.get_vlm_model().vision_model
-        if hasattr(vision_model, "get_last_attn_maps"):
-            return vision_model.get_last_attn_maps(cache_key)
-        return None
-
-    def get_last_reuse_analysis(self, cache_key: int = 0):
-        vision_model = self.get_vlm_model().vision_model
-        if hasattr(vision_model, "get_last_reuse_analysis"):
-            return vision_model.get_last_reuse_analysis(cache_key)
-        return None
-
     def embed_image(
         self,
         image: torch.Tensor,
-        center_patch_ratio: float | None = None,
-        force_full_update: bool = False,
-        full_update_interval: int | None = None,
-        enable_partial_update: bool = True,
-        reuse_log_interval: int | None = None,
-        record_attn: bool = False,
-        attn_reduce: str | None = None,
         cache_name: str | None = None,
         cache_key: int | None = None,
     ):
         patch_attention_mask = None
-        if attn_reduce is None:
-            attn_reduce = "mean_heads_queries"
         # Get sequence from the vision encoder
         image_hidden_states = (
             self.get_vlm_model()
             .vision_model(
                 pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
                 patch_attention_mask=patch_attention_mask,
-                center_patch_ratio=center_patch_ratio,
-                force_full_update=force_full_update,
-                full_update_interval=full_update_interval,
-                enable_partial_update=enable_partial_update,
-                reuse_log_interval=reuse_log_interval,
-                record_attn=record_attn,
-                attn_reduce=attn_reduce,
                 cache_name=cache_name,
                 cache_key=cache_key if cache_key is not None else 0,
             )

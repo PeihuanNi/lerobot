@@ -16,7 +16,7 @@ import builtins
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from pathlib import Path
 from typing import Any, TypeVar
@@ -191,6 +191,38 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
+        cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        choice_name = config.get("type")
+        if isinstance(choice_name, str):
+            try:
+                subcls = cls.get_choice_class(choice_name)
+            except Exception:
+                subcls = None
+        else:
+            subcls = None
+
+        if subcls is not None:
+            valid_keys = {f.name for f in fields(subcls)}
+            valid_keys.add("type")
+            dropped = sorted(set(config) - valid_keys)
+            if dropped:
+                logger.warning(
+                    "Dropping unknown keys from %s config: %s", choice_name, ", ".join(dropped)
+                )
+            config = {k: v for k, v in config.items() if k in valid_keys}
+            config.pop("type", None)
+            with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
+                json.dump(config, f)
+                config_file = f.name
+            with draccus.config_type("json"):
+                return draccus.parse(subcls, config_file, args=cli_overrides)
+
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
@@ -198,17 +230,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
 
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
-
-        with open(config_file) as f:
-            config = json.load(f)
-
-        config.pop("type")
+        config.pop("type", None)
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
-        cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
             return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
