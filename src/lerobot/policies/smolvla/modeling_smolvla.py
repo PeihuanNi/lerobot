@@ -54,7 +54,8 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import logging
 import math
-from collections import deque
+import time
+from collections import defaultdict, deque
 from typing import TypedDict
 
 import torch
@@ -366,6 +367,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return None
         return getter(image_index=image_index)
 
+    def reset_timing_stats(self) -> None:
+        if not hasattr(self, "model"):
+            return
+        resetter = getattr(self.model, "reset_timing_stats", None)
+        if resetter is not None:
+            resetter()
+
+    def get_last_timing(self) -> dict[str, float] | None:
+        if not hasattr(self, "model"):
+            return None
+        getter = getattr(self.model, "get_last_timing", None)
+        if getter is None:
+            return None
+        return getter()
+
+    def get_timing_summary(self) -> dict[str, object] | None:
+        if not hasattr(self, "model"):
+            return None
+        getter = getattr(self.model, "get_timing_summary", None)
+        if getter is None:
+            return None
+        return getter()
+
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
@@ -601,6 +625,27 @@ class VLAFlowMatching(nn.Module):
         self._last_token_masks: dict[str, torch.Tensor] = {}
         self._last_token_meta: dict[str, dict[str, object]] = {}
         self._last_overlay_keys: list[str] = []
+        self._timing_totals: dict[str, float] = defaultdict(float)
+        self._timing_counts: int = 0
+        self._timing_totals_eval: dict[str, float] = defaultdict(float)
+        self._timing_totals_noeval: dict[str, float] = defaultdict(float)
+        self._timing_counts_eval: int = 0
+        self._timing_counts_noeval: int = 0
+        self._last_timing: dict[str, float] = {}
+        self._llm_pruned_total: float = 0.0
+        self._llm_pruned_count: int = 0
+        self._llm_unpruned_total: float = 0.0
+        self._llm_unpruned_count: int = 0
+        self._pruned_token_total: float = 0.0
+        self._pruned_token_counts: int = 0
+        self._pruned_token_denom_total: float = 0.0
+        self._token_stats_totals: dict[str, int] = {
+            "total": 0,
+            "important": 0,
+            "prunable_bg": 0,
+            "other": 0,
+        }
+        self._token_stats_counts: int = 0
 
     def reset_cache(self):
         """Reset cached embeddings. Should be called when the environment resets."""
@@ -647,6 +692,84 @@ class VLAFlowMatching(nn.Module):
             "important_mask": self._last_important_masks.get(key),
             "token_mask": self._last_token_masks.get(key),
         }
+
+    def _sync_if_cuda(self, device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def reset_timing_stats(self) -> None:
+        self._timing_totals = defaultdict(float)
+        self._timing_counts = 0
+        self._timing_totals_eval = defaultdict(float)
+        self._timing_totals_noeval = defaultdict(float)
+        self._timing_counts_eval = 0
+        self._timing_counts_noeval = 0
+        self._last_timing = {}
+        self._llm_pruned_total = 0.0
+        self._llm_pruned_count = 0
+        self._llm_unpruned_total = 0.0
+        self._llm_unpruned_count = 0
+        self._pruned_token_total = 0.0
+        self._pruned_token_counts = 0
+        self._pruned_token_denom_total = 0.0
+        self._token_stats_totals = {
+            "total": 0,
+            "important": 0,
+            "prunable_bg": 0,
+            "other": 0,
+        }
+        self._token_stats_counts = 0
+
+    def get_last_timing(self) -> dict[str, float]:
+        return dict(self._last_timing)
+
+    def get_timing_summary(self) -> dict[str, object]:
+        summary: dict[str, object] = {
+            "num_calls": self._timing_counts,
+            "num_eval_calls": self._timing_counts_eval,
+            "num_noeval_calls": self._timing_counts_noeval,
+            "num_llm_pruned_calls": self._llm_pruned_count,
+            "num_llm_unpruned_calls": self._llm_unpruned_count,
+        }
+        if self._timing_counts > 0:
+            avg = {k: v / self._timing_counts for k, v in self._timing_totals.items()}
+            summary["avg_s"] = avg
+        if self._timing_counts_eval > 0:
+            avg_eval = {k: v / self._timing_counts_eval for k, v in self._timing_totals_eval.items()}
+            summary["avg_eval_s"] = avg_eval
+        if self._timing_counts_noeval > 0:
+            avg_noeval = {k: v / self._timing_counts_noeval for k, v in self._timing_totals_noeval.items()}
+            summary["avg_noeval_s"] = avg_noeval
+        if self._llm_pruned_count > 0:
+            summary["avg_llm_pruned_s"] = self._llm_pruned_total / self._llm_pruned_count
+        else:
+            summary["avg_llm_pruned_s"] = 0.0
+        if self._llm_unpruned_count > 0:
+            summary["avg_llm_unpruned_s"] = self._llm_unpruned_total / self._llm_unpruned_count
+        else:
+            summary["avg_llm_unpruned_s"] = 0.0
+        if self._pruned_token_counts > 0:
+            summary["avg_pruned_tokens"] = self._pruned_token_total / self._pruned_token_counts
+        else:
+            summary["avg_pruned_tokens"] = 0.0
+        if self._pruned_token_denom_total > 0:
+            summary["avg_pruned_ratio"] = self._pruned_token_total / self._pruned_token_denom_total
+        else:
+            summary["avg_pruned_ratio"] = 0.0
+        token_totals = dict(self._token_stats_totals)
+        summary["token_counts"] = token_totals
+        total_tokens = token_totals.get("total", 0)
+        if self._token_stats_counts > 0:
+            summary["token_avg_counts"] = {
+                key: value / self._token_stats_counts for key, value in token_totals.items()
+            }
+        if total_tokens > 0:
+            summary["token_ratios"] = {
+                "important": token_totals.get("important", 0) / total_tokens,
+                "prunable_bg": token_totals.get("prunable_bg", 0) / total_tokens,
+                "other": token_totals.get("other", 0) / total_tokens,
+            }
+        return summary
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -730,6 +853,70 @@ class VLAFlowMatching(nn.Module):
             self._token_cache_batch_size = batch_size
             self._prev_image_tokens = {}
             self._token_keep_masks = {}
+
+    def _record_timing(self, timing: dict[str, float], is_eval: bool, pruned: bool) -> None:
+        self._timing_counts += 1
+        timing["call_idx"] = float(self._timing_counts)
+        self._last_timing = dict(timing)
+        for key, value in timing.items():
+            if key == "call_idx":
+                continue
+            self._timing_totals[key] += float(value)
+            if is_eval:
+                self._timing_totals_eval[key] += float(value)
+            else:
+                self._timing_totals_noeval[key] += float(value)
+        llm_time = float(timing.get("diffusion_prefix_s", 0.0))
+        if pruned:
+            self._llm_pruned_total += llm_time
+            self._llm_pruned_count += 1
+        else:
+            self._llm_unpruned_total += llm_time
+            self._llm_unpruned_count += 1
+        if is_eval:
+            self._timing_counts_eval += 1
+        else:
+            self._timing_counts_noeval += 1
+
+    def _accumulate_token_stats(
+        self,
+        background_masks: dict[str, torch.Tensor],
+        image_token_masks: list[torch.Tensor],
+        image_meta: list[dict[str, object]],
+    ) -> None:
+        total_tokens = 0
+        important_tokens = 0
+        prunable_tokens = 0
+        other_tokens = 0
+
+        for token_mask, meta in zip(image_token_masks, image_meta, strict=False):
+            key = str(meta["key"])
+            if token_mask.ndim != 2:
+                continue
+            valid = token_mask.bool()
+            bg_mask = background_masks.get(key)
+            if bg_mask is None or bg_mask.shape != valid.shape:
+                bg_mask = torch.zeros_like(valid)
+            important_mask = self._last_important_masks.get(key)
+            if important_mask is None or important_mask.shape != valid.shape:
+                important_mask = torch.zeros_like(valid)
+
+            important = important_mask & valid
+            prunable = bg_mask & (~important) & valid
+            other = valid & (~important) & (~bg_mask)
+
+            total_tokens += int(valid.sum().item())
+            important_tokens += int(important.sum().item())
+            prunable_tokens += int(prunable.sum().item())
+            other_tokens += int(other.sum().item())
+
+        if total_tokens == 0:
+            return
+        self._token_stats_counts += 1
+        self._token_stats_totals["total"] += total_tokens
+        self._token_stats_totals["important"] += important_tokens
+        self._token_stats_totals["prunable_bg"] += prunable_tokens
+        self._token_stats_totals["other"] += other_tokens
 
     def _infer_patch_grid(self, image: torch.Tensor, num_tokens: int) -> tuple[int, int, bool]:
         grid_h = 0
@@ -994,8 +1181,13 @@ class VLAFlowMatching(nn.Module):
         token_mask: torch.Tensor,
         background_mask: torch.Tensor | None,
         keep_mask: torch.Tensor,
+        timing: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsize, num_tokens, hidden = tokens.shape
+        device = tokens.device
+        if timing is not None:
+            self._sync_if_cuda(device)
+            mask_start = time.perf_counter()
         if keep_mask.ndim == 1:
             keep_mask = keep_mask.unsqueeze(0).expand(bsize, -1)
         if keep_mask.shape[:2] != (bsize, num_tokens):
@@ -1012,6 +1204,12 @@ class VLAFlowMatching(nn.Module):
         keep_counts = effective_keep.sum(dim=1)
         max_keep = int(keep_counts.max().item()) if keep_counts.numel() > 0 else 0
         max_keep = max(1, max_keep)
+        if timing is not None:
+            self._sync_if_cuda(device)
+            mask_end = time.perf_counter()
+            timing["prune_mask_s"] = timing.get("prune_mask_s", 0.0) + (mask_end - mask_start)
+            self._sync_if_cuda(device)
+            pack_start = time.perf_counter()
         pruned_tokens = tokens.new_zeros((bsize, max_keep, hidden))
         pruned_masks = torch.zeros((bsize, max_keep), dtype=torch.bool, device=tokens.device)
 
@@ -1021,6 +1219,10 @@ class VLAFlowMatching(nn.Module):
                 continue
             pruned_tokens[b, : idx.numel()] = tokens[b, idx]
             pruned_masks[b, : idx.numel()] = True
+        if timing is not None:
+            self._sync_if_cuda(device)
+            pack_end = time.perf_counter()
+            timing["prune_pack_s"] = timing.get("prune_pack_s", 0.0) + (pack_end - pack_start)
 
         return pruned_tokens, pruned_masks
 
@@ -1121,13 +1323,19 @@ class VLAFlowMatching(nn.Module):
         prefix_att_masks: torch.Tensor,
         noise: torch.Tensor,
         use_rtc: bool = True,
+        timing: dict[str, float] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> torch.Tensor:
         bsize = prefix_pad_masks.shape[0]
         device = prefix_pad_masks.device
-
+        if timing is not None:
+            self._sync_if_cuda(device)
+        diffusion_start = time.perf_counter()
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        if timing is not None:
+            self._sync_if_cuda(device)
+        prefix_start = time.perf_counter()
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
@@ -1136,13 +1344,19 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        if timing is not None:
+            self._sync_if_cuda(device)
+        prefix_end = time.perf_counter()
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
         x_t = noise
+        if timing is not None:
+            self._sync_if_cuda(device)
+        denoise_start = time.perf_counter()
         for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            t_val = 1.0 + step * dt
+            time_tensor = torch.tensor(t_val, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -1160,7 +1374,7 @@ class VLAFlowMatching(nn.Module):
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
-                    time=time,
+                    time=t_val,
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
                 )
@@ -1170,8 +1384,16 @@ class VLAFlowMatching(nn.Module):
             x_t = x_t + dt * v_t
 
             if use_rtc and self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                self.rtc_processor.track(time=t_val, x_t=x_t, v_t=v_t)
+        if timing is not None:
+            self._sync_if_cuda(device)
+        denoise_end = time.perf_counter()
+        diffusion_end = denoise_end
 
+        if timing is not None:
+            timing["diffusion_prefix_s"] = prefix_end - prefix_start
+            timing["diffusion_denoise_s"] = denoise_end - denoise_start
+            timing["diffusion_total_s"] = diffusion_end - diffusion_start
         return x_t
 
     def _evaluate_region_importance(
@@ -1305,18 +1527,19 @@ class VLAFlowMatching(nn.Module):
             if total_tokens > 0:
                 bg_count = int(bg_mask.sum().item()) if bg_mask is not None else 0
                 important_count = int(important_mask.sum().item())
-                logger.info(
-                    "Token selection frame=%d image=%s total=%d bg=%d (%.3f) important=%d (%.3f) regions=%d eval=%d",
-                    self._frame_counter,
-                    meta["key"],
-                    total_tokens,
-                    bg_count,
-                    bg_count / total_tokens,
-                    important_count,
-                    important_count / total_tokens,
-                    region_masks.shape[0],
-                    sum(1 for spec in region_specs if spec[0] == image_idx),
-                )
+                if self.config.token_selection_log_frames:
+                    logger.info(
+                        "Token selection frame=%d image=%s total=%d bg=%d (%.3f) important=%d (%.3f) regions=%d eval=%d",
+                        self._frame_counter,
+                        meta["key"],
+                        total_tokens,
+                        bg_count,
+                        bg_count / total_tokens,
+                        important_count,
+                        important_count / total_tokens,
+                        region_masks.shape[0],
+                        sum(1 for spec in region_specs if spec[0] == image_idx),
+                    )
 
         return keep_masks
 
@@ -1331,29 +1554,56 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = state.shape[0]
+        timing: dict[str, float] = {}
         device = state.device
+        self._sync_if_cuda(device)
+        total_start = time.perf_counter()
+        bsize = state.shape[0]
 
         if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         if not self.config.token_selection_enabled:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks, state=state
+            self._sync_if_cuda(device)
+            encode_start = time.perf_counter()
+            image_embs, image_token_masks, _ = self._encode_images(images, img_masks)
+            self._sync_if_cuda(device)
+            timing["vision_encode_s"] = time.perf_counter() - encode_start
+
+            self._sync_if_cuda(device)
+            prefix_start = time.perf_counter()
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
+                image_embs, image_token_masks, lang_tokens, lang_masks, state=state
             )
+            self._sync_if_cuda(device)
+            timing["prefix_build_s"] = time.perf_counter() - prefix_start
+
             x_t = self._run_diffusion(
-                prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, **kwargs
+                prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, timing=timing, **kwargs
             )
+            timing["background_s"] = 0.0
+            timing["prune_s"] = 0.0
+            timing["region_eval_s"] = 0.0
+            timing["token_selection_s"] = 0.0
+            self._sync_if_cuda(device)
+            timing["total_s"] = time.perf_counter() - total_start
+            self._record_timing(timing, is_eval=False, pruned=False)
             self._frame_counter += 1
             return x_t
 
         self._ensure_token_cache_state(bsize)
+        self._sync_if_cuda(device)
+        encode_start = time.perf_counter()
         image_embs, image_token_masks, image_meta = self._encode_images(images, img_masks)
+        self._sync_if_cuda(device)
+        timing["vision_encode_s"] = time.perf_counter() - encode_start
         raw_image_embs = [emb.detach() for emb in image_embs]
 
         background_masks: dict[str, torch.Tensor] = {}
         self._last_overlay_keys = []
+        self._sync_if_cuda(device)
+        background_start = time.perf_counter()
         for emb, token_mask, meta in zip(image_embs, image_token_masks, image_meta, strict=False):
             prev_tokens = self._prev_image_tokens.get(str(meta["key"]))
             bg_mask = self._compute_background_mask(
@@ -1369,37 +1619,68 @@ class VLAFlowMatching(nn.Module):
                 "has_cls": bool(meta["has_cls"]),
             }
             self._last_overlay_keys.append(key)
+        self._sync_if_cuda(device)
+        timing["background_s"] = time.perf_counter() - background_start
 
         eval_interval = int(self.config.region_eval_interval)
         do_region_eval = eval_interval > 0 and (self._frame_counter % eval_interval == 0)
+        pruned_forward = False
+        removed_tokens = 0.0
+        total_tokens = 0.0
+        total_tokens_computed = False
 
         if self.config.token_prune_enabled and not do_region_eval and self._token_keep_masks:
             pruned_embs = []
             pruned_masks = []
+            self._sync_if_cuda(device)
+            prune_start = time.perf_counter()
             for emb, mask, meta in zip(image_embs, image_token_masks, image_meta, strict=False):
+                mask_total = int(mask.sum().item())
+                total_tokens += mask_total
+                total_tokens_computed = True
                 keep_mask = self._token_keep_masks.get(str(meta["key"]))
                 if keep_mask is None:
                     pruned_embs.append(emb)
                     pruned_masks.append(mask)
                     continue
                 pruned_emb, pruned_mask = self._prune_tokens_for_image(
-                    emb, mask, None, keep_mask
+                    emb, mask, None, keep_mask, timing=timing
                 )
+                if int(pruned_mask.sum().item()) < int(mask.sum().item()):
+                    pruned_forward = True
+                removed_tokens += max(0, mask_total - int(pruned_mask.sum().item()))
                 pruned_embs.append(pruned_emb)
                 pruned_masks.append(pruned_mask)
+            self._sync_if_cuda(device)
+            timing["prune_s"] = time.perf_counter() - prune_start
+            self._sync_if_cuda(device)
+            prefix_start = time.perf_counter()
             prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
                 pruned_embs, pruned_masks, lang_tokens, lang_masks, state=state
             )
+            self._sync_if_cuda(device)
+            timing["prefix_build_s"] = time.perf_counter() - prefix_start
         else:
+            timing["prune_s"] = 0.0
+            self._sync_if_cuda(device)
+            prefix_start = time.perf_counter()
             prefix_embs, prefix_pad_masks, prefix_att_masks = self._build_prefix_from_tokens(
                 image_embs, image_token_masks, lang_tokens, lang_masks, state=state
             )
+            self._sync_if_cuda(device)
+            timing["prefix_build_s"] = time.perf_counter() - prefix_start
 
         x_t = self._run_diffusion(
-            prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, **kwargs
+            prefix_embs, prefix_pad_masks, prefix_att_masks, noise, use_rtc=True, timing=timing, **kwargs
         )
 
+        if not do_region_eval and not total_tokens_computed:
+            total_tokens = sum(int(mask.sum().item()) for mask in image_token_masks)
+            total_tokens_computed = True
+
         if do_region_eval:
+            self._sync_if_cuda(device)
+            region_start = time.perf_counter()
             keep_masks = self._evaluate_region_importance(
                 image_embs,
                 image_token_masks,
@@ -1411,12 +1692,29 @@ class VLAFlowMatching(nn.Module):
                 noise,
                 x_t,
             )
+            self._sync_if_cuda(device)
+            timing["region_eval_s"] = time.perf_counter() - region_start
             if keep_masks:
                 self._token_keep_masks.update(keep_masks)
+        else:
+            timing["region_eval_s"] = 0.0
 
         for emb, meta in zip(raw_image_embs, image_meta, strict=False):
             self._prev_image_tokens[str(meta["key"])] = emb
 
+        self._accumulate_token_stats(background_masks, image_token_masks, image_meta)
+        timing["token_selection_s"] = (
+            timing.get("background_s", 0.0)
+            + timing.get("region_eval_s", 0.0)
+            + timing.get("prune_s", 0.0)
+        )
+        self._sync_if_cuda(device)
+        timing["total_s"] = time.perf_counter() - total_start
+        self._record_timing(timing, is_eval=do_region_eval, pruned=pruned_forward)
+        if not do_region_eval:
+            self._pruned_token_total += removed_tokens
+            self._pruned_token_counts += 1
+            self._pruned_token_denom_total += total_tokens
         self._frame_counter += 1
         return x_t
 

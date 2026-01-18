@@ -125,6 +125,8 @@ class SmolVLAConfig(PreTrainedConfig):
     region_noise_std: float = 1e-3
     # Minimum tokens to keep per image when pruning.
     min_kept_tokens: int = 1
+    # Log per-frame token selection stats (debug-only).
+    token_selection_log_frames: bool = False
 
     def __post_init__(self):
         super().__post_init__()

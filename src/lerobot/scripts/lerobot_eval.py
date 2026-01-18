@@ -148,6 +148,9 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    timing_calls_seen = -1
+    infer_time_sum = 0.0
+    infer_time_count = 0
 
     step = 0
     # Keep track of which environments are done.
@@ -176,6 +179,15 @@ def rollout(
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
+        timing = None
+        if hasattr(policy, "get_last_timing"):
+            timing = policy.get_last_timing()
+        if timing and "call_idx" in timing and "total_s" in timing:
+            call_idx = int(timing["call_idx"])
+            if call_idx != timing_calls_seen:
+                timing_calls_seen = call_idx
+                infer_time_sum += float(timing["total_s"])
+                infer_time_count += 1
         action = postprocessor(action)
 
         action_transition = {"action": action}
@@ -221,7 +233,11 @@ def rollout(
         running_success_rate = (
             einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+        postfix = {"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"}
+        if infer_time_count > 0:
+            avg_infer_ms = (infer_time_sum / infer_time_count) * 1000.0
+            postfix["avg_infer_ms"] = f"{avg_infer_ms:.1f}"
+        progbar.set_postfix(postfix)
         progbar.update()
 
     # Track the final observation.
@@ -536,9 +552,68 @@ def eval_policy(
                 threads.append(thread)
                 n_episodes_rendered += 1
 
-        progbar.set_postfix(
-            {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
-        )
+        postfix = {"sr": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
+        if hasattr(policy, "get_timing_summary"):
+            summary = policy.get_timing_summary()
+        else:
+            summary = None
+        if summary and isinstance(summary, dict):
+            avg = summary.get("avg_s", {})
+            avg_eval = summary.get("avg_eval_s", {})
+            avg_noeval = summary.get("avg_noeval_s", {})
+
+            total_ms = float(avg.get("total_s", 0.0)) * 1000.0 if isinstance(avg, dict) else 0.0
+            vision_ms = float(avg.get("vision_encode_s", 0.0)) * 1000.0 if isinstance(avg, dict) else 0.0
+            diff_ms = float(avg.get("diffusion_denoise_s", 0.0)) * 1000.0 if isinstance(avg, dict) else 0.0
+            bg_ms = float(avg.get("background_s", 0.0)) * 1000.0 if isinstance(avg, dict) else 0.0
+            region_ms = (
+                float(avg_eval.get("region_eval_s", 0.0)) * 1000.0 if isinstance(avg_eval, dict) else 0.0
+            )
+            mask_ms = (
+                float(avg_noeval.get("prune_mask_s", 0.0)) * 1000.0 if isinstance(avg_noeval, dict) else 0.0
+            )
+            prune_ms = (
+                float(avg_noeval.get("prune_pack_s", 0.0)) * 1000.0 if isinstance(avg_noeval, dict) else 0.0
+            )
+            eval_ms = float(avg_eval.get("total_s", 0.0)) * 1000.0 if isinstance(avg_eval, dict) else 0.0
+            noeval_ms = float(avg_noeval.get("total_s", 0.0)) * 1000.0 if isinstance(avg_noeval, dict) else 0.0
+            llm_pruned_ms = float(summary.get("avg_llm_pruned_s", 0.0)) * 1000.0
+            llm_unpruned_ms = float(summary.get("avg_llm_unpruned_s", 0.0)) * 1000.0
+            pruned_tokens = float(summary.get("avg_pruned_tokens", 0.0))
+            pruned_ratio = float(summary.get("avg_pruned_ratio", 0.0)) * 100.0
+
+            postfix.update(
+                {
+                    "avg_t": f"{total_ms:.1f}",
+                    "eval_t": f"{eval_ms:.1f}",
+                    "noeval_t": f"{noeval_ms:.1f}",
+                    "vis_t": f"{vision_ms:.1f}",
+                    "diff_t": f"{diff_ms:.1f}",
+                    "bg_t": f"{bg_ms:.1f}",
+                    "reg_t": f"{region_ms:.1f}",
+                    "mask_t": f"{mask_ms:.1f}",
+                    "prn_t": f"{prune_ms:.1f}",
+                    "p_llm": f"{llm_pruned_ms:.1f}",
+                    "u_llm": f"{llm_unpruned_ms:.1f}",
+                    "prn_tok": f"{pruned_tokens:.1f}",
+                    "prn_ratio": f"{pruned_ratio:.1f}%",
+                }
+            )
+
+            token_counts = summary.get("token_avg_counts", summary.get("token_counts", {}))
+            if isinstance(token_counts, dict):
+                total_tokens = float(token_counts.get("total", 0.0))
+                bg_tokens = float(token_counts.get("prunable_bg", 0.0))
+                region_tokens = float(token_counts.get("important", 0.0))
+                if total_tokens > 0:
+                    bg_ratio = bg_tokens / total_tokens * 100.0
+                    region_ratio = region_tokens / total_tokens * 100.0
+                    postfix["bg_ratio"] = f"{bg_tokens:.1f}/{bg_ratio:.1f}%"
+                    postfix["reg_ratio"] = f"{region_tokens:.1f}/{region_ratio:.1f}%"
+                else:
+                    postfix["bg_ratio"] = "0/0.0%"
+                    postfix["reg_ratio"] = "0/0.0%"
+        progbar.set_postfix(postfix)
 
     # Wait till all video rendering threads are done.
     for thread in threads:
@@ -794,6 +869,8 @@ def run_one(
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
+    if hasattr(policy, "reset_timing_stats"):
+        policy.reset_timing_stats()
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
         env,
@@ -811,6 +888,7 @@ def run_one(
         overlay_alpha=overlay_alpha,
         overlay_image_index=overlay_image_index,
     )
+    _log_timing_summary(policy, task_group=task_group, task_id=task_id)
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
@@ -999,6 +1077,141 @@ def build_eval_summary(info: dict) -> dict:
         overall["eval_ep_s"] = info["overall"].get("eval_ep_s")
 
     return {"per_task": per_task, "per_group": per_group, "overall": overall}
+
+
+def _format_pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def _log_timing_summary(policy: PreTrainedPolicy, task_group: str, task_id: int) -> None:
+    if not hasattr(policy, "get_timing_summary"):
+        return
+    summary = policy.get_timing_summary()
+    if not summary:
+        return
+    num_calls = int(summary.get("num_calls", 0))
+    num_eval_calls = int(summary.get("num_eval_calls", 0))
+    num_noeval_calls = int(summary.get("num_noeval_calls", 0))
+    avg = summary.get("avg_s", {})
+    if num_calls <= 0 or not avg:
+        return
+
+    total_s = float(avg.get("total_s", 0.0))
+    if total_s <= 0:
+        return
+
+    def _ms(value: float) -> float:
+        return value * 1000.0
+
+    avg_eval = summary.get("avg_eval_s", {})
+    avg_noeval = summary.get("avg_noeval_s", {})
+    token_counts = summary.get("token_avg_counts", summary.get("token_counts", {}))
+    total_tokens = float(token_counts.get("total", 0.0)) if isinstance(token_counts, dict) else 0.0
+    bg_tokens = float(token_counts.get("prunable_bg", 0.0)) if isinstance(token_counts, dict) else 0.0
+    region_tokens = float(token_counts.get("important", 0.0)) if isinstance(token_counts, dict) else 0.0
+    bg_ratio = (bg_tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0
+    region_ratio = (region_tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0
+
+    logging.info(
+        "Timing metrics task_group=%s task_id=%d calls=%d avg_time=%.2fms eval_time=%.2fms "
+        "noeval_time=%.2fms vision_time=%.2fms diff_time=%.2fms bg_time=%.2fms "
+        "region_time=%.2fms mask_time=%.2fms prune_time=%.2fms "
+        "prune_llm=%.2fms unprune_llm=%.2fms pruned_tokens=%.1f pruned_ratio=%.1f%% "
+        "bg_ratio=%.1f/%.1f%% region_ratio=%.1f/%.1f%%",
+        task_group,
+        task_id,
+        num_calls,
+        _ms(float(avg.get("total_s", 0.0))),
+        _ms(float(avg_eval.get("total_s", 0.0))) if isinstance(avg_eval, dict) else 0.0,
+        _ms(float(avg_noeval.get("total_s", 0.0))) if isinstance(avg_noeval, dict) else 0.0,
+        _ms(float(avg.get("vision_encode_s", 0.0))),
+        _ms(float(avg.get("diffusion_denoise_s", 0.0))),
+        _ms(float(avg.get("background_s", 0.0))),
+        _ms(float(avg_eval.get("region_eval_s", 0.0))) if isinstance(avg_eval, dict) else 0.0,
+        _ms(float(avg_noeval.get("prune_mask_s", 0.0))) if isinstance(avg_noeval, dict) else 0.0,
+        _ms(float(avg_noeval.get("prune_pack_s", 0.0))) if isinstance(avg_noeval, dict) else 0.0,
+        _ms(float(summary.get("avg_llm_pruned_s", 0.0))),
+        _ms(float(summary.get("avg_llm_unpruned_s", 0.0))),
+        float(summary.get("avg_pruned_tokens", 0.0)),
+        float(summary.get("avg_pruned_ratio", 0.0)) * 100.0,
+        bg_tokens,
+        bg_ratio,
+        region_tokens,
+        region_ratio,
+    )
+    if isinstance(avg_eval, dict) and "total_s" in avg_eval:
+        logging.info(
+            "Timing split task_group=%s task_id=%d eval_calls=%d eval_total=%.2fms",
+            task_group,
+            task_id,
+            num_eval_calls,
+            _ms(float(avg_eval.get("total_s", 0.0))),
+        )
+    if isinstance(avg_noeval, dict) and "total_s" in avg_noeval:
+        logging.info(
+            "Timing split task_group=%s task_id=%d noeval_calls=%d noeval_total=%.2fms",
+            task_group,
+            task_id,
+            num_noeval_calls,
+            _ms(float(avg_noeval.get("total_s", 0.0))),
+        )
+    llm_pruned_s = summary.get("avg_llm_pruned_s")
+    llm_unpruned_s = summary.get("avg_llm_unpruned_s")
+    llm_pruned_calls = int(summary.get("num_llm_pruned_calls", 0))
+    llm_unpruned_calls = int(summary.get("num_llm_unpruned_calls", 0))
+    if isinstance(llm_pruned_s, (int, float)):
+        logging.info(
+            "Timing LLM split task_group=%s task_id=%d pruned_calls=%d pruned_llm=%.2fms",
+            task_group,
+            task_id,
+            llm_pruned_calls,
+            _ms(float(llm_pruned_s)),
+        )
+    if isinstance(llm_unpruned_s, (int, float)):
+        logging.info(
+            "Timing LLM split task_group=%s task_id=%d unpruned_calls=%d unpruned_llm=%.2fms",
+            task_group,
+            task_id,
+            llm_unpruned_calls,
+            _ms(float(llm_unpruned_s)),
+        )
+
+    pct = {
+        "vision": float(avg.get("vision_encode_s", 0.0)) / total_s,
+        "prefix": float(avg.get("prefix_build_s", 0.0)) / total_s,
+        "diffusion": float(avg.get("diffusion_total_s", 0.0)) / total_s,
+        "background": float(avg.get("background_s", 0.0)) / total_s,
+        "region_eval": float(avg.get("region_eval_s", 0.0)) / total_s,
+        "prune": float(avg.get("prune_s", 0.0)) / total_s,
+        "token_sel": float(avg.get("token_selection_s", 0.0)) / total_s,
+    }
+    logging.info(
+        "Timing pct task_group=%s task_id=%d vision=%s prefix=%s diffusion=%s background=%s "
+        "region_eval=%s prune=%s token_sel=%s",
+        task_group,
+        task_id,
+        _format_pct(pct["vision"]),
+        _format_pct(pct["prefix"]),
+        _format_pct(pct["diffusion"]),
+        _format_pct(pct["background"]),
+        _format_pct(pct["region_eval"]),
+        _format_pct(pct["prune"]),
+        _format_pct(pct["token_sel"]),
+    )
+
+    token_counts = summary.get("token_counts", {})
+    token_ratios = summary.get("token_ratios", {})
+    total_tokens = int(token_counts.get("total", 0)) if isinstance(token_counts, dict) else 0
+    if total_tokens > 0 and isinstance(token_counts, dict) and isinstance(token_ratios, dict):
+        logging.info(
+            "Token ratio task_group=%s task_id=%d total_tokens=%d important=%s prunable_bg=%s other=%s",
+            task_group,
+            task_id,
+            total_tokens,
+            _format_pct(float(token_ratios.get("important", 0.0))),
+            _format_pct(float(token_ratios.get("prunable_bg", 0.0))),
+            _format_pct(float(token_ratios.get("other", 0.0))),
+        )
 
 
 def main():

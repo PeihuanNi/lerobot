@@ -7,6 +7,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=/home/nipeihuan/lerobot TOKENIZERS_PARALLELISM=fal
   --policy.token_spatial_threshold=0.9 \
   --policy.token_spatial_radius=1 \
   --policy.background_fill=zero \
+  --policy.token_selection_log_frames=false \
   --policy.region_patch_size=1 \
   --policy.region_eval_interval=2 \
   --policy.region_importance_threshold=4.0 \
