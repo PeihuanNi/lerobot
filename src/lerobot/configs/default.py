@@ -64,6 +64,14 @@ class EvalConfig:
     overlay_alpha: float = 0.35
     # Which image index to visualize when multiple cameras are present.
     overlay_image_index: int = 0
+    # Whether to draw region scores on the overlay.
+    overlay_show_scores: bool = False
+    # Number of decimals to show for region scores.
+    overlay_score_precision: int = 2
+    # Normalization for region scores on overlay: "none", "max", or "sum".
+    overlay_score_normalize: str = "none"
+    # Scale factor for overlay score text size.
+    overlay_score_scale: float = 0.6
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
@@ -79,3 +87,9 @@ class EvalConfig:
             raise ValueError("eval.overlay_alpha must be between 0 and 1.")
         if self.overlay_image_index < 0:
             raise ValueError("eval.overlay_image_index must be >= 0.")
+        if self.overlay_score_precision < 0:
+            raise ValueError("eval.overlay_score_precision must be >= 0.")
+        if self.overlay_score_normalize not in {"none", "max", "sum"}:
+            raise ValueError("eval.overlay_score_normalize must be one of: none, max, sum.")
+        if self.overlay_score_scale <= 0:
+            raise ValueError("eval.overlay_score_scale must be > 0.")

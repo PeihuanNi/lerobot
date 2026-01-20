@@ -760,6 +760,7 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
         reuse_log_interval = kwargs.pop("reuse_log_interval", 10)
         record_attn = kwargs.pop("record_attn", False)
         attn_reduce = kwargs.pop("attn_reduce", "mean_heads_queries")
+        update_mask_grid = kwargs.pop("update_mask_grid", None)
         cache_key = kwargs.pop("cache_key", 0)
         if cache_key is None:
             cache_key = 0
@@ -781,46 +782,74 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
 
         patch_attention_mask_grid = patch_attention_mask
         patch_attention_mask = patch_attention_mask.view(batch_size, -1)
+        num_patches = patch_attention_mask.shape[1]
         if center_patch_ratio is None:
             center_patch_ratio = 1.0
 
-        use_partial_update = enable_partial_update and center_patch_ratio < 1.0
         update_mask = None
         update_indices = None
         center_bounds = None
         disable_reason = None
+        use_partial_update = False
+        explicit_update_mask = update_mask_grid is not None
+        mask_ratio = float(center_patch_ratio)
 
-        if use_partial_update:
-            update_mask, same_mask = self._compute_center_update_mask(
-                patch_attention_mask_grid,
-                center_patch_ratio,
-            )
-            
-            if not same_mask:
-                # if batch masks differ, we cannot use partial update
-                use_partial_update = False
-                disable_reason = "batch masks differ"
+        if explicit_update_mask:
+            if not enable_partial_update:
+                disable_reason = "partial update disabled"
             else:
-                update_indices = torch.nonzero(update_mask[0], as_tuple=False).squeeze(-1)
-                
-                if update_indices.numel() == patch_attention_mask.shape[1]:
-                    # if all tokens are updated, no need for partial update
-                    use_partial_update = False
-                    disable_reason = "update covers all tokens"
+                update_mask_grid = update_mask_grid.to(dtype=torch.bool, device=pixel_values.device)
+                if update_mask_grid.shape != patch_attention_mask_grid.shape:
+                    disable_reason = "update mask shape mismatch"
                 else:
-                    update_indices = update_indices.to(pixel_values.device)
-                    center_bounds = self._compute_center_patch_bounds(
-                        patch_attention_mask_grid,
-                        center_patch_ratio,
-                    )
-                    
-                    if center_bounds[2] == 0 or center_bounds[3] == 0:
-                        # check for empty or mismatched center bounds   
+                    update_mask_grid = update_mask_grid & patch_attention_mask_grid
+                    update_mask = update_mask_grid.view(batch_size, -1)
+                    same_mask = bool(torch.all(update_mask == update_mask[:1]).item())
+                    if not same_mask:
+                        disable_reason = "batch masks differ"
+                    else:
+                        update_indices = torch.nonzero(update_mask[0], as_tuple=False).squeeze(-1)
+                        if update_indices.numel() == 0:
+                            disable_reason = "empty update mask"
+                        elif update_indices.numel() == num_patches:
+                            disable_reason = "update covers all tokens"
+                        else:
+                            update_indices = update_indices.to(pixel_values.device)
+                            mask_ratio = float(update_mask[0].float().mean().item()) if num_patches > 0 else 0.0
+                            use_partial_update = True
+        else:
+            use_partial_update = enable_partial_update and center_patch_ratio < 1.0
+            if use_partial_update:
+                update_mask, same_mask = self._compute_center_update_mask(
+                    patch_attention_mask_grid,
+                    center_patch_ratio,
+                )
+
+                if not same_mask:
+                    # if batch masks differ, we cannot use partial update
+                    use_partial_update = False
+                    disable_reason = "batch masks differ"
+                else:
+                    update_indices = torch.nonzero(update_mask[0], as_tuple=False).squeeze(-1)
+
+                    if update_indices.numel() == num_patches:
+                        # if all tokens are updated, no need for partial update
                         use_partial_update = False
-                        disable_reason = "empty center bounds"
-                    elif update_indices.numel() != center_bounds[2] * center_bounds[3]:
-                        use_partial_update = False
-                        disable_reason = "center bounds mismatch"
+                        disable_reason = "update covers all tokens"
+                    else:
+                        update_indices = update_indices.to(pixel_values.device)
+                        center_bounds = self._compute_center_patch_bounds(
+                            patch_attention_mask_grid,
+                            center_patch_ratio,
+                        )
+
+                        if center_bounds[2] == 0 or center_bounds[3] == 0:
+                            # check for empty or mismatched center bounds
+                            use_partial_update = False
+                            disable_reason = "empty center bounds"
+                        elif update_indices.numel() != center_bounds[2] * center_bounds[3]:
+                            use_partial_update = False
+                            disable_reason = "center bounds mismatch"
 
         use_ste = torch.is_grad_enabled() and self.training
 
@@ -835,7 +864,6 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
             and (frame_counter - last_full_frame) >= full_update_interval
         )
 
-        num_patches = patch_attention_mask.shape[1]
         embed_dim = self.embeddings.embed_dim
         num_heads = self.encoder.layers[0].self_attn.num_heads
         head_dim = self.encoder.layers[0].self_attn.head_dim
@@ -873,12 +901,12 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
                 pixel_values=pixel_values,
                 patch_attention_mask=patch_attention_mask_grid,
             )
-        elif use_ste:
+        elif use_ste or explicit_update_mask:
             hidden_states = self.embeddings(
                 pixel_values=pixel_values,
                 patch_attention_mask=patch_attention_mask_grid,
             )
-            hidden_states = merge_with_cache(hidden_states, cache["patch_embeddings"], update_mask, use_ste=True)
+            hidden_states = merge_with_cache(hidden_states, cache["patch_embeddings"], update_mask, use_ste=use_ste)
         else:
             position_ids = self.embeddings._get_position_ids(patch_attention_mask_grid)
             pos_embeds = self.embeddings.position_embedding(position_ids)
@@ -918,7 +946,7 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
                     message,
                     cache_name,
                     mode,
-                    float(center_patch_ratio),
+                    mask_ratio,
                     effective_update_tokens,
                     num_patches,
                     reuse_ratio,
@@ -1029,9 +1057,12 @@ class SmolVLMVisionTransformer(SmolVLMPreTrainedModel):
                     )
                     attn_weights_list = None
             else:
-                render_update_mask_grid = update_mask.view(
-                    batch_size, patch_attention_mask_grid.shape[1], patch_attention_mask_grid.shape[2]
-                )
+                if update_mask_grid is not None:
+                    render_update_mask_grid = update_mask_grid
+                else:
+                    render_update_mask_grid = update_mask.view(
+                        batch_size, patch_attention_mask_grid.shape[1], patch_attention_mask_grid.shape[2]
+                    )
                 if use_ste:
                     if record_attn:
                         encoder_outputs, layer_outputs, kv_cache, attn_weights_list = self.encoder(

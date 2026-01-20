@@ -244,6 +244,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
 @dataclass
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
+    task_id: int | None = None  # optional: restrict to a single task index
     task_ids: list[int] | None = None  # optional: restrict to specific task indices (e.g., [0, 3] for tasks 0 and 3)
     fps: int = 30
     episode_length: int | None = None
@@ -276,6 +277,10 @@ class LiberoEnv(EnvConfig):
     control_mode: str = "relative"  # or "absolute"
 
     def __post_init__(self):
+        if self.task_id is not None:
+            if self.task_ids is not None and self.task_ids != [int(self.task_id)]:
+                raise ValueError("Specify only one of task_id or task_ids.")
+            self.task_ids = [int(self.task_id)]
         if self.obs_type == "pixels":
             self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)

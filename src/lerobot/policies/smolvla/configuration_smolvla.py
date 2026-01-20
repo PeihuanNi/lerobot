@@ -93,6 +93,33 @@ class SmolVLAConfig(PreTrainedConfig):
 
     prefix_length: int = -1
 
+    # Token selection / pruning
+    token_selection_enabled: bool = False
+    token_prune_enabled: bool = False
+    token_importance_method: str = "grad"
+    token_temporal_threshold: float = 0.9
+    token_spatial_threshold: float = 0.9
+    token_spatial_radius: int = 1
+    background_fill: str = "zero"
+    token_selection_log_frames: bool = False
+    region_patch_size: int = 1
+    region_eval_interval: int = 1
+    min_kept_tokens: int = 0
+    max_kept_tokens: int = 0
+
+    # Grad-based token importance
+    grad_denoise_steps: int = 1
+    grad_region_mass: float = 0.9
+    grad_region_ema: float = 0.0
+    grad_keep_prev: bool = False
+    grad_alpha: float = 1.0
+    grad_beta: float = 1.0
+    grad_tau: float = 0.1
+    grad_region_reduce: str = "mean"
+
+    # Vision encoder partial update
+    vision_partial_update_enabled: bool = False
+
     pad_language_to: str = "longest"  # "max_length"
 
     num_expert_layers: int = -1  # Less or equal to 0 is the default where the action expert has the same number of layers of VLM. Otherwise the expert have less layers.
@@ -105,28 +132,6 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
-    # Token selection + region perturbation (inference-only, experimental).
-    token_selection_enabled: bool = False
-    token_prune_enabled: bool = True
-    token_temporal_threshold: float | None = 0.9
-    token_spatial_threshold: float | None = 0.9
-    token_spatial_radius: int = 1
-    # Fill strategy for background tokens: "zero", "mean", or "none".
-    background_fill: str = "zero"
-    # Region granularity in patch units (square).
-    region_patch_size: int = 4
-    # Re-evaluate region importance every N forwards. <= 0 disables re-evaluation.
-    region_eval_interval: int = 5
-    # L2 delta threshold for marking a region as important.
-    region_importance_threshold: float = 0.05
-    # Perturbation strategy: "zero", "mean", "prev", or "noise".
-    region_perturbation: str = "zero"
-    # Noise std for "noise" perturbation.
-    region_noise_std: float = 1e-3
-    # Minimum tokens to keep per image when pruning.
-    min_kept_tokens: int = 1
-    # Log per-frame token selection stats (debug-only).
-    token_selection_log_frames: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -141,16 +146,40 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
-        if self.token_spatial_radius < 0:
-            raise ValueError("token_spatial_radius must be >= 0.")
-        if self.region_patch_size <= 0:
-            raise ValueError("region_patch_size must be > 0.")
+        if self.token_importance_method not in {"grad"}:
+            raise ValueError(
+                f"token_importance_method must be 'grad'. Got {self.token_importance_method}."
+            )
+        if self.background_fill not in {"zero", "mean", "noise", "cache"}:
+            raise ValueError(
+                f"background_fill must be one of: zero, mean, noise, cache. Got {self.background_fill}."
+            )
+        if self.region_patch_size < 1:
+            raise ValueError("region_patch_size must be >= 1.")
+        if self.region_eval_interval < 1:
+            raise ValueError("region_eval_interval must be >= 1.")
         if self.min_kept_tokens < 0:
             raise ValueError("min_kept_tokens must be >= 0.")
-        if self.background_fill not in {"zero", "mean", "none"}:
-            raise ValueError("background_fill must be one of: zero, mean, none.")
-        if self.region_perturbation not in {"zero", "mean", "prev", "noise"}:
-            raise ValueError("region_perturbation must be one of: zero, mean, prev, noise.")
+        if self.max_kept_tokens < 0:
+            raise ValueError("max_kept_tokens must be >= 0.")
+        if self.max_kept_tokens > 0 and self.max_kept_tokens < self.min_kept_tokens:
+            raise ValueError("max_kept_tokens must be >= min_kept_tokens.")
+        if not (0.0 <= self.grad_region_mass <= 1.0):
+            raise ValueError("grad_region_mass must be between 0 and 1.")
+        if not (0.0 <= self.grad_region_ema <= 1.0):
+            raise ValueError("grad_region_ema must be between 0 and 1.")
+        if self.grad_denoise_steps < 1:
+            raise ValueError("grad_denoise_steps must be >= 1.")
+        if self.grad_tau <= 0:
+            raise ValueError("grad_tau must be > 0.")
+        if self.grad_region_reduce not in {"sum", "mean"}:
+            raise ValueError("grad_region_reduce must be one of: sum, mean.")
+        if not (0.0 <= self.token_temporal_threshold <= 1.0):
+            raise ValueError("token_temporal_threshold must be between 0 and 1.")
+        if not (0.0 <= self.token_spatial_threshold <= 1.0):
+            raise ValueError("token_spatial_threshold must be between 0 and 1.")
+        if self.token_spatial_radius < 0:
+            raise ValueError("token_spatial_radius must be >= 0.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

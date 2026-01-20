@@ -177,8 +177,14 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
-        with torch.inference_mode():
+        use_grad = False
+        if hasattr(policy, "requires_grad_for_action"):
+            use_grad = bool(policy.requires_grad_for_action())
+        if use_grad:
             action = policy.select_action(observation)
+        else:
+            with torch.inference_mode():
+                action = policy.select_action(observation)
         timing = None
         if hasattr(policy, "get_last_timing"):
             timing = policy.get_last_timing()
@@ -195,7 +201,7 @@ def rollout(
         action = action_transition["action"]
 
         # Convert to CPU / numpy.
-        action_numpy: np.ndarray = action.to("cpu").numpy()
+        action_numpy: np.ndarray = action.detach().to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
         # Apply the next action.
@@ -280,11 +286,31 @@ def _mask_to_numpy(mask: torch.Tensor | np.ndarray | None, batch_idx: int) -> np
     return None
 
 
+def _array_to_numpy(arr: torch.Tensor | np.ndarray | None, batch_idx: int) -> np.ndarray | None:
+    if arr is None:
+        return None
+    if isinstance(arr, torch.Tensor):
+        arr_np = arr.detach().cpu().numpy()
+    else:
+        arr_np = np.asarray(arr)
+    if arr_np.ndim == 2:
+        if batch_idx >= arr_np.shape[0]:
+            return None
+        return arr_np[batch_idx]
+    if arr_np.ndim == 1:
+        return arr_np
+    return None
+
+
 def _overlay_tokens_on_frame(
     frame: np.ndarray,
     overlay: dict[str, object],
     batch_idx: int,
     alpha: float,
+    show_scores: bool,
+    score_precision: int,
+    score_normalize: str,
+    score_scale: float,
 ) -> np.ndarray:
     if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
         return frame
@@ -296,7 +322,11 @@ def _overlay_tokens_on_frame(
     has_cls = bool(overlay.get("has_cls", False))
     background = _mask_to_numpy(overlay.get("background_mask"), batch_idx)
     important = _mask_to_numpy(overlay.get("important_mask"), batch_idx)
+    keep_mask = _mask_to_numpy(overlay.get("keep_mask"), batch_idx)
+    clipped_mask = _mask_to_numpy(overlay.get("clipped_mask"), batch_idx)
     token_mask = _mask_to_numpy(overlay.get("token_mask"), batch_idx)
+    region_scores = _array_to_numpy(overlay.get("region_scores"), batch_idx)
+    region_patch_size = int(overlay.get("region_patch_size", 1))
 
     num_tokens = grid_h * grid_w
     if token_mask is None:
@@ -309,12 +339,20 @@ def _overlay_tokens_on_frame(
             background = background[1:]
         if important is not None and important.size > 0:
             important = important[1:]
+        if keep_mask is not None and keep_mask.size > 0:
+            keep_mask = keep_mask[1:]
+        if clipped_mask is not None and clipped_mask.size > 0:
+            clipped_mask = clipped_mask[1:]
 
     if token_mask.size != num_tokens:
         return frame
     if background is not None and background.size != num_tokens:
         return frame
     if important is not None and important.size != num_tokens:
+        return frame
+    if keep_mask is not None and keep_mask.size != num_tokens:
+        return frame
+    if clipped_mask is not None and clipped_mask.size != num_tokens:
         return frame
 
     if background is None:
@@ -324,13 +362,20 @@ def _overlay_tokens_on_frame(
 
     valid = token_mask.astype(bool)
     important = important.astype(bool) & valid
-    background = background.astype(bool) & valid
-    prunable = background & (~important)
-    other = valid & (~important) & (~background)
+    if keep_mask is not None:
+        kept = keep_mask.astype(bool) & valid
+        clipped = clipped_mask.astype(bool) & valid if clipped_mask is not None else np.zeros_like(valid)
+        prunable = valid & (~kept) & (~clipped)
+        other = kept & (~important)
+    else:
+        background = background.astype(bool) & valid
+        prunable = background & (~important)
+        other = valid & (~important) & (~background)
 
     important_grid = important.reshape(grid_h, grid_w)
     prunable_grid = prunable.reshape(grid_h, grid_w)
     other_grid = other.reshape(grid_h, grid_w)
+    clipped_grid = clipped.reshape(grid_h, grid_w) if keep_mask is not None else None
 
     height, width = frame.shape[:2]
     ys = np.linspace(0, height, grid_h + 1, dtype=int)
@@ -341,10 +386,17 @@ def _overlay_tokens_on_frame(
     for i in range(grid_h):
         y0, y1 = ys[i], ys[i + 1]
         for j in range(grid_w):
-            if not (important_grid[i, j] or prunable_grid[i, j] or other_grid[i, j]):
+            if not (
+                important_grid[i, j]
+                or prunable_grid[i, j]
+                or other_grid[i, j]
+                or (clipped_grid is not None and clipped_grid[i, j])
+            ):
                 continue
             x0, x1 = xs[j], xs[j + 1]
-            if important_grid[i, j]:
+            if clipped_grid is not None and clipped_grid[i, j]:
+                color = (0.0, 0.0, 255.0)
+            elif important_grid[i, j]:
                 color = (255.0, 0.0, 0.0)
             elif prunable_grid[i, j]:
                 color = (0.0, 255.0, 0.0)
@@ -359,7 +411,58 @@ def _overlay_tokens_on_frame(
     frame_f = frame.astype(np.float32)
     alpha_mask = (overlay_mask * alpha)[:, :, None]
     blended = frame_f * (1.0 - alpha_mask) + overlay_img * alpha_mask
-    return blended.astype(frame.dtype)
+    blended = blended.astype(frame.dtype)
+
+    if show_scores and region_scores is not None and region_patch_size > 0:
+        scores = region_scores.astype(np.float32, copy=True)
+        if score_normalize == "max":
+            denom = float(np.max(scores))
+            if denom > 0:
+                scores = scores / denom
+        elif score_normalize == "sum":
+            denom = float(np.sum(scores))
+            if denom > 0:
+                scores = scores / denom
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            return blended
+
+        num_regions_h = (grid_h + region_patch_size - 1) // region_patch_size
+        num_regions_w = (grid_w + region_patch_size - 1) // region_patch_size
+        if scores.size != num_regions_h * num_regions_w:
+            return blended
+
+        valid_grid = valid.reshape(grid_h, grid_w)
+        height, width = blended.shape[:2]
+        ys = np.linspace(0, height, grid_h + 1, dtype=int)
+        xs = np.linspace(0, width, grid_w + 1, dtype=int)
+        region_px = min(height / grid_h, width / grid_w) * region_patch_size
+        font_scale = max(0.2, min(0.8, region_px / 110.0)) * score_scale
+        thickness = 1
+
+        for rh in range(num_regions_h):
+            r0 = rh * region_patch_size
+            r1 = min((rh + 1) * region_patch_size, grid_h)
+            for rw in range(num_regions_w):
+                c0 = rw * region_patch_size
+                c1 = min((rw + 1) * region_patch_size, grid_w)
+                if not valid_grid[r0:r1, c0:c1].any():
+                    continue
+                region_idx = rh * num_regions_w + rw
+                score_val = float(scores[region_idx])
+                text = f"{score_val:.{score_precision}f}"
+                y0, y1 = ys[r0], ys[r1]
+                x0, x1 = xs[c0], xs[c1]
+                cx = int((x0 + x1) / 2)
+                cy = int((y0 + y1) / 2)
+                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                tx = max(0, min(width - text_size[0], cx - text_size[0] // 2))
+                ty = max(text_size[1], min(height - 1, cy + text_size[1] // 2))
+                cv2.putText(blended, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2)
+                cv2.putText(blended, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+
+    return blended
 
 
 def _apply_overlay_to_frames(
@@ -367,6 +470,10 @@ def _apply_overlay_to_frames(
     policy: PreTrainedPolicy,
     image_index: int,
     alpha: float,
+    show_scores: bool,
+    score_precision: int,
+    score_normalize: str,
+    score_scale: float,
 ) -> list[np.ndarray]:
     getter = getattr(policy, "get_last_token_overlay", None)
     if getter is None:
@@ -375,7 +482,16 @@ def _apply_overlay_to_frames(
     if overlay is None:
         return frames
     return [
-        _overlay_tokens_on_frame(frame, overlay, batch_idx, alpha)
+        _overlay_tokens_on_frame(
+            frame,
+            overlay,
+            batch_idx,
+            alpha,
+            show_scores,
+            score_precision,
+            score_normalize,
+            score_scale,
+        )
         for batch_idx, frame in enumerate(frames)
     ]
 
@@ -395,6 +511,10 @@ def eval_policy(
     overlay_token_masks: bool = False,
     overlay_alpha: float = 0.35,
     overlay_image_index: int = 0,
+    overlay_show_scores: bool = False,
+    overlay_score_precision: int = 2,
+    overlay_score_normalize: str = "none",
+    overlay_score_scale: float = 1.0,
 ) -> dict:
     """
     Args:
@@ -410,6 +530,10 @@ def eval_policy(
         overlay_token_masks: Whether to overlay token masks on rendered videos.
         overlay_alpha: Alpha value for overlay blending.
         overlay_image_index: Which image index to visualize for overlay.
+        overlay_show_scores: Whether to overlay region scores on rendered videos.
+        overlay_score_precision: Number of decimals to show for region scores.
+        overlay_score_normalize: Normalization mode for region scores ("none", "max", "sum").
+        overlay_score_scale: Scale factor for overlay score text size.
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
@@ -451,7 +575,16 @@ def eval_policy(
             frames = []
 
         if overlay_token_masks and frames:
-            frames = _apply_overlay_to_frames(frames, policy, overlay_image_index, overlay_alpha)
+            frames = _apply_overlay_to_frames(
+                frames,
+                policy,
+                overlay_image_index,
+                overlay_alpha,
+                overlay_show_scores,
+                overlay_score_precision,
+                overlay_score_normalize,
+                overlay_score_scale,
+            )
 
         if frames:
             ep_frames.append(np.stack(frames))
@@ -749,7 +882,12 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+    use_grad = False
+    if hasattr(policy, "requires_grad_for_action"):
+        use_grad = bool(policy.requires_grad_for_action())
+    grad_ctx = nullcontext() if use_grad else torch.no_grad()
+    amp_ctx = torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext()
+    with grad_ctx, amp_ctx:
         info = eval_policy_all(
             envs=envs,
             policy=policy,
@@ -765,6 +903,10 @@ def eval_main(cfg: EvalPipelineConfig):
             overlay_token_masks=cfg.eval.overlay_token_masks,
             overlay_alpha=cfg.eval.overlay_alpha,
             overlay_image_index=cfg.eval.overlay_image_index,
+            overlay_show_scores=cfg.eval.overlay_show_scores,
+            overlay_score_precision=cfg.eval.overlay_score_precision,
+            overlay_score_normalize=cfg.eval.overlay_score_normalize,
+            overlay_score_scale=cfg.eval.overlay_score_scale,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -810,6 +952,10 @@ def eval_one(
     overlay_token_masks: bool,
     overlay_alpha: float,
     overlay_image_index: int,
+    overlay_show_scores: bool,
+    overlay_score_precision: int,
+    overlay_score_normalize: str,
+    overlay_score_scale: float,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -830,6 +976,10 @@ def eval_one(
         overlay_token_masks=overlay_token_masks,
         overlay_alpha=overlay_alpha,
         overlay_image_index=overlay_image_index,
+        overlay_show_scores=overlay_show_scores,
+        overlay_score_precision=overlay_score_precision,
+        overlay_score_normalize=overlay_score_normalize,
+        overlay_score_scale=overlay_score_scale,
     )
 
     per_episode = task_result["per_episode"]
@@ -859,6 +1009,10 @@ def run_one(
     overlay_token_masks: bool,
     overlay_alpha: float,
     overlay_image_index: int,
+    overlay_show_scores: bool,
+    overlay_score_precision: int,
+    overlay_score_normalize: str,
+    overlay_score_scale: float,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -887,6 +1041,10 @@ def run_one(
         overlay_token_masks=overlay_token_masks,
         overlay_alpha=overlay_alpha,
         overlay_image_index=overlay_image_index,
+        overlay_show_scores=overlay_show_scores,
+        overlay_score_precision=overlay_score_precision,
+        overlay_score_normalize=overlay_score_normalize,
+        overlay_score_scale=overlay_score_scale,
     )
     _log_timing_summary(policy, task_group=task_group, task_id=task_id)
     # ensure we always provide video_paths key to simplify accumulation
@@ -912,6 +1070,10 @@ def eval_policy_all(
     overlay_token_masks: bool = False,
     overlay_alpha: float = 0.35,
     overlay_image_index: int = 0,
+    overlay_show_scores: bool = False,
+    overlay_score_precision: int = 2,
+    overlay_score_normalize: str = "none",
+    overlay_score_scale: float = 1.0,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -967,10 +1129,14 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
-        overlay_token_masks=overlay_token_masks,
-        overlay_alpha=overlay_alpha,
-        overlay_image_index=overlay_image_index,
-    )
+            overlay_token_masks=overlay_token_masks,
+            overlay_alpha=overlay_alpha,
+            overlay_image_index=overlay_image_index,
+            overlay_show_scores=overlay_show_scores,
+            overlay_score_precision=overlay_score_precision,
+            overlay_score_normalize=overlay_score_normalize,
+            overlay_score_scale=overlay_score_scale,
+        )
 
     if max_parallel_tasks <= 1:
         # sequential path (single accumulator path on the main thread)

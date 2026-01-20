@@ -197,8 +197,18 @@ class SmolVLMWithExpertModel(nn.Module):
         image: torch.Tensor,
         cache_name: str | None = None,
         cache_key: int | None = None,
+        update_mask_grid: torch.Tensor | None = None,
+        enable_partial_update: bool | None = None,
+        force_full_update: bool = False,
     ):
         patch_attention_mask = None
+        vision_kwargs = {}
+        if update_mask_grid is not None:
+            vision_kwargs["update_mask_grid"] = update_mask_grid
+        if enable_partial_update is not None:
+            vision_kwargs["enable_partial_update"] = enable_partial_update
+        if force_full_update:
+            vision_kwargs["force_full_update"] = True
         # Get sequence from the vision encoder
         image_hidden_states = (
             self.get_vlm_model()
@@ -207,12 +217,18 @@ class SmolVLMWithExpertModel(nn.Module):
                 patch_attention_mask=patch_attention_mask,
                 cache_name=cache_name,
                 cache_key=cache_key if cache_key is not None else 0,
+                **vision_kwargs,
             )
             .last_hidden_state
         )
         # Modality projection & resampling
         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
         return image_hidden_states
+
+    def reset_vision_cache(self) -> None:
+        vision_model = self.get_vlm_model().vision_model
+        if hasattr(vision_model, "reset_partial_update_cache"):
+            vision_model.reset_partial_update_cache()
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
