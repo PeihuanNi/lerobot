@@ -26,6 +26,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../LIBERO'))
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 

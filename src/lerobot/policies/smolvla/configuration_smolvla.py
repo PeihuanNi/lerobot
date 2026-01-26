@@ -105,11 +105,6 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
-    # Frame-level partial update settings (experimental)
-    # Fraction of patches (center square) to fully update each frame. 0.5 means center half of patches per side.
-    center_patch_ratio: float = 0.7
-    # Perform a full update of all tokens every `full_update_interval` frames. Set to 1 to always full-update.
-    full_update_interval: int = 5
 
     def __post_init__(self):
         super().__post_init__()

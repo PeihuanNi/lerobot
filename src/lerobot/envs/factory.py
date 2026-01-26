@@ -19,6 +19,9 @@ from typing import Any
 import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../LIBERO'))
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs.configs import AlohaEnv, EnvConfig, LiberoEnv, PushtEnv
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result

@@ -44,6 +44,20 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+from lerobot.policies.token_selection_utils import (
+    TokenSelectionState,
+    apply_partial_update,
+    apply_min_max_constraints,
+    build_overlay,
+    compute_region_embeddings,
+    compute_region_scores,
+    compute_spatial_mask,
+    compute_temporal_mask,
+    expand_region_mask,
+    prune_image_embeddings,
+    select_regions_by_mass,
+    split_patch_tokens,
+)
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -418,9 +432,11 @@ class PaliGemmaWithExpertModel(
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        output_attentions: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+        attentions = None
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -429,8 +445,11 @@ class PaliGemmaWithExpertModel(
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                output_attentions=output_attentions,
             )
             prefix_past_key_values = prefix_output.past_key_values
+            if output_attentions:
+                attentions = prefix_output.attentions
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
@@ -441,11 +460,16 @@ class PaliGemmaWithExpertModel(
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                output_attentions=output_attentions,
             )
+            if output_attentions:
+                attentions = suffix_output.attentions
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
         else:
+            if output_attentions:
+                raise ValueError("output_attentions is only supported for prefix-only or suffix-only forward.")
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
@@ -506,6 +530,8 @@ class PaliGemmaWithExpertModel(
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
+        if output_attentions:
+            return [prefix_output, suffix_output], prefix_past_key_values, attentions
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
@@ -516,6 +542,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        self._token_selection_state = TokenSelectionState()
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -575,6 +602,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
+    def reset_token_selection_state(self):
+        if self._token_selection_state is None:
+            self._token_selection_state = TokenSelectionState()
+        else:
+            self._token_selection_state.reset()
+
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
@@ -608,7 +641,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        image_embs: list[torch.Tensor] | None = None,
+        image_pad_masks: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -616,16 +655,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
+            if image_embs is None:
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+            else:
+                img_emb = image_embs[idx]
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            if image_pad_masks is None:
+                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            else:
+                pad_masks.append(image_pad_masks[idx])
             att_masks += [0] * num_img_embs
 
         # Process language tokens
@@ -752,7 +797,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
         self,
         images,
@@ -764,73 +808,496 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
+        if self.config.token_selection_enabled:
+            return self._sample_actions_with_token_selection(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                noise=noise,
+                num_steps=num_steps,
+                **kwargs,
+            )
+        with torch.no_grad():
+            if num_steps is None:
+                num_steps = self.config.num_inference_steps
+
+            bsize = tokens.shape[0]
+            device = tokens.device
+
+            if noise is None:
+                # Sample noise with padded dimension as expected by action_in_proj
+                actions_shape = (
+                    bsize,
+                    self.config.chunk_size,
+                    self.config.max_action_dim,
+                )  # Use config max_action_dim for internal processing
+                noise = self.sample_noise(actions_shape, device)
+
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+
+            dt = -1.0 / num_steps
+
+            x_t = noise
+            for step in range(num_steps):
+                time = 1.0 + step * dt
+                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+                def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                    return self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                    )
+
+                if self._rtc_enabled():
+                    inference_delay = kwargs.get("inference_delay")
+                    prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                    execution_horizon = kwargs.get("execution_horizon")
+
+                    v_t = self.rtc_processor.denoise_step(
+                        x_t=x_t,
+                        prev_chunk_left_over=prev_chunk_left_over,
+                        inference_delay=inference_delay,
+                        time=time,
+                        original_denoise_step_partial=denoise_step_partial_call,
+                        execution_horizon=execution_horizon,
+                    )
+                else:
+                    v_t = denoise_step_partial_call(x_t)
+
+                x_t = x_t + dt * v_t
+
+                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                    self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+            return x_t
+
+    def _sample_actions_with_token_selection(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        noise=None,
+        num_steps=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        cfg = self.config
         if num_steps is None:
-            num_steps = self.config.num_inference_steps
+            num_steps = cfg.num_inference_steps
+
+        if not cfg.use_diffusion:
+            raise ValueError("PI05 token selection only supports diffusion decoding.")
 
         bsize = tokens.shape[0]
         device = tokens.device
 
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
                 bsize,
-                self.config.chunk_size,
-                self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
+                cfg.chunk_size,
+                cfg.max_action_dim,
+            )
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        token_state = self._token_selection_state
+        eval_interval = cfg.region_eval_interval if cfg.region_eval_interval > 0 else 1
+        eval_frame = token_state.frame_idx % eval_interval == 0
 
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        with torch.no_grad():
+            image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        patch_embs = []
+        metas = []
+        for emb in image_embs:
+            patch_emb, meta = split_patch_tokens(emb)
+            patch_embs.append(patch_emb)
+            metas.append(meta)
 
-        dt = -1.0 / num_steps
+        if token_state.last_score_token is not None:
+            if len(token_state.last_score_token) != len(patch_embs):
+                token_state.reset()
+            else:
+                for idx, score in enumerate(token_state.last_score_token):
+                    if score.shape[0] != bsize or score.shape[1] != patch_embs[idx].shape[1]:
+                        token_state.reset()
+                        break
 
-        x_t = noise
-        for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+        region_embs = []
+        background_regions = []
+        valid_masks = []
+        for idx, patch_emb in enumerate(patch_embs):
+            meta = metas[idx]
+            region_emb = compute_region_embeddings(patch_emb, meta.patches_per_side, cfg.region_patch_size)
+            region_embs.append(region_emb)
+            valid_mask = img_masks[idx][:, None].expand(bsize, region_emb.shape[1])
+            valid_masks.append(valid_mask)
+            prev_region = None
+            if token_state.last_region_embs is not None and len(token_state.last_region_embs) == len(patch_embs):
+                prev_region = token_state.last_region_embs[idx]
+                if prev_region.shape != region_emb.shape:
+                    prev_region = None
+            temporal = compute_temporal_mask(region_emb, prev_region, cfg.token_temporal_threshold, valid_mask)
+            spatial = compute_spatial_mask(
+                region_emb,
+                meta.patches_per_side,
+                cfg.region_patch_size,
+                cfg.token_spatial_radius,
+                cfg.token_spatial_threshold,
+            )
+            background_regions.append(temporal & spatial & valid_mask)
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                return self.denoise_step(
+        token_norms = [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
+
+        def compute_gate_weights(values: Tensor) -> tuple[Tensor, Tensor]:
+            grip = values[..., -1]
+            if grip.shape[1] > 1:
+                m = (grip[:, 1:] - grip[:, :-1]).abs().mean(dim=1)
+            else:
+                m = grip.abs().mean(dim=1)
+            if cfg.grad_tau <= 0:
+                gate = torch.zeros_like(m)
+            else:
+                gate = (m / cfg.grad_tau).clamp(0.0, 1.0)
+            lambda_grip = 1.0 + cfg.grad_alpha * gate
+            lambda_pos = 1.0 + cfg.grad_beta * (1.0 - gate)
+            return lambda_pos, lambda_grip
+
+        def build_prefix(image_embs, image_pad_masks=None):
+            return self.embed_prefix(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                image_embs=image_embs,
+                image_pad_masks=image_pad_masks,
+            )
+
+        def compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks):
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+            return past_key_values
+
+        def run_diffusion(
+            prefix_pad_masks,
+            past_key_values,
+            capture_attn: bool = False,
+        ):
+            dt = -1.0 / num_steps
+            x_t = noise
+            last_attn = None
+            last_v_t = None
+            for step in range(num_steps):
+                time = 1.0 + step * dt
+                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+                want_attn = capture_attn and step == num_steps - 1
+
+                def denoise_step_call(input_x_t, current_timestep=time_tensor):
+                    return self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                        output_attentions=want_attn,
+                    )
+
+                if want_attn:
+                    v_t_raw, _, attn = denoise_step_call(x_t)
+                else:
+                    v_t_raw = denoise_step_call(x_t)
+                    attn = None
+
+                if self._rtc_enabled():
+                    inference_delay = kwargs.get("inference_delay")
+                    prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                    execution_horizon = kwargs.get("execution_horizon")
+                    v_t = self.rtc_processor.denoise_step(
+                        x_t=x_t,
+                        prev_chunk_left_over=prev_chunk_left_over,
+                        inference_delay=inference_delay,
+                        time=time,
+                        original_denoise_step_partial=lambda x: self.denoise_step(
+                            prefix_pad_masks=prefix_pad_masks,
+                            past_key_values=past_key_values,
+                            x_t=x,
+                            timestep=time_tensor,
+                        ),
+                        execution_horizon=execution_horizon,
+                    )
+                else:
+                    v_t = v_t_raw
+
+                x_t = x_t + dt * v_t
+
+                if want_attn:
+                    last_attn = attn
+                    last_v_t = v_t_raw
+                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                    self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+            return x_t, last_v_t, last_attn
+
+        score_tokens = None
+        actions = None
+        prefix_pad_masks = None
+        last_attn = None
+        last_v_t = None
+
+        if eval_frame:
+            if cfg.grad_score_method == "full_grad":
+                image_embs = [emb.detach().requires_grad_(True) for emb in image_embs]
+                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+                with torch.enable_grad():
+                    grad_steps = max(1, min(cfg.grad_denoise_steps, num_steps))
+                    start_step = num_steps - grad_steps
+                    dt = -1.0 / num_steps
+                    x_t = noise
+                    objective = torch.zeros((), device=device)
+                    for step in range(num_steps):
+                        time = 1.0 + step * dt
+                        time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+                        v_t_raw, suffix_out, _ = self.denoise_step(
+                            prefix_pad_masks=prefix_pad_masks,
+                            past_key_values=past_key_values,
+                            x_t=x_t,
+                            timestep=time_tensor,
+                            return_suffix_out=True,
+                        )
+                        proxy = suffix_out[..., : v_t_raw.shape[-1]] + (
+                            v_t_raw - suffix_out[..., : v_t_raw.shape[-1]]
+                        ).detach()
+                        if step >= start_step:
+                            lambda_pos, lambda_grip = compute_gate_weights(proxy)
+                            pos_sq = (proxy[..., :-1].float() ** 2).sum(dim=-1)
+                            grip_sq = (proxy[..., -1].float() ** 2)
+                            objective = objective + (lambda_pos[:, None] * pos_sq + lambda_grip[:, None] * grip_sq).sum()
+                        v_t = v_t_raw
+                        x_t = x_t + dt * v_t
+                        if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                            self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                    grads = torch.autograd.grad(objective, image_embs, retain_graph=False, allow_unused=True)
+                score_tokens = []
+                for grad, emb, meta in zip(grads, image_embs, metas, strict=True):
+                    if grad is None:
+                        score_tokens.append(torch.zeros(emb.shape[0], meta.num_patches, device=emb.device))
+                        continue
+                    grad_patch = grad[:, meta.num_extra_tokens :, :]
+                    emb_patch = emb[:, meta.num_extra_tokens :, :]
+                    grad_norm = torch.linalg.vector_norm(grad_patch.float(), dim=-1)
+                    emb_norm = torch.linalg.vector_norm(emb_patch.float(), dim=-1)
+                    score_tokens.append(grad_norm * emb_norm)
+                actions = x_t.detach()
+            else:
+                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+                x_t, last_v_t, last_attn = run_diffusion(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
-                    x_t=input_x_t,
-                    timestep=current_timestep,
+                    capture_attn=True,
                 )
-
-            if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
-
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
+                if last_attn is None or last_v_t is None:
+                    raise ValueError("Missing attention output for attention-based scoring.")
+                attn_weights = last_attn[-1]
+                prefix_len = prefix_pad_masks.shape[1]
+                action_len = cfg.chunk_size
+                suffix_len = cfg.chunk_size
+                action_start = prefix_len + (suffix_len - action_len)
+                action_end = action_start + action_len
+                vision_indices = []
+                offset = 0
+                for meta in metas:
+                    offset += meta.num_extra_tokens
+                    vision_indices.extend(range(offset, offset + meta.num_patches))
+                    offset += meta.num_patches
+                vision_indices = torch.tensor(vision_indices, device=attn_weights.device)
+                action_attn = attn_weights[:, :, action_start:action_end, vision_indices]
+                alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
+                if cfg.grad_score_method == "attn_only":
+                    score = alpha.sum(dim=(1, 2))
+                else:
+                    pos = last_v_t[..., :-1]
+                    grip = last_v_t[..., -1:]
+                    if cfg.partial_grad_phi == "l1":
+                        pos_grad = pos.sign()
+                        grip_grad = grip.sign()
+                    else:
+                        pos_grad = 2 * pos
+                        grip_grad = 2 * grip
+                    grad_action = torch.cat(
+                        [
+                            pos_grad * cfg.partial_grad_pos_weight,
+                            grip_grad * cfg.partial_grad_grip_weight,
+                        ],
+                        dim=-1,
+                    )
+                    last_layer = self.paligemma_with_expert.gemma_expert.model.layers[-1]
+                    wo = last_layer.self_attn.o_proj.weight
+                    hidden_size = wo.shape[0]
+                    action_dim = grad_action.shape[-1]
+                    if action_dim >= hidden_size:
+                        grad_hidden = grad_action[..., :hidden_size]
+                    else:
+                        grad_hidden = torch.zeros(
+                            bsize, action_len, hidden_size, device=grad_action.device, dtype=grad_action.dtype
+                        )
+                        grad_hidden[..., :action_dim] = grad_action
+                    grad_attn = torch.matmul(grad_hidden.reshape(-1, hidden_size), wo)
+                    head_dim = last_layer.self_attn.head_dim
+                    num_heads = grad_attn.shape[1] // head_dim
+                    grad_attn = grad_attn.view(bsize, action_len, num_heads, head_dim)
+                    g_head_norm = torch.linalg.vector_norm(grad_attn.float(), dim=-1)
+                    g_weight = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
+                    score = (alpha * g_weight).sum(dim=(1, 2))
+                score_tokens = []
+                start = 0
+                for meta in metas:
+                    end = start + meta.num_patches
+                    score_tokens.append(score[:, start:end])
+                    start = end
+                actions = x_t.detach()
+        else:
+            if token_state.last_score_token is not None:
+                score_tokens = token_state.last_score_token
             else:
-                v_t = denoise_step_partial_call(x_t)
+                score_tokens = token_norms
 
-            x_t = x_t + dt * v_t
+        score_regions = []
+        important_regions = []
+        keep_regions = []
+        clipped_regions = []
+        keep_token_masks = []
+        important_token_masks = []
+        effective_important_token_masks = []
+        for idx, score_token in enumerate(score_tokens):
+            meta = metas[idx]
+            score_region = compute_region_scores(score_token, meta.patches_per_side, cfg.region_patch_size)
+            if eval_frame and cfg.grad_region_ema > 0 and token_state.last_score_region is not None:
+                score_region = (
+                    cfg.grad_region_ema * token_state.last_score_region[idx]
+                    + (1.0 - cfg.grad_region_ema) * score_region
+                )
+            if eval_frame:
+                important_region = select_regions_by_mass(score_region, cfg.grad_region_mass)
+                if cfg.grad_keep_prev and token_state.last_important_region is not None:
+                    important_region = important_region | token_state.last_important_region[idx]
+            else:
+                if token_state.last_important_region is not None:
+                    important_region = token_state.last_important_region[idx]
+                else:
+                    important_region = select_regions_by_mass(score_region, cfg.grad_region_mass)
+            keep_pre = (~background_regions[idx]) | important_region
+            keep_pre = keep_pre & valid_masks[idx]
+            region_area = cfg.region_patch_size * cfg.region_patch_size
+            min_regions = math.ceil(cfg.min_kept_tokens / region_area) if cfg.min_kept_tokens > 0 else 0
+            max_regions = (
+                math.floor(cfg.max_kept_tokens / region_area)
+                if cfg.max_kept_tokens > 0
+                else score_region.shape[1]
+            )
+            keep_region, clipped_region = apply_min_max_constraints(
+                keep_pre, score_region, min_regions, max_regions
+            )
+            keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
+            important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
+            effective_important_token = important_token & keep_token
+            score_regions.append(score_region)
+            important_regions.append(important_region)
+            keep_regions.append(keep_region)
+            clipped_regions.append(clipped_region)
+            keep_token_masks.append(keep_token)
+            important_token_masks.append(important_token)
+            effective_important_token_masks.append(effective_important_token)
 
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+        if eval_frame and (cfg.overlay_show_scores or cfg.overlay_show_ids):
+            base_dir = cfg.local_log_dir or cfg.rollout_dir
+            if base_dir:
+                out_dir = Path(base_dir)
+                if cfg.run_id_note:
+                    out_dir = out_dir / cfg.run_id_note
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for img_idx, meta in enumerate(metas):
+                    region_h = meta.patches_per_side // cfg.region_patch_size
+                    region_w = region_h
+                    for batch_idx in range(bsize):
+                        img = images[img_idx][batch_idx]
+                        if img.shape[0] == 3:
+                            img = img.permute(1, 2, 0)
+                        img = ((img + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+                        overlay = build_overlay(
+                            img,
+                            region_h,
+                            region_w,
+                            cfg.region_patch_size,
+                            important_regions[img_idx][batch_idx].cpu(),
+                            keep_regions[img_idx][batch_idx].cpu(),
+                            clipped_regions[img_idx][batch_idx].cpu(),
+                            cfg.overlay_show_scores,
+                            cfg.overlay_show_ids,
+                            scores=score_regions[img_idx][batch_idx].detach().cpu(),
+                        )
+                        try:
+                            from PIL import Image
+                        except ImportError:
+                            continue
+                        Image.fromarray(overlay.numpy()).save(
+                            out_dir / f"overlay_f{token_state.frame_idx:06d}_i{img_idx}_b{batch_idx}.png"
+                        )
 
-        return x_t
+        if not eval_frame and cfg.vision_partial_update_enabled:
+            image_embs = apply_partial_update(
+                image_embs, token_state.last_image_embs, effective_important_token_masks, metas
+            )
+
+        cache_image_embs = image_embs
+
+        image_pad_masks = None
+        if not eval_frame and cfg.token_prune_enabled:
+            image_embs, image_pad_masks = prune_image_embeddings(
+                image_embs, keep_token_masks, img_masks, metas
+            )
+
+        if actions is None:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
+            past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+            with torch.no_grad():
+                actions, _, _ = run_diffusion(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                )
+                actions = actions.detach()
+
+        token_state.last_score_token = [score.detach() for score in score_tokens]
+        token_state.last_score_region = [score.detach() for score in score_regions]
+        token_state.last_important_region = [mask.detach() for mask in important_regions]
+        token_state.last_region_embs = [emb.detach() for emb in region_embs]
+        token_state.last_image_embs = [emb.detach() for emb in cache_image_embs]
+        token_state.frame_idx += 1
+
+        return actions
 
     def denoise_step(
         self,
@@ -838,6 +1305,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        output_attentions: bool = False,
+        return_suffix_out: bool = False,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -856,19 +1325,34 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        attentions = None
+        if output_attentions:
+            outputs_embeds, _, attentions = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+                output_attentions=True,
+            )
+        else:
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        v_t = self.action_out_proj(suffix_out)
+        if output_attentions or return_suffix_out:
+            return v_t, suffix_out, attentions
+        return v_t
 
 
 class PI05Policy(PreTrainedPolicy):
@@ -1087,6 +1571,8 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        if hasattr(self, "model"):
+            self.model.reset_token_selection_state()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""

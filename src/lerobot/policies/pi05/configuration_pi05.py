@@ -52,6 +52,43 @@ class PI05Config(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Token selection / pruning (optional, inference-time)
+    token_selection_enabled: bool = False
+    grad_score_method: str = "full_grad"  # full_grad | partial_grad | attn_only
+    grad_denoise_steps: int = 1
+    attn_score_beta: float = 1.0
+    partial_grad_phi: str = "l2"  # l1 | l2
+    partial_grad_pos_weight: float = 1.0
+    partial_grad_grip_weight: float = 2.0
+    grad_tau: float = 0.1
+    grad_alpha: float = 1.0
+    grad_beta: float = 1.0
+    grad_region_mass: float = 0.25
+    grad_region_ema: float = 0.0
+    grad_keep_prev: bool = False
+    region_eval_interval: int = 1
+    region_patch_size: int = 1
+    token_temporal_threshold: float = 0.9
+    token_spatial_threshold: float = 0.9
+    token_spatial_radius: int = 1
+    token_prune_enabled: bool = False
+    min_kept_tokens: int = 0
+    max_kept_tokens: int = 1_000_000
+    vision_partial_update_enabled: bool = False
+    overlay_show_scores: bool = False
+    overlay_show_ids: bool = False
+    rollout_dir: str | None = None
+    local_log_dir: str | None = None
+    run_id_note: str = ""
+    use_wandb: bool = False
+    wandb_entity: str | None = None
+    wandb_project: str | None = None
+    seed: int | None = None
+
+    # Action decoding options
+    use_l1_regression: bool = False
+    use_diffusion: bool = True
+
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,
@@ -109,6 +146,16 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.token_selection_enabled:
+            valid_grad_methods = {"full_grad", "partial_grad", "attn_only"}
+            if self.grad_score_method not in valid_grad_methods:
+                raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
+            valid_phi = {"l1", "l2"}
+            if self.partial_grad_phi not in valid_phi:
+                raise ValueError(f"Invalid partial_grad_phi: {self.partial_grad_phi}")
+            if self.region_patch_size <= 0:
+                raise ValueError("region_patch_size must be > 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
