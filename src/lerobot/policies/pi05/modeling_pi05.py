@@ -1122,11 +1122,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 if last_attn is None or last_v_t is None:
                     raise ValueError("Missing attention output for attention-based scoring.")
                 attn_weights = last_attn[-1]
-                prefix_len = prefix_pad_masks.shape[1]
                 action_len = cfg.chunk_size
-                suffix_len = cfg.chunk_size
-                action_start = prefix_len + (suffix_len - action_len)
-                action_end = action_start + action_len
+                query_len = attn_weights.shape[2]
+                action_end = query_len
+                action_start = max(0, action_end - action_len)
                 vision_indices = []
                 offset = 0
                 for meta in metas:
@@ -1134,50 +1133,61 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     vision_indices.extend(range(offset, offset + meta.num_patches))
                     offset += meta.num_patches
                 vision_indices = torch.tensor(vision_indices, device=attn_weights.device)
-                action_attn = attn_weights[:, :, action_start:action_end, vision_indices]
-                alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
-                if cfg.grad_score_method == "attn_only":
-                    score = alpha.sum(dim=(1, 2))
+                key_len = attn_weights.shape[3]
+                if vision_indices.numel() > 0 and key_len > 0:
+                    vision_indices = vision_indices[vision_indices < key_len]
+                if vision_indices.numel() == 0 or action_start >= action_end:
+                    score_tokens = token_norms
                 else:
-                    pos = last_v_t[..., :-1]
-                    grip = last_v_t[..., -1:]
-                    if cfg.partial_grad_phi == "l1":
-                        pos_grad = pos.sign()
-                        grip_grad = grip.sign()
+                    action_attn = attn_weights[:, :, action_start:action_end, vision_indices]
+                    if action_attn.shape[2] == 0:
+                        score_tokens = token_norms
                     else:
-                        pos_grad = 2 * pos
-                        grip_grad = 2 * grip
-                    grad_action = torch.cat(
-                        [
-                            pos_grad * cfg.partial_grad_pos_weight,
-                            grip_grad * cfg.partial_grad_grip_weight,
-                        ],
-                        dim=-1,
-                    )
-                    last_layer = self.paligemma_with_expert.gemma_expert.model.layers[-1]
-                    wo = last_layer.self_attn.o_proj.weight
-                    hidden_size = wo.shape[0]
-                    action_dim = grad_action.shape[-1]
-                    if action_dim >= hidden_size:
-                        grad_hidden = grad_action[..., :hidden_size]
-                    else:
-                        grad_hidden = torch.zeros(
-                            bsize, action_len, hidden_size, device=grad_action.device, dtype=grad_action.dtype
-                        )
-                        grad_hidden[..., :action_dim] = grad_action
-                    grad_attn = torch.matmul(grad_hidden.reshape(-1, hidden_size), wo)
-                    head_dim = last_layer.self_attn.head_dim
-                    num_heads = grad_attn.shape[1] // head_dim
-                    grad_attn = grad_attn.view(bsize, action_len, num_heads, head_dim)
-                    g_head_norm = torch.linalg.vector_norm(grad_attn.float(), dim=-1)
-                    g_weight = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
-                    score = (alpha * g_weight).sum(dim=(1, 2))
-                score_tokens = []
-                start = 0
-                for meta in metas:
-                    end = start + meta.num_patches
-                    score_tokens.append(score[:, start:end])
-                    start = end
+                        alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
+                        if cfg.grad_score_method == "attn_only":
+                            score = alpha.sum(dim=(1, 2))
+                        else:
+                            pos = last_v_t[..., :-1]
+                            grip = last_v_t[..., -1:]
+                            if cfg.partial_grad_phi == "l1":
+                                pos_grad = pos.sign()
+                                grip_grad = grip.sign()
+                            else:
+                                pos_grad = 2 * pos
+                                grip_grad = 2 * grip
+                            grad_action = torch.cat(
+                                [
+                                    pos_grad * cfg.partial_grad_pos_weight,
+                                    grip_grad * cfg.partial_grad_grip_weight,
+                                ],
+                                dim=-1,
+                            )
+                            last_layer = self.paligemma_with_expert.gemma_expert.model.layers[-1]
+                            wo = last_layer.self_attn.o_proj.weight
+                            hidden_size = wo.shape[0]
+                            action_dim = grad_action.shape[-1]
+                            if action_dim >= hidden_size:
+                                grad_hidden = grad_action[..., :hidden_size]
+                            else:
+                                grad_hidden = torch.zeros(
+                                    bsize, action_len, hidden_size, device=grad_action.device, dtype=grad_action.dtype
+                                )
+                                grad_hidden[..., :action_dim] = grad_action
+                            grad_attn = torch.matmul(grad_hidden.reshape(-1, hidden_size), wo)
+                            head_dim = last_layer.self_attn.head_dim
+                            num_heads = grad_attn.shape[1] // head_dim
+                            grad_attn = grad_attn.view(bsize, action_len, num_heads, head_dim)
+                            g_head_norm = torch.linalg.vector_norm(grad_attn.float(), dim=-1)
+                            g_weight = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
+                            if g_weight.shape[2] != alpha.shape[2]:
+                                g_weight = g_weight[:, :, -alpha.shape[2] :, :]
+                            score = (alpha * g_weight).sum(dim=(1, 2))
+                        score_tokens = []
+                        start = 0
+                        for meta in metas:
+                            end = start + meta.num_patches
+                            score_tokens.append(score[:, start:end])
+                            start = end
                 actions = x_t.detach()
         else:
             if token_state.last_score_token is not None:

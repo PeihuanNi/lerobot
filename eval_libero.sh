@@ -4,6 +4,12 @@ POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
 POLICY_TYPE="pi0"
 N_ACTION_STEPS=10
 
+MUJOCO_GL="egl"
+PYOPENGL_PLATFORM="egl"
+EGL_PLATFORM="surfaceless"
+MUJOCO_EGL_DEVICE_ID=""
+LIBGL_ALWAYS_SOFTWARE=""
+
 ENV_TYPE="libero"
 ENV_TASK="libero_spatial"
 ENV_TASK_ID="[0]"
@@ -97,4 +103,20 @@ if [ -n "${SEED}" ]; then
   ARGS+=("--policy.seed=${SEED}")
 fi
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" TOKENIZERS_PARALLELISM=false MUJOCO_GL="egl" PYOPENGL_PLATFORM="egl" lerobot-eval "${ARGS[@]}"
+ENV_VARS=(
+  "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+  "TOKENIZERS_PARALLELISM=false"
+  "MUJOCO_GL=${MUJOCO_GL}"
+  "PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM}"
+)
+if [ -n "${EGL_PLATFORM}" ]; then
+  ENV_VARS+=("EGL_PLATFORM=${EGL_PLATFORM}")
+fi
+if [ -n "${MUJOCO_EGL_DEVICE_ID}" ]; then
+  ENV_VARS+=("MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID}")
+fi
+if [ -n "${LIBGL_ALWAYS_SOFTWARE}" ]; then
+  ENV_VARS+=("LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE}")
+fi
+
+env "${ENV_VARS[@]}" lerobot-eval "${ARGS[@]}"
