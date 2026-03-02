@@ -49,6 +49,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -90,6 +91,166 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _to_numpy(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not value:
+            return None
+        if torch.is_tensor(value[0]):
+            value = torch.stack(value, dim=0)
+        else:
+            value = np.stack(value, axis=0)
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    return np.array(value)
+
+
+def _extract_overlay_state(policy: PreTrainedPolicy):
+    if not hasattr(policy, "get_token_selection_state"):
+        return None, None
+    state = policy.get_token_selection_state()
+    if state is None:
+        return None, None
+
+    overlay_grid = _to_numpy(state.get("last_overlay_grid"))
+    if overlay_grid is None:
+        return None, None
+
+    if overlay_grid.ndim == 4:
+        overlay_grid = overlay_grid[0]
+    elif overlay_grid.ndim == 3:
+        overlay_grid = overlay_grid
+    elif overlay_grid.ndim == 2:
+        overlay_grid = overlay_grid[None, ...]
+    else:
+        return None, None
+
+    token_scores = _to_numpy(state.get("last_token_scores"))
+    if token_scores is not None:
+        if token_scores.ndim == 3:
+            token_scores = token_scores[0]
+        elif token_scores.ndim != 2:
+            token_scores = None
+
+    region_scores = _to_numpy(state.get("last_region_scores"))
+    if region_scores is not None:
+        if region_scores.ndim == 4:
+            region_scores = region_scores[0]
+        elif region_scores.ndim == 3:
+            region_scores = region_scores[0]
+        elif region_scores.ndim != 2:
+            region_scores = None
+
+    region_patch = max(1, int(getattr(policy.config, "region_patch_size", 1)))
+    if region_patch > 1:
+        grid_h, grid_w = overlay_grid.shape[1:3]
+        if grid_h % region_patch == 0 and grid_w % region_patch == 0:
+            region_h = grid_h // region_patch
+            region_w = grid_w // region_patch
+            labels = overlay_grid.reshape(-1, region_h, region_patch, region_w, region_patch)
+            if token_scores is not None and token_scores.shape[1] == grid_h * grid_w:
+                scores = token_scores.reshape(-1, region_h, region_patch, region_w, region_patch)
+                label_scores = np.zeros((labels.shape[0], 4, region_h, region_w), dtype=np.float32)
+                for label in range(4):
+                    label_scores[:, label] = (scores * (labels == label)).sum(axis=(2, 4))
+                overlay_grid = label_scores.argmax(axis=1).astype(np.uint8)
+            else:
+                label_counts = np.zeros((labels.shape[0], 4, region_h, region_w), dtype=np.int32)
+                for label in range(4):
+                    label_counts[:, label] = (labels == label).sum(axis=(2, 4))
+                overlay_grid = label_counts.argmax(axis=1).astype(np.uint8)
+
+            if region_scores is not None and region_scores.shape[1] == region_h * region_w:
+                region_scores = region_scores.reshape(-1, region_h, region_w)
+            elif region_scores is None and token_scores is not None and token_scores.shape[1] == grid_h * grid_w:
+                region_scores = token_scores.reshape(
+                    -1, region_h, region_patch, region_w, region_patch
+                ).mean(axis=(2, 4))
+
+    return overlay_grid.astype(np.uint8), region_scores
+
+
+def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35, show_ids=False):
+    if overlay_grid is None:
+        return img
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return img
+
+    img_np = img.astype(np.uint8, copy=False)
+    height, width = img_np.shape[:2]
+
+    overlay_img = Image.fromarray(overlay_grid).resize((width, height), resample=Image.NEAREST)
+    overlay_labels = np.array(overlay_img)
+
+    overlay_colors = np.zeros_like(img_np)
+    overlay_colors[overlay_labels == 0] = (0, 255, 0)       # green: not important
+    overlay_colors[overlay_labels == 1] = (255, 255, 0)     # yellow: gate-protected (important + cosine-static)
+    overlay_colors[overlay_labels == 2] = (255, 0, 0)       # red: important foreground
+    overlay_colors[overlay_labels == 3] = (0, 0, 255)       # blue: important but pruned as bg (gate didn't protect)
+
+    blended = (img_np.astype(np.float32) * (1.0 - alpha) + overlay_colors.astype(np.float32) * alpha).astype(
+        np.uint8
+    )
+    # label=4 (pruned bg): transparent — restore original image
+    bg_mask = overlay_labels == 4
+    blended[bg_mask] = img_np[bg_mask]
+
+    show_scores = region_scores is not None
+    if not show_scores and not show_ids:
+        return blended
+
+    if torch.is_tensor(region_scores):
+        region_scores = region_scores.detach().cpu().numpy()
+
+    region_h, region_w = overlay_grid.shape
+    cell_w = width / max(region_w, 1)
+    cell_h = height / max(region_h, 1)
+
+    if show_scores:
+        region_scores = region_scores.astype(np.float32)
+        total = float(region_scores.sum())
+        if total > 0:
+            region_scores = region_scores / total
+
+    pil_img = Image.fromarray(blended)
+    draw = ImageDraw.Draw(pil_img)
+    id_font_size = max(10, min(16, int(min(cell_w, cell_h) * 0.55)))
+    score_font_size = max(7, min(12, int(min(cell_w, cell_h) * 0.38)))
+
+    def _load_font(size):
+        for font_name in ("DejaVuSansMono.ttf", "DejaVuSans.ttf", "Arial.ttf"):
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    id_font = _load_font(id_font_size)
+    score_font = _load_font(score_font_size)
+
+    for r in range(region_h):
+        for c in range(region_w):
+            x = int((c + 0.03) * cell_w)
+            y = int((r + 0.03) * cell_h)
+            if show_ids:
+                region_id = r * region_w + c
+                id_text = str(region_id)
+                draw.text((x + 1, y + 1), id_text, fill=(0, 0, 0), font=id_font)
+                draw.text((x, y), id_text, fill=(255, 255, 255), font=id_font)
+                y = y + int(id_font_size * 0.85)
+            if show_scores:
+                score = region_scores[r, c]
+                text = f"{score:.3f}"
+                draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=score_font)
+                draw.text((x, y), text, fill=(255, 255, 255), font=score_font)
+
+    return np.array(pil_img)
 
 
 def rollout(
@@ -220,7 +381,14 @@ def rollout(
         running_success_rate = (
             einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+        # Build postfix: start with success rate, then append token-selection
+        # stats (entropy, avg eval interval) if the policy exposes them.
+        _postfix = {"sr": f"{running_success_rate.item() * 100:.1f}%"}
+        _model = getattr(policy, "model", None)
+        _ts = getattr(_model, "_token_selection_state", None) if _model is not None else None
+        if _ts is not None and getattr(_ts, "last_stats", None):
+            _postfix.update(_ts.last_stats)
+        progbar.set_postfix(_postfix)
         progbar.update()
 
     # Track the final observation.
@@ -285,6 +453,12 @@ def eval_policy(
     start = time.time()
     policy.eval()
 
+    overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
+    show_scores = bool(getattr(getattr(policy, "config", None), "overlay_show_scores", False))
+    show_ids = bool(getattr(getattr(policy, "config", None), "overlay_show_ids", False))
+    last_overlay_grid = None
+    last_region_scores = None
+
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
@@ -300,14 +474,45 @@ def eval_policy(
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
         # noqa: B023
+        nonlocal last_overlay_grid, last_region_scores
         if n_episodes_rendered >= max_episodes_rendered:
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+        overlay_grid = None
+        region_scores = None
+        if overlay_enabled:
+            overlay_grid, region_scores = _extract_overlay_state(policy)
+            if overlay_grid is not None:
+                last_overlay_grid = overlay_grid
+                last_region_scores = region_scores
+            else:
+                overlay_grid = last_overlay_grid
+                region_scores = last_region_scores
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            frames = [env.envs[i].render() for i in range(n_to_render_now)]  # noqa: B023
+            if overlay_grid is not None:
+                rendered = []
+                for idx, frame in enumerate(frames):
+                    grid = overlay_grid[idx] if idx < overlay_grid.shape[0] else overlay_grid[0]
+                    scores = None
+                    if show_scores and region_scores is not None:
+                        scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
+                    rendered.append(_apply_overlay(frame, grid, scores, show_ids=show_ids))
+                frames = rendered
+            ep_frames.append(np.stack(frames))
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
-            ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+            frames = env.call("render")[:n_to_render_now]
+            if overlay_grid is not None:
+                rendered = []
+                for idx, frame in enumerate(frames):
+                    grid = overlay_grid[idx] if idx < overlay_grid.shape[0] else overlay_grid[0]
+                    scores = None
+                    if show_scores and region_scores is not None:
+                        scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
+                    rendered.append(_apply_overlay(frame, grid, scores, show_ids=show_ids))
+                frames = rendered
+            ep_frames.append(np.stack(frames))
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
@@ -412,6 +617,27 @@ def eval_policy(
     for thread in threads:
         thread.join()
 
+    # Collect final token selection stats if available.
+    _token_sel_stats = {}
+    _model = getattr(policy, "model", None)
+    _ts_final = getattr(_model, "_token_selection_state", None) if _model is not None else None
+    if _ts_final is not None and getattr(_ts_final, "last_stats", None):
+        _token_sel_stats = dict(_ts_final.last_stats)
+    if _ts_final is not None:
+        _token_sel_stats["total_frames"] = _ts_final.frame_idx
+        _token_sel_stats["total_eval_frames"] = _ts_final.eval_frame_count
+        if _ts_final.frame_idx > 0 and _ts_final.eval_frame_count > 0:
+            _token_sel_stats["avg_eval_interval"] = round(_ts_final.frame_idx / _ts_final.eval_frame_count, 2)
+            _token_sel_stats["eval_rate"] = round(_ts_final.eval_frame_count / _ts_final.frame_idx, 4)
+        if _ts_final.last_entropy is not None:
+            _token_sel_stats["final_entropy"] = round(_ts_final.last_entropy, 4)
+        # Per-episode average pruning ratio
+        if _ts_final.total_possible > 0:
+            _avg_prune = (1.0 - _ts_final.total_kept / _ts_final.total_possible) * 100.0
+            _token_sel_stats["avg_prune_ratio"] = round(_avg_prune, 2)
+            _token_sel_stats["total_kept"] = _ts_final.total_kept
+            _token_sel_stats["total_possible"] = _ts_final.total_possible
+
     # Compile eval info.
     info = {
         "per_episode": [
@@ -440,6 +666,9 @@ def eval_policy(
             "eval_ep_s": (time.time() - start) / n_episodes,
         },
     }
+
+    if _token_sel_stats:
+        info["token_selection_stats"] = _token_sel_stats
 
     if return_episode_data:
         info["episodes"] = episode_data
@@ -497,7 +726,8 @@ def _compile_episode_data(
 
 @parser.wrap()
 def eval_main(cfg: EvalPipelineConfig):
-    logging.info(pformat(asdict(cfg)))
+    logging.info("CLI args: %s", " ".join(sys.argv[1:]) or "<none>")
+    logging.info("Resolved config:\n%s", pformat(asdict(cfg)))
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -568,11 +798,12 @@ def eval_main(cfg: EvalPipelineConfig):
 
 
 # ---- typed payload returned by one task eval ----
-class TaskMetrics(TypedDict):
+class TaskMetrics(TypedDict, total=False):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    token_selection_stats: dict
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -611,12 +842,15 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
-    return TaskMetrics(
+    result = TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
     )
+    if "token_selection_stats" in task_result:
+        result["token_selection_stats"] = task_result["token_selection_stats"]
+    return result
 
 
 def run_one(
@@ -762,16 +996,58 @@ def eval_policy_all(
         arr = np.array(xs, dtype=float)
         return float(np.nanmean(arr))
 
+    # Collect per-group token selection stats from per_task_infos
+    group_token_sel: dict[str, list[dict]] = defaultdict(list)
+    for ti in per_task_infos:
+        ts = ti["metrics"].get("token_selection_stats")
+        if ts:
+            group_token_sel[ti["task_group"]].append(ts)
+
     # compute per-group aggregates
     groups_aggregated = {}
     for group, acc in group_acc.items():
-        groups_aggregated[group] = {
+        group_agg = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
             "video_paths": list(acc["video_paths"]),
         }
+        # Aggregate token selection stats across tasks in this group
+        ts_list = group_token_sel.get(group, [])
+        if ts_list:
+            _total_frames = sum(t.get("total_frames", 0) for t in ts_list)
+            _total_evals = sum(t.get("total_eval_frames", 0) for t in ts_list)
+            group_ts = {
+                "total_frames": _total_frames,
+                "total_eval_frames": _total_evals,
+            }
+            if _total_frames > 0 and _total_evals > 0:
+                group_ts["avg_eval_interval"] = round(_total_frames / _total_evals, 2)
+                group_ts["eval_rate"] = round(_total_evals / _total_frames, 4)
+            _entropies = [t["final_entropy"] for t in ts_list if "final_entropy" in t]
+            if _entropies:
+                group_ts["avg_final_entropy"] = round(float(np.mean(_entropies)), 4)
+            # Aggregate pruning ratio across tasks in this group
+            _g_total_kept = sum(t.get("total_kept", 0) for t in ts_list)
+            _g_total_possible = sum(t.get("total_possible", 0) for t in ts_list)
+            if _g_total_possible > 0:
+                group_ts["avg_prune_ratio"] = round((1.0 - _g_total_kept / _g_total_possible) * 100.0, 2)
+                group_ts["total_kept"] = _g_total_kept
+                group_ts["total_possible"] = _g_total_possible
+            group_agg["token_selection_stats"] = group_ts
+            _sr = group_agg.get("pc_success")
+            _sr_str = f"{_sr:.1f}%" if _sr is not None and _sr == _sr else "N/A"
+            logging.info(
+                f"[{group}] Token selection: frames={_total_frames}, "
+                f"eval_frames={_total_evals}, "
+                f"avg_interval={group_ts.get('avg_eval_interval', 'N/A')}, "
+                f"eval_rate={group_ts.get('eval_rate', 'N/A')}, "
+                f"avg_entropy={group_ts.get('avg_final_entropy', 'N/A')}, "
+                f"avg_prune={group_ts.get('avg_prune_ratio', 'N/A')}%, "
+                f"success_rate={_sr_str}"
+            )
+        groups_aggregated[group] = group_agg
 
     # overall aggregates
     overall_agg = {

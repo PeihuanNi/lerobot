@@ -49,13 +49,16 @@ from lerobot.policies.token_selection_utils import (
     apply_partial_update,
     apply_min_max_constraints,
     build_overlay,
+    build_overlay_labels,
     compute_region_embeddings,
     compute_region_scores,
     compute_spatial_mask,
     compute_temporal_mask,
+    detect_static_background,
     expand_region_mask,
     prune_image_embeddings,
     select_regions_by_mass,
+    select_regions_by_topk_ratio,
     split_patch_tokens,
 )
 from lerobot.utils.constants import (
@@ -917,7 +920,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         token_state = self._token_selection_state
         eval_interval = cfg.region_eval_interval if cfg.region_eval_interval > 0 else 1
-        eval_frame = token_state.frame_idx % eval_interval == 0
+        if cfg.dynamic_eval_enabled:
+            frames_since_eval = token_state.frame_idx - token_state.last_eval_frame_idx
+            if token_state.frame_idx == 0:
+                eval_frame = True
+            elif frames_since_eval >= cfg.max_eval_interval:
+                eval_frame = True  # hard-cap fallback
+            elif token_state.last_entropy is not None and token_state.last_entropy > cfg.eval_entropy_threshold:
+                eval_frame = True  # model confused (high entropy) -> re-evaluate full image
+            else:
+                eval_frame = False  # model focused -> keep pruning
+        else:
+            eval_frame = token_state.frame_idx % eval_interval == 0
 
         with torch.no_grad():
             image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
@@ -961,6 +975,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 cfg.token_spatial_threshold,
             )
             background_regions.append(temporal & spatial & valid_mask)
+
+        # ── Static background: capture reference on the very first frame ─────
+        _bg_first_frame = False
+        if cfg.static_bg_enabled and token_state.reference_region_embs is None:
+            token_state.reference_region_embs = [emb.detach().clone() for emb in region_embs]
+            _bg_first_frame = True
 
         token_norms = [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
 
@@ -1014,7 +1034,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             for step in range(num_steps):
                 time = 1.0 + step * dt
                 time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-                want_attn = capture_attn and step == num_steps - 1
+                _attn_start = num_steps - max(1, min(cfg.attn_num_denoise_steps, num_steps))
+                want_attn = capture_attn and step >= _attn_start
 
                 def denoise_step_call(input_x_t, current_timestep=time_tensor):
                     return self.denoise_step(
@@ -1054,10 +1075,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 x_t = x_t + dt * v_t
 
                 if want_attn:
-                    last_attn = attn
-                    last_v_t = v_t_raw
+                    if last_attn is None:
+                        last_attn = list(attn)  # list of per-layer tensors
+                        _attn_count = 1
+                    else:
+                        for _li in range(len(attn)):
+                            last_attn[_li] = last_attn[_li] + attn[_li]
+                        _attn_count += 1
+                    last_v_t = v_t_raw  # always use the final step's v_t
                 if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                     self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+            # Average accumulated attention over collected denoise steps
+            if last_attn is not None and _attn_count > 1:
+                last_attn = tuple(a / _attn_count for a in last_attn)
+            elif last_attn is not None:
+                last_attn = tuple(last_attn)
             return x_t, last_v_t, last_attn
 
         score_tokens = None
@@ -1121,7 +1153,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )
                 if last_attn is None or last_v_t is None:
                     raise ValueError("Missing attention output for attention-based scoring.")
-                attn_weights = last_attn[-1]
+                # Aggregate attention over last N Expert layers (mean pooling)
+                _n_layers = max(1, min(cfg.attn_num_layers, len(last_attn)))
+                if _n_layers == 1:
+                    attn_weights = last_attn[-1]
+                else:
+                    attn_weights = torch.stack(last_attn[-_n_layers:], dim=0).mean(dim=0)
                 action_len = cfg.chunk_size
                 query_len = attn_weights.shape[2]
                 action_end = query_len
@@ -1145,7 +1182,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     else:
                         alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
                         if cfg.grad_score_method == "attn_only":
-                            score = alpha.sum(dim=(1, 2))
+                            if cfg.grad_action_agg == "max":
+                                score = alpha.max(dim=2).values.sum(dim=1)
+                            else:
+                                score = alpha.sum(dim=(1, 2))
                         else:
                             pos = last_v_t[..., :-1]
                             grip = last_v_t[..., -1:]
@@ -1173,15 +1213,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                     bsize, action_len, hidden_size, device=grad_action.device, dtype=grad_action.dtype
                                 )
                                 grad_hidden[..., :action_dim] = grad_action
+                            grad_hidden = grad_hidden.to(dtype=wo.dtype)
                             grad_attn = torch.matmul(grad_hidden.reshape(-1, hidden_size), wo)
                             head_dim = last_layer.self_attn.head_dim
                             num_heads = grad_attn.shape[1] // head_dim
                             grad_attn = grad_attn.view(bsize, action_len, num_heads, head_dim)
                             g_head_norm = torch.linalg.vector_norm(grad_attn.float(), dim=-1)
+                            if cfg.grad_head_beta != 1.0:
+                                g_head_norm = g_head_norm.clamp_min(1e-8).pow(cfg.grad_head_beta)
+                            if cfg.grad_head_norm == "max":
+                                denom = g_head_norm.max(dim=-1, keepdim=True).values
+                            else:
+                                denom = g_head_norm.sum(dim=-1, keepdim=True)
+                            head_count = g_head_norm.shape[-1]
+                            g_head_norm = torch.where(
+                                denom > 0,
+                                g_head_norm / denom,
+                                torch.full_like(g_head_norm, 1.0 / head_count),
+                            )
                             g_weight = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
                             if g_weight.shape[2] != alpha.shape[2]:
                                 g_weight = g_weight[:, :, -alpha.shape[2] :, :]
-                            score = (alpha * g_weight).sum(dim=(1, 2))
+                            if cfg.grad_action_agg == "max":
+                                score = (alpha * g_weight).max(dim=2).values.sum(dim=1)
+                            else:
+                                score = (alpha * g_weight).sum(dim=(1, 2))
                         score_tokens = []
                         start = 0
                         for meta in metas:
@@ -1199,9 +1255,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         important_regions = []
         keep_regions = []
         clipped_regions = []
+        static_bg_regions = []
+        raw_cosine_static_regions = []
         keep_token_masks = []
         important_token_masks = []
         effective_important_token_masks = []
+        overlay_labels = []
+        overlay_grids = []
         for idx, score_token in enumerate(score_tokens):
             meta = metas[idx]
             score_region = compute_region_scores(score_token, meta.patches_per_side, cfg.region_patch_size)
@@ -1210,37 +1270,121 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     cfg.grad_region_ema * token_state.last_score_region[idx]
                     + (1.0 - cfg.grad_region_ema) * score_region
                 )
+            # ── Dynamic pruning: scale aggressiveness by region-score entropy ──
+            # Normalised entropy h ∈ [0,1] of region score distribution:
+            #   h=0 → attention fully focused → aggressive pruning
+            #   h=1 → attention fully diffuse → conservative (keep more)
+            if cfg.dynamic_mass_enabled:
+                import math as _math
+                _r = score_region.float()  # [B, R]
+                _r_total = _r.sum(dim=-1, keepdim=True)
+                _r_norm = torch.where(
+                    _r_total > 0, _r / _r_total,
+                    torch.full_like(_r, 1.0 / _r.shape[-1]),
+                )
+                _r_ent = -(_r_norm * torch.log(_r_norm.clamp_min(1e-8))).sum(dim=-1)
+                _h = (_r_ent / _math.log(_r.shape[-1])).mean().item()  # ∈ [0,1]
+                if cfg.pruning_method == "topk_ratio":
+                    _effective_param = cfg.keep_ratio_low + _h * (cfg.keep_ratio_high - cfg.keep_ratio_low)
+                else:  # "mass"
+                    _effective_param = cfg.mass_low + _h * (cfg.mass_high - cfg.mass_low)
+            else:
+                _effective_param = cfg.grad_region_mass  # static fallback (mass mode)
+
+            def _select_important(sr):
+                if cfg.pruning_method == "topk_ratio" and cfg.dynamic_mass_enabled:
+                    return select_regions_by_topk_ratio(sr, _effective_param)
+                else:
+                    return select_regions_by_mass(sr, _effective_param)
+
             if eval_frame:
-                important_region = select_regions_by_mass(score_region, cfg.grad_region_mass)
+                important_region = _select_important(score_region)
                 if cfg.grad_keep_prev and token_state.last_important_region is not None:
                     important_region = important_region | token_state.last_important_region[idx]
             else:
                 if token_state.last_important_region is not None:
                     important_region = token_state.last_important_region[idx]
                 else:
-                    important_region = select_regions_by_mass(score_region, cfg.grad_region_mass)
-            keep_pre = (~background_regions[idx]) | important_region
-            keep_pre = keep_pre & valid_masks[idx]
-            region_area = cfg.region_patch_size * cfg.region_patch_size
-            min_regions = math.ceil(cfg.min_kept_tokens / region_area) if cfg.min_kept_tokens > 0 else 0
-            max_regions = (
-                math.floor(cfg.max_kept_tokens / region_area)
-                if cfg.max_kept_tokens > 0
-                else score_region.shape[1]
-            )
-            keep_region, clipped_region = apply_min_max_constraints(
-                keep_pre, score_region, min_regions, max_regions
-            )
+                    important_region = _select_important(score_region)
+            # ── Static background detection (cosine sim to first-frame ref) ────
+            static_bg_region = None
+            static_bg_token = None
+            raw_cosine_static_region = None
+            raw_cosine_static_token = None
+            if (cfg.static_bg_enabled
+                    and idx == cfg.static_bg_camera_idx
+                    and not _bg_first_frame
+                    and token_state.reference_region_embs is not None):
+                static_bg_region, raw_cosine_static_region = detect_static_background(
+                    region_embs[idx],
+                    token_state.reference_region_embs[idx],
+                    cfg.static_bg_threshold,
+                    valid_masks[idx],
+                    score_region=score_region,
+                    score_gate=cfg.static_bg_score_gate,
+                )
+                static_bg_token = expand_region_mask(
+                    static_bg_region, meta.patches_per_side, cfg.region_patch_size,
+                )
+                raw_cosine_static_token = expand_region_mask(
+                    raw_cosine_static_region, meta.patches_per_side, cfg.region_patch_size,
+                )
+            keep_pre = important_region & valid_masks[idx]
+            if static_bg_region is not None:
+                keep_pre = keep_pre & ~static_bg_region
+            # When dynamic_mass is enabled, mass already controls how many
+            # regions to keep — skip the hard min/max clamp so the adaptive
+            # mass has full effect.  Otherwise use fixed min/max counts.
+            if cfg.dynamic_mass_enabled:
+                # trust mass-based selection; no hard count clamp
+                keep_region = keep_pre
+                clipped_region = torch.zeros_like(keep_pre, dtype=torch.bool)
+            else:
+                region_area = cfg.region_patch_size * cfg.region_patch_size
+                min_regions = math.ceil(cfg.min_kept_tokens / region_area) if cfg.min_kept_tokens > 0 else 0
+                max_regions = (
+                    math.floor(cfg.max_kept_tokens / region_area)
+                    if cfg.max_kept_tokens > 0
+                    else score_region.shape[1]
+                )
+                keep_region, clipped_region = apply_min_max_constraints(
+                    keep_pre, score_region, min_regions, max_regions
+                )
             keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
             important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
             effective_important_token = important_token & keep_token
+            clipped_token = expand_region_mask(clipped_region, meta.patches_per_side, cfg.region_patch_size)
+            overlay_label = build_overlay_labels(keep_token, important_token, clipped_token, static_bg=static_bg_token, raw_cosine_static=raw_cosine_static_token)
+            overlay_labels.append(overlay_label)
+            overlay_grids.append(overlay_label.view(bsize, meta.patches_per_side, meta.patches_per_side))
             score_regions.append(score_region)
             important_regions.append(important_region)
             keep_regions.append(keep_region)
             clipped_regions.append(clipped_region)
+            static_bg_regions.append(static_bg_region)
+            raw_cosine_static_regions.append(raw_cosine_static_region)
             keep_token_masks.append(keep_token)
             important_token_masks.append(important_token)
             effective_important_token_masks.append(effective_important_token)
+
+        # Build mask that removes ONLY static-bg tokens (for eval-frame pruning)
+        _has_static_bg = any(s is not None for s in static_bg_regions)
+        if _has_static_bg:
+            static_bg_keep_masks = []
+            for idx, sbg in enumerate(static_bg_regions):
+                if sbg is not None:
+                    sbg_token = expand_region_mask(
+                        sbg, metas[idx].patches_per_side, cfg.region_patch_size,
+                    )
+                    static_bg_keep_masks.append(~sbg_token)  # keep = NOT background
+                else:
+                    # No bg detection for this camera — keep all
+                    static_bg_keep_masks.append(
+                        torch.ones(bsize, metas[idx].num_patches, dtype=torch.bool,
+                                   device=region_embs[idx].device)
+                    )
+        else:
+            static_bg_keep_masks = None
 
         if eval_frame and (cfg.overlay_show_scores or cfg.overlay_show_ids):
             base_dir = cfg.local_log_dir or cfg.rollout_dir
@@ -1257,6 +1401,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         if img.shape[0] == 3:
                             img = img.permute(1, 2, 0)
                         img = ((img + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+                        _sbg = (static_bg_regions[img_idx][batch_idx].cpu()
+                               if static_bg_regions[img_idx] is not None else None)
+                        _rcs = (raw_cosine_static_regions[img_idx][batch_idx].cpu()
+                                if raw_cosine_static_regions[img_idx] is not None else None)
                         overlay = build_overlay(
                             img,
                             region_h,
@@ -1268,6 +1416,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             cfg.overlay_show_scores,
                             cfg.overlay_show_ids,
                             scores=score_regions[img_idx][batch_idx].detach().cpu(),
+                            static_bg=_sbg,
+                            raw_cosine_static=_rcs,
                         )
                         try:
                             from PIL import Image
@@ -1289,6 +1439,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_embs, image_pad_masks = prune_image_embeddings(
                 image_embs, keep_token_masks, img_masks, metas
             )
+        elif eval_frame and cfg.token_prune_enabled and _has_static_bg and static_bg_keep_masks is not None:
+            # Even on eval frames, prune static-background tokens
+            image_embs, image_pad_masks = prune_image_embeddings(
+                image_embs, static_bg_keep_masks, img_masks, metas
+            )
 
         if actions is None:
             prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
@@ -1305,6 +1460,68 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         token_state.last_important_region = [mask.detach() for mask in important_regions]
         token_state.last_region_embs = [emb.detach() for emb in region_embs]
         token_state.last_image_embs = [emb.detach() for emb in cache_image_embs]
+        token_state.last_overlay_labels = [label.detach() for label in overlay_labels]
+        token_state.last_overlay_grid = [grid.detach() for grid in overlay_grids]
+
+        # Compute entropy of score distribution for dynamic eval interval
+        if eval_frame and score_tokens:
+            token_state.eval_frame_count += 1
+            token_state.last_eval_frame_idx = token_state.frame_idx
+            _entropy_sum = 0.0
+            for _st in score_tokens:
+                # z-score normalise before softmax so that tiny differences between
+                # summed attention weights (≈ 0.31 ± tiny) are amplified into a
+                # meaningful distribution (otherwise entropy is always ≈ ln(N_tokens))
+                _s = _st.float()
+                _mean = _s.mean(dim=-1, keepdim=True)
+                _std  = _s.std(dim=-1, keepdim=True).clamp_min(1e-8)
+                _probs = torch.nn.functional.softmax((_s - _mean) / _std, dim=-1)
+                _ent = -(_probs * torch.log(_probs + 1e-8)).sum(dim=-1)
+                _entropy_sum += _ent.mean().item()
+            token_state.last_entropy = _entropy_sum / len(score_tokens)
+
+        if cfg.token_selection_enabled and token_state.frame_idx > 0:
+            _eval_rate = token_state.eval_frame_count / (token_state.frame_idx + 1)
+            _avg_interval = 1.0 / _eval_rate if _eval_rate > 0 else float("inf")
+            _entropy_str = f"{token_state.last_entropy:.3f}" if token_state.last_entropy is not None else "N/A"
+            # Store stats in token_state so the eval loop can show them in tqdm postfix
+            # Only count tokens from *valid* images (img_masks=True); placeholder
+            # images (missing cameras) have img_mask=False and should not inflate
+            # the total count or appear as "pruned" tokens.
+            _valid_masks = [
+                m for m, im in zip(keep_token_masks, img_masks)
+                if im.any()
+            ] if keep_token_masks else []
+            _marked_n = sum(int(m.sum().item()) for m in _valid_masks)
+            _total_n = sum(m.shape[-1] for m in _valid_masks)
+            # Count actually-kept tokens this frame:
+            #  - non-eval + prune_enabled: standard keep_token_masks
+            #  - eval + static_bg: only bg tokens are pruned
+            #  - otherwise: full tokens (no pruning)
+            if not cfg.token_prune_enabled:
+                _actual_kept = _total_n
+            elif not eval_frame:
+                _actual_kept = _marked_n
+            elif _has_static_bg and static_bg_keep_masks is not None:
+                _sbg_valid = [
+                    m for m, im in zip(static_bg_keep_masks, img_masks)
+                    if im.any()
+                ]
+                _actual_kept = sum(int(m.sum().item()) for m in _sbg_valid)
+            else:
+                _actual_kept = _total_n
+            _prune_pct = (1.0 - _actual_kept / _total_n) * 100.0 if _total_n > 0 else 0.0
+            # Accumulate for per-episode average pruning ratio
+            token_state.total_kept += _actual_kept
+            token_state.total_possible += _total_n
+            token_state.last_stats = {
+                "entropy": _entropy_str,
+                "avg_ivl": f"{_avg_interval:.1f}f ({_eval_rate:.0%})",
+                "kept": f"{_actual_kept}/{_total_n}",
+                "prune": f"{_prune_pct:.1f}%",
+                "eval": "Y" if eval_frame else "N",
+            }
+
         token_state.frame_idx += 1
 
         return actions
@@ -1487,6 +1704,26 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
+            # Handle tied weights: embed_tokens.weight == lm_head.weight in Gemma
+            # Checkpoints usually only save lm_head.weight; add embed_tokens alias if absent
+            _missing_embed_keys = [
+                name for name, _ in model.named_parameters()
+                if name.endswith("embed_tokens.weight") and name not in remapped_state_dict
+            ]
+            for _ek in _missing_embed_keys:
+                # Find the corresponding lm_head.weight in the same model scope
+                _lm_head_key = _ek.replace("embed_tokens.weight", "lm_head.weight")
+                # Also try language_model.lm_head.weight path variants
+                _alt_key = _ek.rsplit("embed_tokens.weight", 1)[0] + "lm_head.weight"
+                _src_key = _lm_head_key if _lm_head_key in remapped_state_dict else (
+                    _alt_key if _alt_key in remapped_state_dict else None
+                )
+                if _src_key:
+                    remapped_state_dict[_ek] = remapped_state_dict[_src_key]
+                    print(f"Tied weight: {_ek} <- {_src_key}")
+                else:
+                    print(f"[WARN] Could not resolve tied weight for {_ek}")
+
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
@@ -1583,6 +1820,31 @@ class PI05Policy(PreTrainedPolicy):
         }
         if hasattr(self, "model"):
             self.model.reset_token_selection_state()
+
+    def get_token_selection_state(self) -> dict[str, Tensor] | None:
+        if not hasattr(self, "model") or not hasattr(self.model, "_token_selection_state"):
+            return None
+        state = self.model._token_selection_state
+        if state is None:
+            return None
+
+        overlay_grid = None
+        if state.last_overlay_grid:
+            overlay_grid = torch.stack(state.last_overlay_grid, dim=0)
+
+        token_scores = None
+        if state.last_score_token:
+            token_scores = torch.stack(state.last_score_token, dim=0)
+
+        region_scores = None
+        if state.last_score_region:
+            region_scores = torch.stack(state.last_score_region, dim=0)
+
+        return {
+            "last_overlay_grid": overlay_grid,
+            "last_token_scores": token_scores,
+            "last_region_scores": region_scores,
+        }
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""

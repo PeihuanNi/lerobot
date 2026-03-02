@@ -1,0 +1,17 @@
+                    PaliGemma (2B)                    Gemma Expert (300M)
+                    ┌─────────────┐                   ┌──────────────┐
+   images ────────→ │ SigLIP      │                   │              │
+   language ──────→ │ 18层 transf │──→ KV cache ────→ │ 18层 transf  │──→ v_t (action)
+                    │ (prefix)    │    (frozen)        │ (suffix)     │
+                    └─────────────┘                   └──────┬───────┘
+                                                             │
+                                              ┌──────────────┴──────────────┐
+                                              │                             │
+                                      A^(17) (attention)           v_t (action output)
+                                              │                             │
+                                              ↓                             ↓
+                                    α = A^(17)[:,:,                g = 2·v_t → ×W_o
+                                     action, vision]              → per-head norm
+                                              │                     → w_h
+                                              ↓                             │
+                                          score_j = Σ_h max_a (α^2.0 · w_h)

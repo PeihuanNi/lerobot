@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import sys
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -184,7 +185,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Only log on main process
     if is_main_process:
-        logging.info(pformat(cfg.to_dict()))
+        logging.info("CLI args: %s", " ".join(sys.argv[1:]) or "<none>")
+        logging.info("Resolved config:\n%s", pformat(cfg.to_dict()))
 
     # Initialize wandb only on main process
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:

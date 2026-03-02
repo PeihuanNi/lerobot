@@ -58,6 +58,11 @@ class PI0Config(PreTrainedConfig):
     grad_score_method: str = "full_grad"  # full_grad | partial_grad | attn_only
     grad_denoise_steps: int = 1
     attn_score_beta: float = 1.0
+    attn_num_layers: int = 1  # number of last Expert layers to average attention over (1 = last layer only)
+    attn_num_denoise_steps: int = 1  # number of last denoise steps to average attention over (1 = last step only)
+    grad_head_beta: float = 1.0
+    grad_head_norm: str = "sum"  # sum | max
+    grad_action_agg: str = "sum"  # sum | max — how to aggregate scores over action steps and heads
     partial_grad_phi: str = "l2"  # l1 | l2
     partial_grad_pos_weight: float = 1.0
     partial_grad_grip_weight: float = 2.0
@@ -67,12 +72,55 @@ class PI0Config(PreTrainedConfig):
     grad_region_mass: float = 0.25
     grad_region_ema: float = 0.0
     grad_keep_prev: bool = False
+    # Dynamic evaluation interval (entropy-based)
+    dynamic_eval_enabled: bool = False  # if True, use entropy-based adaptive eval interval
+    eval_entropy_threshold: float = 3.5  # trigger re-eval when score entropy exceeds this
+    max_eval_interval: int = 5  # hard-cap fallback: re-eval at least every N frames
+
+    # ── Dynamic mass: entropy-coupled pruning aggressiveness ─────────────────
+    # When enabled, grad_region_mass becomes a dynamic value that scales with
+    # the normalised entropy h ∈ [0,1] of the current region score distribution:
+    #   effective_mass = mass_low + h * (mass_high - mass_low)
+    # Low h (focused) → mass_low → aggressive pruning
+    # High h (confused) → mass_high → conservative, keep more tokens
+    # grad_region_mass still acts as static fallback when dynamic_mass_enabled=False
+    dynamic_mass_enabled: bool = False
+    mass_low: float = 0.5   # effective mass when attention is fully focused  (h=0)
+    mass_high: float = 0.95  # effective mass when attention is fully diffuse (h=1)
+
+    # ── Pruning method selection ─────────────────────────────────────────────
+    # "mass"       — cumulative-score threshold (original); sensitive to score
+    #                distribution shape — see mass_low / mass_high above.
+    # "topk_ratio" — keep a fixed fraction of regions by score rank.  Linear,
+    #                no cliff-like jumps.  Use keep_ratio_low / keep_ratio_high
+    #                below (coupled to entropy h, like mass_low / mass_high).
+    pruning_method: str = "topk_ratio"  # "mass" | "topk_ratio"
+
+    # ── TopK-ratio: entropy-coupled keep-ratio ───────────────────────────────
+    # effective_keep_ratio = keep_ratio_low + h * (keep_ratio_high - keep_ratio_low)
+    # h=0 (focused, stable) → keep_ratio_low → more aggressive pruning
+    # h=1 (diffuse, confused) → keep_ratio_high → conservative, keep more
+    keep_ratio_low: float = 0.5    # keep 50% when attention is focused
+    keep_ratio_high: float = 0.9   # keep 90% when attention is diffuse
     region_eval_interval: int = 1
     region_patch_size: int = 1
     token_temporal_threshold: float = 0.9
     token_spatial_threshold: float = 0.9
     token_spatial_radius: int = 1
     token_prune_enabled: bool = False
+
+    # ── Static background detection (cosine similarity to first frame) ───────
+    # When enabled, regions in the specified camera whose cosine similarity to
+    # the first-frame reference exceeds ``static_bg_threshold`` are treated as
+    # static background and forcibly pruned on every frame (eval + non-eval).
+    static_bg_enabled: bool = False
+    static_bg_threshold: float = 0.95  # cosine similarity threshold (higher = stricter)
+    static_bg_camera_idx: int = 0      # image slot index to apply bg detection (0 = agentview)
+    static_bg_score_gate: float = 0.3    # protect top (1-gate) scored regions; 1.0 = no protection
+
+    # Fixed-count mode (used when dynamic_mass_enabled=False):
+    # When min == max, exactly that many tokens are kept per image.
+    # Ignored when dynamic_mass_enabled=True (mass controls how many to keep).
     min_kept_tokens: int = 0
     max_kept_tokens: int = 1_000_000
     vision_partial_update_enabled: bool = False
@@ -154,8 +202,17 @@ class PI0Config(PreTrainedConfig):
             valid_phi = {"l1", "l2"}
             if self.partial_grad_phi not in valid_phi:
                 raise ValueError(f"Invalid partial_grad_phi: {self.partial_grad_phi}")
+            if self.grad_score_method == "partial_grad":
+                valid_head_norm = {"sum", "max"}
+                if self.grad_head_norm not in valid_head_norm:
+                    raise ValueError(f"Invalid grad_head_norm: {self.grad_head_norm}")
+                valid_action_agg = {"sum", "max"}
+                if self.grad_action_agg not in valid_action_agg:
+                    raise ValueError(f"Invalid grad_action_agg: {self.grad_action_agg}")
             if self.region_patch_size <= 0:
                 raise ValueError("region_patch_size must be > 0")
+            if self.dynamic_eval_enabled and self.max_eval_interval <= 0:
+                raise ValueError("max_eval_interval must be > 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

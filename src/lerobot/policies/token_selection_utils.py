@@ -40,6 +40,23 @@ class TokenSelectionState:
     last_important_region: list[Tensor] | None = None
     last_region_embs: list[Tensor] | None = None
     last_image_embs: list[Tensor] | None = None
+    last_overlay_labels: list[Tensor] | None = None
+    last_overlay_grid: list[Tensor] | None = None
+    # Dynamic eval interval state
+    last_entropy: float | None = None
+    last_eval_frame_idx: int = 0
+    eval_frame_count: int = 0
+    # Reference region embeddings for static-background detection (first eval frame)
+    reference_region_embs: list[Tensor] | None = None
+    # Accumulated pruning counters for per-episode average pruning ratio
+    total_kept: int = 0
+    total_possible: int = 0
+    # Stats for tqdm postfix (updated every frame when token_selection_enabled)
+    last_stats: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.last_stats is None:
+            self.last_stats = {}
 
     def reset(self) -> None:
         self.frame_idx = 0
@@ -48,6 +65,15 @@ class TokenSelectionState:
         self.last_important_region = None
         self.last_region_embs = None
         self.last_image_embs = None
+        self.last_overlay_labels = None
+        self.last_overlay_grid = None
+        self.last_entropy = None
+        self.last_eval_frame_idx = 0
+        self.eval_frame_count = 0
+        self.reference_region_embs = None
+        self.total_kept = 0
+        self.total_possible = 0
+        self.last_stats = {}
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:
@@ -125,6 +151,34 @@ def expand_region_mask(
     return expanded.view(batch_size, patches_per_side * patches_per_side)
 
 
+def select_regions_by_topk_ratio(score_region: Tensor, keep_ratio: float) -> Tensor:
+    """Select the top-k regions by score, where k = ceil(keep_ratio * num_regions).
+
+    Unlike ``select_regions_by_mass`` (which depends on the *cumulative score*
+    and is therefore very sensitive to the score distribution shape), this
+    function directly controls the *fraction of regions* that are kept.  The
+    mapping from ``keep_ratio`` to the number of kept regions is perfectly
+    linear and does not exhibit cliff-like jumps.
+
+    Args:
+        score_region: ``[B, R]`` importance scores (any non-negative values).
+        keep_ratio:   Fraction of regions to keep, in ``(0, 1]``.
+                      ``0.5`` keeps half of all regions; ``1.0`` keeps all.
+
+    Returns:
+        Boolean mask ``[B, R]`` with ``True`` for kept regions.
+    """
+    batch_size, num_regions = score_region.shape
+    keep_ratio = max(0.0, min(keep_ratio, 1.0))
+    k = max(1, math.ceil(keep_ratio * num_regions))
+    k = min(k, num_regions)
+    order = torch.argsort(score_region, dim=-1, descending=True)
+    mask = torch.zeros_like(score_region, dtype=torch.bool)
+    for batch_idx in range(batch_size):
+        mask[batch_idx, order[batch_idx, :k]] = True
+    return mask
+
+
 def select_regions_by_mass(score_region: Tensor, mass: float) -> Tensor:
     batch_size, num_regions = score_region.shape
     total = score_region.sum(dim=-1, keepdim=True)
@@ -185,6 +239,60 @@ def cosine_similarity(a: Tensor, b: Tensor, eps: float = 1e-6) -> Tensor:
     return (a_f * b_f).sum(dim=-1) / denom
 
 
+def detect_static_background(
+    region_emb: Tensor,
+    reference_emb: Tensor,
+    threshold: float,
+    valid_mask: Tensor,
+    score_region: Tensor | None = None,
+    score_gate: float = 1.0,
+) -> tuple[Tensor, Tensor]:
+    """Detect static background by cosine similarity to reference embeddings.
+
+    A region is marked as static background only when **both**:
+      1. Its cosine similarity to the first-frame reference >= ``threshold``.
+      2. Its gradient importance score is NOT in the top ``1 - score_gate``
+         fraction (i.e., the model does not consider it highly important).
+
+    ``score_gate = 1.0`` disables the gate (all static regions are background).
+    ``score_gate = 0.3`` protects the top 70% scored regions from being pruned,
+    only pruning static regions in the bottom 30%.
+
+    Args:
+        region_emb:    ``[B, R, D]`` current region embeddings.
+        reference_emb: ``[B, R, D]`` reference (first-frame) region embeddings.
+        threshold:     Cosine similarity threshold; higher = stricter.
+        valid_mask:    ``[B, R]`` bool mask (True = real image, False = padding).
+        score_region:  ``[B, R]`` gradient importance scores (optional).
+        score_gate:    Fraction in (0, 1].  A static region is protected from
+                       background pruning if its score rank is in the top
+                       ``1 - score_gate`` of all valid regions.
+
+    Returns:
+        Tuple of two ``[B, R]`` bool masks:
+          - ``bg_mask``: True for static-background regions (after score gate).
+          - ``raw_static``: True for ALL cosine-static regions (before score gate).
+    """
+    cos = cosine_similarity(region_emb, reference_emb)  # [B, R]
+    raw_static = (cos >= threshold) & valid_mask
+    is_static = raw_static.clone()
+
+    # Score gate: protect high-scoring static regions from being pruned
+    if score_region is not None and 0 < score_gate < 1.0:
+        sr = score_region.float()
+        sr = torch.where(valid_mask, sr, torch.full_like(sr, float("-inf")))
+        n_valid = max(1, int(valid_mask.sum(dim=-1).float().mean().item()))
+        k = max(1, int((1.0 - score_gate) * n_valid))
+        # top-k scores: regions with score >= kth-largest are protected
+        topk_vals, _ = sr.topk(k, dim=-1)               # [B, k]
+        cutoff = topk_vals[:, -1:]                        # [B, 1]
+        is_high_score = sr >= cutoff                      # [B, R]
+        # Only mark as background if static AND NOT high-score
+        is_static = is_static & ~is_high_score
+
+    return is_static, raw_static
+
+
 def compute_temporal_mask(
     region_emb: Tensor, prev_region_emb: Tensor | None, threshold: float, valid_mask: Tensor
 ) -> Tensor:
@@ -218,6 +326,56 @@ def compute_spatial_mask(
     return spatial_mask.view(batch_size, region_h * region_w)
 
 
+def build_overlay_labels(
+    keep: Tensor, important: Tensor, clipped: Tensor,
+    static_bg: Tensor | None = None,
+    raw_cosine_static: Tensor | None = None,
+) -> Tensor:
+    """Build per-token overlay label map.
+
+    Label meanings (when raw_cosine_static is provided — bg camera):
+        0 = not important & not background  (green       — gradient-pruned foreground)
+        1 = important & cosine-static       (yellow      — gate-protected, looks bg but important)
+        2 = important & not cosine-static   (red         — important foreground)
+        3 = important & pruned as bg        (blue        — important but gate didn't protect)
+        4 = not important & pruned as bg    (transparent — no overlay, original image)
+
+    Fallback (no bg detection — other cameras):
+        0 = pruned (green)
+        2 = kept & important (red)
+    """
+    if keep.dim() == 1:
+        keep = keep.unsqueeze(0)
+    if important.dim() == 1:
+        important = important.unsqueeze(0)
+    if clipped.dim() == 1:
+        clipped = clipped.unsqueeze(0)
+
+    overlay = torch.zeros_like(keep, dtype=torch.uint8)  # default = 0 (green)
+
+    if raw_cosine_static is not None and static_bg is not None:
+        # 4-way classification for bg-detected camera
+        if raw_cosine_static.dim() == 1:
+            raw_cosine_static = raw_cosine_static.unsqueeze(0)
+        if static_bg.dim() == 1:
+            static_bg = static_bg.unsqueeze(0)
+        overlay[important & ~raw_cosine_static] = 2   # red: important + not static
+        overlay[important & raw_cosine_static] = 1    # yellow: important + cosine-static (gate-protected)
+        overlay[static_bg] = 4                         # transparent: pruned background (not important)
+        overlay[important & static_bg] = 3             # blue: important but pruned as bg (gate didn't protect)
+        # Everything else stays 0 (green): not important, not bg
+    else:
+        # Fallback: original scheme (no bg detection for this camera)
+        overlay[keep & ~important] = 1
+        overlay[keep & important] = 2
+        overlay[clipped] = 3
+        if static_bg is not None:
+            if static_bg.dim() == 1:
+                static_bg = static_bg.unsqueeze(0)
+            overlay[static_bg] = 4
+    return overlay
+
+
 def build_overlay(
     image: Tensor,
     region_h: int,
@@ -229,6 +387,8 @@ def build_overlay(
     show_scores: bool,
     show_ids: bool,
     scores: Tensor | None = None,
+    static_bg: Tensor | None = None,
+    raw_cosine_static: Tensor | None = None,
 ) -> Tensor:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -257,14 +417,16 @@ def build_overlay(
         x0 = col * region_width
         y1 = y0 + region_height
         x1 = x0 + region_width
-        if clipped[idx]:
-            color = (0, 0, 255)
-        elif important[idx] and keep[idx]:
-            color = (255, 0, 0)
-        elif keep[idx]:
-            color = (255, 255, 0)
+        if static_bg is not None and static_bg[idx] and important[idx]:
+            color = (0, 0, 255)       # blue: important but pruned as bg (gate didn't protect)
+        elif static_bg is not None and static_bg[idx]:
+            continue  # pruned bg (not important): no overlay, keep original image
+        elif raw_cosine_static is not None and raw_cosine_static[idx] and important[idx]:
+            color = (255, 255, 0)     # yellow: gate-protected (important + cosine-static)
+        elif important[idx]:
+            color = (255, 0, 0)       # red: important & not static
         else:
-            color = (0, 255, 0)
+            color = (0, 255, 0)       # green: not important
         draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
         if show_scores or show_ids:
             label_parts = []
