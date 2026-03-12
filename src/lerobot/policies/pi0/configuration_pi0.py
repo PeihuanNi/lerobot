@@ -55,77 +55,126 @@ class PI0Config(PreTrainedConfig):
 
     # Token selection / pruning (optional, inference-time)
     token_selection_enabled: bool = False
-    grad_score_method: str = "full_grad"  # full_grad | partial_grad | attn_only
-    grad_denoise_steps: int = 1
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. Scoring Method
+    #    Determines how vision-token importance is computed.
+    #    Each method outputs per-token scores; downstream modules are unaffected.
+    # ═══════════════════════════════════════════════════════════════════════
+    grad_score_method: str = "full_grad"
+    # full_grad | partial_grad | attn_only | transformer_interpretability
+
+    # -- transformer_interpretability params --
+    interp_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
+    interp_use_residual: bool = False  # True = full Chefer residual propagation across all layers
+    interp_action_start: int = 0       # first action step for objective (0-indexed)
+    interp_action_end: int = -1        # last action step (exclusive); -1 = chunk_size (all)
+    interp_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-dim backprop
+    interp_objective: str = "vector_field_L2"
+    interp_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
+
+    # -- Shared attention params --
+    attn_num_layers: int = 1       # avg attention over last N Expert layers (1=last only, 18=all)
+    attn_num_denoise_steps: int = 1  # avg attention over last N denoise steps (1=last only)
     attn_score_beta: float = 1.0
-    attn_num_layers: int = 1  # number of last Expert layers to average attention over (1 = last layer only)
-    attn_num_denoise_steps: int = 1  # number of last denoise steps to average attention over (1 = last step only)
     grad_head_beta: float = 1.0
-    grad_head_norm: str = "sum"  # sum | max
-    grad_action_agg: str = "sum"  # sum | max — how to aggregate scores over action steps and heads
-    partial_grad_phi: str = "l2"  # l1 | l2
+    grad_head_norm: str = "sum"      # sum | max
+    grad_action_agg: str = "sum"     # sum | max — action-step & head aggregation
+
+    # -- partial_grad params --
+    partial_grad_phi: str = "l2"           # l1 | l2
     partial_grad_pos_weight: float = 1.0
     partial_grad_grip_weight: float = 2.0
+
+    # -- General scoring params --
+    grad_denoise_steps: int = 1
     grad_tau: float = 0.1
     grad_alpha: float = 1.0
     grad_beta: float = 1.0
-    grad_region_mass: float = 0.25
-    grad_region_ema: float = 0.0
+    grad_region_ema: float = 0.0  # EMA smoothing for region scores (0=none)
     grad_keep_prev: bool = False
-    # Dynamic evaluation interval (entropy-based)
-    dynamic_eval_enabled: bool = False  # if True, use entropy-based adaptive eval interval
-    eval_entropy_threshold: float = 3.5  # trigger re-eval when score entropy exceeds this
-    max_eval_interval: int = 5  # hard-cap fallback: re-eval at least every N frames
 
-    # ── Dynamic mass: entropy-coupled pruning aggressiveness ─────────────────
-    # When enabled, grad_region_mass becomes a dynamic value that scales with
-    # the normalised entropy h ∈ [0,1] of the current region score distribution:
-    #   effective_mass = mass_low + h * (mass_high - mass_low)
-    # Low h (focused) → mass_low → aggressive pruning
-    # High h (confused) → mass_high → conservative, keep more tokens
-    # grad_region_mass still acts as static fallback when dynamic_mass_enabled=False
-    dynamic_mass_enabled: bool = False
-    mass_low: float = 0.5   # effective mass when attention is fully focused  (h=0)
-    mass_high: float = 0.95  # effective mass when attention is fully diffuse (h=1)
+    # ═══════════════════════════════════════════════════════════════════════
+    # 2. Background Filtering  (independent of scoring & pruning ratio)
+    #    Cosine-similarity to first-frame reference → static background mask.
+    #    Applied per-camera before pruning; protected by score_gate.
+    # ═══════════════════════════════════════════════════════════════════════
+    static_bg_enabled: bool = False
+    static_bg_threshold: float = 0.95   # cosine sim threshold (higher = stricter)
+    static_bg_camera_idx: int = 0       # image slot (0 = agentview, 1 = wrist)
+    static_bg_score_gate: float = 0.3   # protect top (1-gate) scored regions (1.0 = no protection)
 
-    # ── Pruning method selection ─────────────────────────────────────────────
-    # "mass"       — cumulative-score threshold (original); sensitive to score
-    #                distribution shape — see mass_low / mass_high above.
-    # "topk_ratio" — keep a fixed fraction of regions by score rank.  Linear,
-    #                no cliff-like jumps.  Use keep_ratio_low / keep_ratio_high
-    #                below (coupled to entropy h, like mass_low / mass_high).
-    pruning_method: str = "topk_ratio"  # "mass" | "topk_ratio"
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. Pruning Ratio  (independent of scoring method & background filter)
+    #    Controls *how many* tokens to keep after scoring.
+    #
+    #    pruning_mode selects the strategy:
+    #      "fixed_count"      — keep TopK by score; count set by min/max_kept_tokens.
+    #      "cumulative_mass"  — normalize scores to sum=1, keep until cumulative
+    #                           sum >= grad_region_mass.  min/max still enforced.
+    #      "entropy_dynamic"  — entropy-coupled: h∈[0,1] interpolates between
+    #                           low/high params.  pruning_method picks "mass" or
+    #                           "topk_ratio".  min/max still enforced.
+    # ═══════════════════════════════════════════════════════════════════════
+    pruning_mode: str = "fixed_count"  # "fixed_count" | "cumulative_mass" | "entropy_dynamic"
 
-    # ── TopK-ratio: entropy-coupled keep-ratio ───────────────────────────────
-    # effective_keep_ratio = keep_ratio_low + h * (keep_ratio_high - keep_ratio_low)
-    # h=0 (focused, stable) → keep_ratio_low → more aggressive pruning
-    # h=1 (diffuse, confused) → keep_ratio_high → conservative, keep more
-    keep_ratio_low: float = 0.5    # keep 50% when attention is focused
-    keep_ratio_high: float = 0.9   # keep 90% when attention is diffuse
-    region_eval_interval: int = 1
+    # -- cumulative_mass params --
+    grad_region_mass: float = 0.7  # cumulative-score threshold (used when pruning_mode="cumulative_mass")
+
+    # -- entropy_dynamic params --
+    pruning_method: str = "topk_ratio"   # "mass" | "topk_ratio"  (used when pruning_mode="entropy_dynamic")
+    keep_ratio_low: float = 0.5          # keep ratio when h≈0 (focused)
+    keep_ratio_high: float = 0.9         # keep ratio when h≈1 (diffuse)
+    mass_low: float = 0.5               # mass threshold when h≈0
+    mass_high: float = 0.95             # mass threshold when h≈1
+
+    # -- Shared: min/max guardrails (applied in ALL pruning modes) --
+    min_kept_tokens: int = 0
+    max_kept_tokens: int = 1_000_000
+
+    # -- L1 Dynamic Prune Ratio --
+    #    When enabled, the pruning count switches between min_kept_tokens and
+    #    max_kept_tokens based on the previous frame's action L1 norm:
+    #      L1 > threshold → aggressive prune (min_kept_tokens)
+    #      L1 ≤ threshold → conservative prune (max_kept_tokens)
+    #    When disabled, a fixed prune_ratio is used for both min/max.
+    l1_dynamic_prune_enabled: bool = False
+    l1_dynamic_prune_threshold: float = 8.0
+    prune_ratio: int = 64  # fixed kept-token count when l1_dynamic_prune is disabled
+
     region_patch_size: int = 1
     token_temporal_threshold: float = 0.9
     token_spatial_threshold: float = 0.9
     token_spatial_radius: int = 1
     token_prune_enabled: bool = False
-
-    # ── Static background detection (cosine similarity to first frame) ───────
-    # When enabled, regions in the specified camera whose cosine similarity to
-    # the first-frame reference exceeds ``static_bg_threshold`` are treated as
-    # static background and forcibly pruned on every frame (eval + non-eval).
-    static_bg_enabled: bool = False
-    static_bg_threshold: float = 0.95  # cosine similarity threshold (higher = stricter)
-    static_bg_camera_idx: int = 0      # image slot index to apply bg detection (0 = agentview)
-    static_bg_score_gate: float = 0.3    # protect top (1-gate) scored regions; 1.0 = no protection
-
-    # Fixed-count mode (used when dynamic_mass_enabled=False):
-    # When min == max, exactly that many tokens are kept per image.
-    # Ignored when dynamic_mass_enabled=True (mass controls how many to keep).
-    min_kept_tokens: int = 0
-    max_kept_tokens: int = 1_000_000
     vision_partial_update_enabled: bool = False
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 4. Eval Interval  (independent of everything above)
+    #    Controls how often the scoring + pruning pipeline runs.
+    #      dynamic_eval_enabled=False → fixed interval (region_eval_interval)
+    #      dynamic_eval_enabled=True  → entropy-triggered re-eval
+    # ═══════════════════════════════════════════════════════════════════════
+    region_eval_interval: int = 1
+    dynamic_eval_enabled: bool = False
+    eval_entropy_threshold: float = 3.5  # re-eval trigger threshold
+    max_eval_interval: int = 5           # hard-cap: re-eval at least every N frames
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 5. Overlay / Visualization  (independent of scoring & pruning)
+    #    overlay_mode selects rendering style:
+    #      "heatmap" — continuous jet colormap; pruned regions darkened+hatched
+    #      "label"   — discrete 5-color overlay (green/yellow/red/blue/transparent)
+    #    score_debug_heatmap overrides everything: forces every-frame scoring,
+    #    disables pruning, shows pure heatmap without prune marks.
+    # ═══════════════════════════════════════════════════════════════════════
+    overlay_mode: str = "heatmap"       # "heatmap" | "label"
     overlay_show_scores: bool = False
     overlay_show_ids: bool = False
+    score_debug_heatmap: bool = False   # debug: no pruning, every frame scored
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 6. Logging / Debug
+    # ═══════════════════════════════════════════════════════════════════════
     rollout_dir: str | None = None
     local_log_dir: str | None = None
     run_id_note: str = ""
@@ -196,7 +245,7 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
         if self.token_selection_enabled:
-            valid_grad_methods = {"full_grad", "partial_grad", "attn_only"}
+            valid_grad_methods = {"full_grad", "partial_grad", "attn_only", "transformer_interpretability"}
             if self.grad_score_method not in valid_grad_methods:
                 raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
             valid_phi = {"l1", "l2"}
@@ -209,6 +258,12 @@ class PI0Config(PreTrainedConfig):
                 valid_action_agg = {"sum", "max"}
                 if self.grad_action_agg not in valid_action_agg:
                     raise ValueError(f"Invalid grad_action_agg: {self.grad_action_agg}")
+            valid_pruning_modes = {"fixed_count", "cumulative_mass", "entropy_dynamic"}
+            if self.pruning_mode not in valid_pruning_modes:
+                raise ValueError(f"Invalid pruning_mode: {self.pruning_mode}")
+            valid_overlay_modes = {"heatmap", "label"}
+            if self.overlay_mode not in valid_overlay_modes:
+                raise ValueError(f"Invalid overlay_mode: {self.overlay_mode}")
             if self.region_patch_size <= 0:
                 raise ValueError("region_patch_size must be > 0")
             if self.dynamic_eval_enabled and self.max_eval_interval <= 0:

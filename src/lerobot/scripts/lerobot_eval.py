@@ -110,14 +110,14 @@ def _to_numpy(value):
 
 def _extract_overlay_state(policy: PreTrainedPolicy):
     if not hasattr(policy, "get_token_selection_state"):
-        return None, None
+        return None, None, None, None
     state = policy.get_token_selection_state()
     if state is None:
-        return None, None
+        return None, None, None, None
 
     overlay_grid = _to_numpy(state.get("last_overlay_grid"))
     if overlay_grid is None:
-        return None, None
+        return None, None, None, None
 
     if overlay_grid.ndim == 4:
         overlay_grid = overlay_grid[0]
@@ -126,7 +126,7 @@ def _extract_overlay_state(policy: PreTrainedPolicy):
     elif overlay_grid.ndim == 2:
         overlay_grid = overlay_grid[None, ...]
     else:
-        return None, None
+        return None, None, None, None
 
     token_scores = _to_numpy(state.get("last_token_scores"))
     if token_scores is not None:
@@ -170,7 +170,122 @@ def _extract_overlay_state(policy: PreTrainedPolicy):
                     -1, region_h, region_patch, region_w, region_patch
                 ).mean(axis=(2, 4))
 
-    return overlay_grid.astype(np.uint8), region_scores
+    heatmap_grid_out = _to_numpy(state.get("last_heatmap_grid"))
+    if heatmap_grid_out is not None:
+        # Shape from torch.stack: [num_cameras, B, H, W]
+        # We want [num_cameras, H, W] (take batch=0)
+        if heatmap_grid_out.ndim == 4:
+            heatmap_grid_out = heatmap_grid_out[:, 0]
+        elif heatmap_grid_out.ndim == 2:
+            heatmap_grid_out = heatmap_grid_out[None, ...]
+
+    keep_grid_out = _to_numpy(state.get("last_keep_grid"))
+    if keep_grid_out is not None:
+        if keep_grid_out.ndim == 4:
+            keep_grid_out = keep_grid_out[:, 0]  # [num_cameras, H, W]
+        elif keep_grid_out.ndim == 2:
+            keep_grid_out = keep_grid_out[None, ...]
+
+    return overlay_grid.astype(np.uint8), region_scores, heatmap_grid_out, keep_grid_out
+
+
+def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
+                          keep_grid=None, prune_darken=0.5, prune_stripe_gap=4):
+    """Overlay a continuous heatmap (blue→red) on *img* based on *heatmap_grid*.
+
+    Args:
+        heatmap_grid: float [H_region, W_region] in [0, 1].
+        keep_grid:    bool/uint8 [H_region, W_region] (optional).
+                      True/1 = kept, False/0 = pruned.
+                      When provided, pruned regions are darkened and overlaid
+                      with diagonal stripe hatching so you can clearly see which
+                      tokens were pruned while still reading the heatmap colour.
+        prune_darken: brightness multiplier for pruned regions (0=black, 1=no change).
+        prune_stripe_gap: pixel spacing of diagonal hatching lines.
+    """
+    if heatmap_grid is None:
+        return img
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return img
+
+    img_np = img.astype(np.uint8, copy=False)
+    height, width = img_np.shape[:2]
+
+    # Upsample heatmap to image resolution (nearest for sharp region boundaries)
+    hm_h, hm_w = heatmap_grid.shape
+    hm_img = Image.fromarray(heatmap_grid.astype(np.float32), mode="F")
+    hm_up = np.array(hm_img.resize((width, height), resample=Image.NEAREST))
+
+    # Colormap: blue (0) → cyan → green → yellow → red (1)
+    def _jet_colormap(v):
+        r = np.clip(1.5 - np.abs(v - 0.75) * 4.0, 0.0, 1.0)
+        g = np.clip(1.5 - np.abs(v - 0.5) * 4.0, 0.0, 1.0)
+        b = np.clip(1.5 - np.abs(v - 0.25) * 4.0, 0.0, 1.0)
+        return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+
+    heat_rgb = _jet_colormap(hm_up)
+    blended = (img_np.astype(np.float32) * (1.0 - alpha)
+               + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+
+    # ── Mark pruned regions: darken + diagonal stripe hatching ────────────
+    if keep_grid is not None:
+        kg_arr = keep_grid.astype(np.uint8) if keep_grid.dtype != np.uint8 else keep_grid
+        kg_img = Image.fromarray(kg_arr, mode='L').resize((width, height), resample=Image.NEAREST)
+        kg_up = np.array(kg_img)
+        pruned_mask = (kg_up == 0)  # True where pruned (keep=0)
+
+        # 1) Darken pruned pixels
+        blended_f = blended.astype(np.float32)
+        blended_f[pruned_mask] *= prune_darken
+        blended = blended_f.astype(np.uint8)
+
+        # 2) Diagonal stripe hatching (white, semi-transparent) on pruned regions
+        #    Pattern: pixel (x, y) is on a stripe if (x + y) % gap < gap//3
+        if prune_stripe_gap > 0:
+            yy, xx = np.mgrid[:height, :width]
+            stripe = ((xx + yy) % prune_stripe_gap) < max(1, prune_stripe_gap // 3)
+            stripe_mask = pruned_mask & stripe
+            # Blend stripe colour (white, 40% opacity) onto the darkened image
+            blended_f2 = blended.astype(np.float32)
+            blended_f2[stripe_mask] = blended_f2[stripe_mask] * 0.6 + 255.0 * 0.4
+            blended = blended_f2.astype(np.uint8)
+
+    # ── Optionally draw region score numbers ──────────────────────────────
+    if region_scores is None:
+        return blended
+    if torch.is_tensor(region_scores):
+        region_scores = region_scores.detach().cpu().numpy()
+    region_scores = region_scores.astype(np.float32)
+    total = float(region_scores.sum())
+    if total > 0:
+        region_scores = region_scores / total
+
+    region_h, region_w = heatmap_grid.shape
+    cell_w = width / max(region_w, 1)
+    cell_h = height / max(region_h, 1)
+    pil_img = Image.fromarray(blended)
+    draw = ImageDraw.Draw(pil_img)
+    score_font_size = max(7, min(12, int(min(cell_w, cell_h) * 0.38)))
+    def _load_font(size):
+        for font_name in ("DejaVuSansMono.ttf", "DejaVuSans.ttf", "Arial.ttf"):
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+    score_font = _load_font(score_font_size)
+    for r in range(region_h):
+        for c in range(region_w):
+            x = int((c + 0.03) * cell_w)
+            y = int((r + 0.03) * cell_h)
+            score = region_scores[r, c]
+            text = f"{score:.3f}"
+            draw.text((x + 1, y + 1), text, fill=(0, 0, 0), font=score_font)
+            draw.text((x, y), text, fill=(255, 255, 255), font=score_font)
+    return np.array(pil_img)
 
 
 def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35, show_ids=False):
@@ -334,7 +449,7 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
-        with torch.inference_mode():
+        with torch.no_grad():
             action = policy.select_action(observation)
         action = postprocessor(action)
 
@@ -454,6 +569,8 @@ def eval_policy(
     policy.eval()
 
     overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
+    heatmap_debug = bool(getattr(getattr(policy, "config", None), "score_debug_heatmap", False))
+    overlay_heatmap = getattr(getattr(policy, "config", None), "overlay_mode", "label") == "heatmap"
     show_scores = bool(getattr(getattr(policy, "config", None), "overlay_show_scores", False))
     show_ids = bool(getattr(getattr(policy, "config", None), "overlay_show_ids", False))
     last_overlay_grid = None
@@ -480,8 +597,10 @@ def eval_policy(
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         overlay_grid = None
         region_scores = None
+        heatmap_grid = None
+        keep_grid = None
         if overlay_enabled:
-            overlay_grid, region_scores = _extract_overlay_state(policy)
+            overlay_grid, region_scores, heatmap_grid, keep_grid = _extract_overlay_state(policy)
             if overlay_grid is not None:
                 last_overlay_grid = overlay_grid
                 last_region_scores = region_scores
@@ -490,7 +609,19 @@ def eval_policy(
                 region_scores = last_region_scores
         if isinstance(env, gym.vector.SyncVectorEnv):
             frames = [env.envs[i].render() for i in range(n_to_render_now)]  # noqa: B023
-            if overlay_grid is not None:
+            if heatmap_grid is not None and (heatmap_debug or overlay_heatmap):
+                rendered = []
+                for idx, frame in enumerate(frames):
+                    hm = heatmap_grid[idx] if idx < heatmap_grid.shape[0] else heatmap_grid[0]
+                    scores = None
+                    if show_scores and region_scores is not None:
+                        scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
+                    kg = None
+                    if keep_grid is not None and not heatmap_debug:
+                        kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
+                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                frames = rendered
+            elif overlay_grid is not None:
                 rendered = []
                 for idx, frame in enumerate(frames):
                     grid = overlay_grid[idx] if idx < overlay_grid.shape[0] else overlay_grid[0]
@@ -503,7 +634,19 @@ def eval_policy(
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
             frames = env.call("render")[:n_to_render_now]
-            if overlay_grid is not None:
+            if heatmap_grid is not None and (heatmap_debug or overlay_heatmap):
+                rendered = []
+                for idx, frame in enumerate(frames):
+                    hm = heatmap_grid[idx] if idx < heatmap_grid.shape[0] else heatmap_grid[0]
+                    scores = None
+                    if show_scores and region_scores is not None:
+                        scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
+                    kg = None
+                    if keep_grid is not None and not heatmap_debug:
+                        kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
+                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                frames = rendered
+            elif overlay_grid is not None:
                 rendered = []
                 for idx, frame in enumerate(frames):
                     grid = overlay_grid[idx] if idx < overlay_grid.shape[0] else overlay_grid[0]
@@ -616,6 +759,20 @@ def eval_policy(
     # Wait till all video rendering threads are done.
     for thread in threads:
         thread.join()
+
+    # Flush any pending action L1 norm plot for the last episode.
+    _flush_model = getattr(policy, "model", None)
+    if _flush_model is not None:
+        _flush_state = getattr(_flush_model, "_token_selection_state", None)
+        _flush_cfg = getattr(_flush_model, "config", None)
+        if (_flush_state is not None
+                and _flush_cfg is not None
+                and getattr(_flush_cfg, "interp_plot_actions_l1", False)
+                and _flush_state.actions_l1_history):
+            if not hasattr(_flush_model, '_plot_episode_idx'):
+                _flush_model._plot_episode_idx = 0
+            _flush_model._save_actions_l1_plot(_flush_state, _flush_model._plot_episode_idx)
+            _flush_model._plot_episode_idx += 1
 
     # Collect final token selection stats if available.
     _token_sel_stats = {}
@@ -732,8 +889,13 @@ def eval_main(cfg: EvalPipelineConfig):
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
 
-    torch.backends.cudnn.benchmark = True
+    # ── Full determinism ──
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    import os
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     set_seed(cfg.seed)
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
@@ -775,7 +937,7 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,

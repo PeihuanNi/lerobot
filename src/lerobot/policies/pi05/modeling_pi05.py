@@ -609,7 +609,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if self._token_selection_state is None:
             self._token_selection_state = TokenSelectionState()
         else:
+            if (self.config.interp_plot_actions_l1
+                    and self._token_selection_state.actions_l1_history):
+                if not hasattr(self, '_plot_episode_idx'):
+                    self._plot_episode_idx = 0
+                self._save_actions_l1_plot(self._token_selection_state, self._plot_episode_idx)
+                self._plot_episode_idx += 1
             self._token_selection_state.reset()
+
+    def _save_actions_l1_plot(self, state, episode_idx):
+        """Save a line chart of the predicted-action L1 norm at each inference frame."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        history = state.actions_l1_history
+        if not history:
+            return
+        cfg = self.config
+        base_dir = cfg.local_log_dir or cfg.rollout_dir or "outputs/eval/actions_l1"
+        out_dir = Path(base_dir)
+        if cfg.run_id_note:
+            out_dir = out_dir / cfg.run_id_note
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        frames = [h[0] for h in history]
+        l1_norms = [h[1] for h in history]
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(frames, l1_norms, marker="o", markersize=3,
+                linewidth=1.2, color="tab:blue", label="Action L1 Norm")
+        ax.set_xlabel("Inference Frame Index")
+        ax.set_ylabel("Action L1 Norm")
+        ax.set_title("Predicted Action L1 Norm over Time")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / f"actions_l1_episode_{episode_idx}.png", dpi=120)
+        plt.close(fig)
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -920,7 +957,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         token_state = self._token_selection_state
         eval_interval = cfg.region_eval_interval if cfg.region_eval_interval > 0 else 1
-        if cfg.dynamic_eval_enabled:
+        if cfg.score_debug_heatmap:
+            eval_frame = True  # debug heatmap: evaluate every frame
+        elif cfg.dynamic_eval_enabled:
             frames_since_eval = token_state.frame_idx - token_state.last_eval_frame_idx
             if token_state.frame_idx == 0:
                 eval_frame = True
@@ -1143,6 +1182,225 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     emb_norm = torch.linalg.vector_norm(emb_patch.float(), dim=-1)
                     score_tokens.append(grad_norm * emb_norm)
                 actions = x_t.detach()
+            elif cfg.grad_score_method == "transformer_interpretability":
+                # ── Gradient-Weighted Attention (GradxAttn) ───────────────
+                # For each scored denoise step:
+                #   1. Forward with x_t.requires_grad_(True).
+                #   2. Objective: ||v_t||_F^2.
+                #   3. grad_x = dobj/dx_t -> per-action importance w[a]=||grad_x[a]||
+                #   4. Aggregate attention over last N Expert layers.
+                #   5. score_j = sum_a w[a] * sum_h A[h,a,j]
+                #   6. Accumulate across scored denoise steps, then average.
+                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+
+                _interp_step = cfg.interp_denoise_step  # -1 = all steps, >=0 = specific
+                _dt = -1.0 / num_steps
+                x_t = noise.clone()
+                _score_accum = None  # [B, total_vis_tokens]
+                _score_count = 0
+                _n_layers = max(1, min(
+                    cfg.attn_num_layers,
+                    len(self.paligemma_with_expert.gemma_expert.model.layers),
+                ))
+
+                for _step in range(num_steps):
+                    _time = 1.0 + _step * _dt
+                    _time_t = torch.tensor(_time, dtype=torch.float32, device=device).expand(bsize)
+                    _need_score = (_interp_step < 0 or _interp_step == _step)
+
+                    if _need_score:
+                        _x_in = x_t.detach().requires_grad_(True)
+                        with torch.enable_grad():
+                            _v_raw, _, _step_attns = self.denoise_step(
+                                prefix_pad_masks=prefix_pad_masks,
+                                past_key_values=past_key_values,
+                                x_t=_x_in,
+                                timestep=_time_t,
+                                output_attentions=True,
+                                return_suffix_out=True,
+                            )
+                            # ── Action-step subset for objective ──
+                            _a_lo = max(0, cfg.interp_action_start)
+                            _a_hi = cfg.chunk_size if cfg.interp_action_end < 0 else min(cfg.interp_action_end, cfg.chunk_size)
+                            _attn_list = list(_step_attns)
+
+                            # ── Compute objective target ──
+                            if cfg.interp_objective == "action_sample_L1":
+                                # x_0_hat = x_t - t * v_theta
+                                _obj_target = (_x_in[:, _a_lo:_a_hi, :] - _time * _v_raw[:, _a_lo:_a_hi, :]).float()
+                            else:
+                                # vector_field_L2 (default): use v_raw directly
+                                _obj_target = _v_raw[:, _a_lo:_a_hi, :].float()
+
+                            if cfg.interp_variant == "dimension_independent":
+                                # Per-dimension backprop: A_bar = (1/D) sum_d mean_h(A * |dv_d/dA|)
+                                _v_sel = _obj_target[:, :, :7]  # 只用前7维
+                                _action_dim = 7
+                                if cfg.interp_use_residual:
+                                    _dim_A_bars = None
+                                    for _d in range(_action_dim):
+                                        _obj_d = _v_sel[:, :, _d].sum()
+                                        _gs = torch.autograd.grad(
+                                            _obj_d, _attn_list,
+                                            retain_graph=(_d < _action_dim - 1),
+                                        )
+                                        if _dim_A_bars is None:
+                                            _dim_A_bars = [
+                                                (_attn_list[l].detach().float() * _gs[l].float().abs()).mean(dim=1)
+                                                for l in range(len(_attn_list))
+                                            ]
+                                        else:
+                                            for l in range(len(_attn_list)):
+                                                _dim_A_bars[l] = _dim_A_bars[l] + (
+                                                    _attn_list[l].detach().float() * _gs[l].float().abs()
+                                                ).mean(dim=1)
+                                    for l in range(len(_attn_list)):
+                                        _dim_A_bars[l] = _dim_A_bars[l] / _action_dim
+                                else:
+                                    _last_attn = _attn_list[-1]
+                                    _A_last_d = _last_attn.detach().float()
+                                    _dim_A_bar = None
+                                    for _d in range(_action_dim):
+                                        _obj_d = _v_sel[:, :, _d].sum()
+                                        _gd = torch.autograd.grad(
+                                            _obj_d, _last_attn,
+                                            retain_graph=(_d < _action_dim - 1),
+                                        )[0]
+                                        _c = (_A_last_d * _gd.float().abs()).mean(dim=1)
+                                        _dim_A_bar = _c if _dim_A_bar is None else _dim_A_bar + _c
+                                    _dim_A_bar = _dim_A_bar / _action_dim
+                            else:
+                                if cfg.interp_objective == "action_sample_L1":
+                                    _obj = _obj_target.abs().sum()
+                                else:
+                                    _obj = (_obj_target ** 2).sum()
+                                if cfg.interp_use_residual:
+                                    _grads = torch.autograd.grad(
+                                        _obj, _attn_list, retain_graph=False,
+                                    )
+                                else:
+                                    _last_attn = _attn_list[-1]
+                                    _grad_last = torch.autograd.grad(
+                                        _obj, _last_attn, retain_graph=False,
+                                    )[0]
+
+                        # -- build vision-token indices (shared by both paths) --
+                        _ref_A = _step_attns[-1]
+                        _suffix_len = _ref_A.shape[2]
+                        _total_len = _ref_A.shape[3]
+                        _prefix_len = _total_len - _suffix_len
+                        _action_len = cfg.chunk_size
+                        _action_end = _suffix_len
+                        _action_start = max(0, _action_end - _action_len)
+                        # Narrow to user-selected action-step subset
+                        _q_a_start = _action_start + _a_lo
+                        _q_a_end = _action_start + _a_hi
+                        _sel_alen = _a_hi - _a_lo
+
+                        _vis_idx = []
+                        _off = 0
+                        for meta in metas:
+                            _off += meta.num_extra_tokens
+                            _vis_idx.extend(range(_off, _off + meta.num_patches))
+                            _off += meta.num_patches
+                        _vis_idx_t = torch.tensor(_vis_idx, device=device)
+                        if _vis_idx_t.numel() > 0 and _total_len > 0:
+                            _vis_idx_t = _vis_idx_t[_vis_idx_t < _total_len]
+
+                        if cfg.interp_use_residual:
+                            # ── Residual propagation: R^l = R^{l-1} @ Â^l ──
+                            _num_expert_layers = len(_attn_list)
+                            _diag = torch.arange(_suffix_len, device=device)
+                            # R: [B, suffix_len, total_len] — identity init
+                            _R = torch.zeros(bsize, _suffix_len, _total_len,
+                                             device=device, dtype=torch.float32)
+                            _R[:, _diag, _prefix_len + _diag] = 1.0
+
+                            for _ell in range(_num_expert_layers):
+                                if cfg.interp_variant == "dimension_independent":
+                                    _A_bar = _dim_A_bars[_ell]
+                                elif cfg.interp_variant == "abs_heads":
+                                    _A_ell = _attn_list[_ell].detach().float()
+                                    _g_ell = _grads[_ell].float()
+                                    _A_bar = (_g_ell * _A_ell).abs().mean(dim=1)  # [B, Qs, K]
+                                else:  # "original"
+                                    _A_ell = _attn_list[_ell].detach().float()
+                                    _g_ell = _grads[_ell].float()
+                                    _ga = (_g_ell * _A_ell).mean(dim=1)  # [B, Qs, K]
+                                    _A_bar = torch.relu(_ga)
+                                _A_hat = _A_bar.clone()
+                                _A_hat[:, _diag, _prefix_len + _diag] += 1.0
+                                # Row-normalize
+                                _row_sum = _A_hat.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                                _A_hat = _A_hat / _row_sum
+                                # R_new = R @ Â_full  (prefix rows = identity)
+                                _R_s = _R[:, :, _prefix_len:]   # [B, Qs, Qs]
+                                _R_p = _R[:, :, :_prefix_len] + torch.bmm(_R_s, _A_hat[:, :, :_prefix_len])
+                                _R_sf = torch.bmm(_R_s, _A_hat[:, :, _prefix_len:])
+                                _R = torch.cat([_R_p, _R_sf], dim=-1)
+
+                            # Extract action→vision relevance (selected action subset)
+                            if _vis_idx_t.numel() > 0 and _sel_alen > 0:
+                                _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                _step_score = _step_score.mean(dim=1)   # [B, num_vis]
+                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
+                            else:
+                                _step_score = None
+                        else:
+                            # -- Last-layer scoring --
+                            if cfg.interp_variant == "dimension_independent":
+                                _A_bar = _dim_A_bar
+                            elif cfg.interp_variant == "abs_heads":
+                                _A_last = _last_attn.detach().float()
+                                _A_bar = (_grad_last.float() * _A_last).abs().mean(dim=1)
+                            else:  # "original"
+                                _A_last = _last_attn.detach().float()
+                                _ga = (_grad_last.float() * _A_last).mean(dim=1)
+                                _A_bar = torch.relu(_ga)
+
+                            if _vis_idx_t.numel() > 0 and _sel_alen > 0:
+                                _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                _step_score = _step_score.mean(dim=1)  # [B, num_vis]
+                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
+                            else:
+                                _step_score = None
+
+                        if _step_score is not None:
+                            if _score_accum is None:
+                                _score_accum = _step_score
+                            else:
+                                _score_accum = _score_accum + _step_score
+                            _score_count += 1
+
+                        _v_t = _v_raw.detach()
+                    else:
+                        with torch.no_grad():
+                            _v_t = self.denoise_step(
+                                prefix_pad_masks=prefix_pad_masks,
+                                past_key_values=past_key_values,
+                                x_t=x_t,
+                                timestep=_time_t,
+                            )
+
+                    x_t = x_t.detach() + _dt * _v_t.detach()
+
+                # Average across scored steps
+                if _score_count > 1:
+                    _score_accum = _score_accum / _score_count
+
+                if _score_accum is None:
+                    score_tokens = token_norms
+                else:
+                    score_tokens = []
+                    _start = 0
+                    for meta in metas:
+                        _end = _start + meta.num_patches
+                        score_tokens.append(_score_accum[:, _start:_end])
+                        _start = _end
+                actions = x_t.detach()
+
+
             else:
                 prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
                 past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
@@ -1270,32 +1528,47 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     cfg.grad_region_ema * token_state.last_score_region[idx]
                     + (1.0 - cfg.grad_region_ema) * score_region
                 )
-            # ── Dynamic pruning: scale aggressiveness by region-score entropy ──
-            # Normalised entropy h ∈ [0,1] of region score distribution:
-            #   h=0 → attention fully focused → aggressive pruning
-            #   h=1 → attention fully diffuse → conservative (keep more)
-            if cfg.dynamic_mass_enabled:
-                import math as _math
-                _r = score_region.float()  # [B, R]
-                _r_total = _r.sum(dim=-1, keepdim=True)
-                _r_norm = torch.where(
-                    _r_total > 0, _r / _r_total,
-                    torch.full_like(_r, 1.0 / _r.shape[-1]),
-                )
-                _r_ent = -(_r_norm * torch.log(_r_norm.clamp_min(1e-8))).sum(dim=-1)
-                _h = (_r_ent / _math.log(_r.shape[-1])).mean().item()  # ∈ [0,1]
-                if cfg.pruning_method == "topk_ratio":
-                    _effective_param = cfg.keep_ratio_low + _h * (cfg.keep_ratio_high - cfg.keep_ratio_low)
-                else:  # "mass"
-                    _effective_param = cfg.mass_low + _h * (cfg.mass_high - cfg.mass_low)
-            else:
-                _effective_param = cfg.grad_region_mass  # static fallback (mass mode)
+            # ── Debug heatmap: skip all pruning / bg logic, just collect scores ──
+            if cfg.score_debug_heatmap:
+                num_r = score_region.shape[1]
+                num_p = meta.num_patches
+                pps = meta.patches_per_side
+                score_regions.append(score_region)
+                important_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
+                keep_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
+                clipped_regions.append(torch.zeros(bsize, num_r, dtype=torch.bool, device=device))
+                static_bg_regions.append(None)
+                raw_cosine_static_regions.append(None)
+                keep_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
+                important_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
+                effective_important_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
+                overlay_labels.append(torch.zeros(bsize, num_p, dtype=torch.long, device=device))
+                overlay_grids.append(torch.zeros(bsize, pps, pps, dtype=torch.long, device=device))
+                continue
 
+            # ── 3. Pruning Ratio: select "important" regions ─────────────────
             def _select_important(sr):
-                if cfg.pruning_method == "topk_ratio" and cfg.dynamic_mass_enabled:
-                    return select_regions_by_topk_ratio(sr, _effective_param)
-                else:
-                    return select_regions_by_mass(sr, _effective_param)
+                if cfg.pruning_mode == "fixed_count":
+                    # All valid → min/max_kept_tokens does the TopK trimming later
+                    return valid_masks[idx].clone()
+                elif cfg.pruning_mode == "cumulative_mass":
+                    return select_regions_by_mass(sr, cfg.grad_region_mass)
+                else:  # "entropy_dynamic"
+                    import math as _math
+                    _r = sr.float()
+                    _r_total = _r.sum(dim=-1, keepdim=True)
+                    _r_norm = torch.where(
+                        _r_total > 0, _r / _r_total,
+                        torch.full_like(_r, 1.0 / _r.shape[-1]),
+                    )
+                    _r_ent = -(_r_norm * torch.log(_r_norm.clamp_min(1e-8))).sum(dim=-1)
+                    _h = (_r_ent / _math.log(_r.shape[-1])).mean().item()
+                    if cfg.pruning_method == "topk_ratio":
+                        _eff = cfg.keep_ratio_low + _h * (cfg.keep_ratio_high - cfg.keep_ratio_low)
+                        return select_regions_by_topk_ratio(sr, _eff)
+                    else:  # "mass"
+                        _eff = cfg.mass_low + _h * (cfg.mass_high - cfg.mass_low)
+                        return select_regions_by_mass(sr, _eff)
 
             if eval_frame:
                 important_region = _select_important(score_region)
@@ -1335,21 +1608,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # When dynamic_mass is enabled, mass already controls how many
             # regions to keep — skip the hard min/max clamp so the adaptive
             # mass has full effect.  Otherwise use fixed min/max counts.
-            if cfg.dynamic_mass_enabled:
-                # trust mass-based selection; no hard count clamp
-                keep_region = keep_pre
-                clipped_region = torch.zeros_like(keep_pre, dtype=torch.bool)
+            # min/max guardrails: always applied in all pruning modes
+            # ── L1 Dynamic Prune Ratio: select effective min/max based on
+            #    previous frame's action L1 norm ──
+            if cfg.l1_dynamic_prune_enabled:
+                _prev_l1 = token_state.last_actions_l1
+                if _prev_l1 is not None and _prev_l1 > cfg.l1_dynamic_prune_threshold:
+                    # High L1 → aggressive pruning (fewer tokens kept)
+                    _eff_min = cfg.min_kept_tokens
+                    _eff_max = cfg.min_kept_tokens
+                else:
+                    # Low L1 or first frame → conservative (more tokens kept)
+                    _eff_min = cfg.max_kept_tokens
+                    _eff_max = cfg.max_kept_tokens
             else:
-                region_area = cfg.region_patch_size * cfg.region_patch_size
-                min_regions = math.ceil(cfg.min_kept_tokens / region_area) if cfg.min_kept_tokens > 0 else 0
-                max_regions = (
-                    math.floor(cfg.max_kept_tokens / region_area)
-                    if cfg.max_kept_tokens > 0
-                    else score_region.shape[1]
-                )
-                keep_region, clipped_region = apply_min_max_constraints(
-                    keep_pre, score_region, min_regions, max_regions
-                )
+                # Fixed prune ratio mode: use prune_ratio for both min and max
+                _eff_min = cfg.prune_ratio
+                _eff_max = cfg.prune_ratio
+            region_area = cfg.region_patch_size * cfg.region_patch_size
+            min_regions = math.ceil(_eff_min / region_area) if _eff_min > 0 else 0
+            max_regions = (
+                math.floor(_eff_max / region_area)
+                if _eff_max > 0
+                else score_region.shape[1]
+            )
+            keep_region, clipped_region = apply_min_max_constraints(
+                keep_pre, score_region, min_regions, max_regions
+            )
             keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
             important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
             effective_important_token = important_token & keep_token
@@ -1366,6 +1651,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             keep_token_masks.append(keep_token)
             important_token_masks.append(important_token)
             effective_important_token_masks.append(effective_important_token)
+
+        # ── Build normalised heatmap grids for debug visualisation ──────────
+        heatmap_grids = []
+        if cfg.score_debug_heatmap or cfg.overlay_mode == "heatmap":
+            for idx, sr in enumerate(score_regions):
+                meta = metas[idx]
+                rps = meta.patches_per_side // cfg.region_patch_size
+                # sr: [B, num_regions]  — normalise to [0, 1] per batch element
+                sr_f = sr.float()
+                sr_min = sr_f.min(dim=-1, keepdim=True).values
+                sr_max = sr_f.max(dim=-1, keepdim=True).values
+                sr_norm = torch.where(
+                    sr_max > sr_min,
+                    (sr_f - sr_min) / (sr_max - sr_min + 1e-8),
+                    torch.zeros_like(sr_f),
+                )
+                heatmap_grids.append(sr_norm.view(-1, rps, rps))
 
         # Build mask that removes ONLY static-bg tokens (for eval-frame pruning)
         _has_static_bg = any(s is not None for s in static_bg_regions)
@@ -1427,7 +1729,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             out_dir / f"overlay_f{token_state.frame_idx:06d}_i{img_idx}_b{batch_idx}.png"
                         )
 
-        if not eval_frame and cfg.vision_partial_update_enabled:
+        if not cfg.score_debug_heatmap and not eval_frame and cfg.vision_partial_update_enabled:
             image_embs = apply_partial_update(
                 image_embs, token_state.last_image_embs, effective_important_token_masks, metas
             )
@@ -1435,15 +1737,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         cache_image_embs = image_embs
 
         image_pad_masks = None
-        if not eval_frame and cfg.token_prune_enabled:
-            image_embs, image_pad_masks = prune_image_embeddings(
-                image_embs, keep_token_masks, img_masks, metas
-            )
-        elif eval_frame and cfg.token_prune_enabled and _has_static_bg and static_bg_keep_masks is not None:
-            # Even on eval frames, prune static-background tokens
-            image_embs, image_pad_masks = prune_image_embeddings(
-                image_embs, static_bg_keep_masks, img_masks, metas
-            )
+        if not cfg.score_debug_heatmap:
+            if not eval_frame and cfg.token_prune_enabled:
+                image_embs, image_pad_masks = prune_image_embeddings(
+                    image_embs, keep_token_masks, img_masks, metas
+                )
+            elif eval_frame and cfg.token_prune_enabled and _has_static_bg and static_bg_keep_masks is not None:
+                # Even on eval frames, prune static-background tokens
+                image_embs, image_pad_masks = prune_image_embeddings(
+                    image_embs, static_bg_keep_masks, img_masks, metas
+                )
 
         if actions is None:
             prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
@@ -1462,6 +1765,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         token_state.last_image_embs = [emb.detach() for emb in cache_image_embs]
         token_state.last_overlay_labels = [label.detach() for label in overlay_labels]
         token_state.last_overlay_grid = [grid.detach() for grid in overlay_grids]
+        token_state.last_heatmap_grid = [g.detach() for g in heatmap_grids] if heatmap_grids else None
+        # Store binary keep mask for heatmap pruning visualization
+        if keep_token_masks:
+            token_state.last_keep_grid = [
+                m.detach().view(bsize, metas[i].patches_per_side, metas[i].patches_per_side)
+                for i, m in enumerate(keep_token_masks)
+            ]
+        else:
+            token_state.last_keep_grid = None
 
         # Compute entropy of score distribution for dynamic eval interval
         if eval_frame and score_tokens:
@@ -1479,6 +1791,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 _ent = -(_probs * torch.log(_probs + 1e-8)).sum(dim=-1)
                 _entropy_sum += _ent.mean().item()
             token_state.last_entropy = _entropy_sum / len(score_tokens)
+
+
 
         if cfg.token_selection_enabled and token_state.frame_idx > 0:
             _eval_rate = token_state.eval_frame_count / (token_state.frame_idx + 1)
@@ -1521,6 +1835,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 "prune": f"{_prune_pct:.1f}%",
                 "eval": "Y" if eval_frame else "N",
             }
+
+        # ── Collect action L1 norm for plotting ──
+        if cfg.interp_plot_actions_l1 and actions is not None:
+            _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
+            token_state.actions_l1_history.append(
+                (token_state.frame_idx, _l1)
+            )
+            token_state.last_actions_l1 = _l1
+        # ── Also track L1 for dynamic prune ratio (even without plotting) ──
+        elif cfg.l1_dynamic_prune_enabled and actions is not None:
+            _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
+            token_state.last_actions_l1 = _l1
 
         token_state.frame_idx += 1
 
@@ -1840,10 +2166,20 @@ class PI05Policy(PreTrainedPolicy):
         if state.last_score_region:
             region_scores = torch.stack(state.last_score_region, dim=0)
 
+        heatmap_grid = None
+        if state.last_heatmap_grid:
+            heatmap_grid = torch.stack(state.last_heatmap_grid, dim=0)
+
+        keep_grid = None
+        if state.last_keep_grid:
+            keep_grid = torch.stack(state.last_keep_grid, dim=0)
+
         return {
             "last_overlay_grid": overlay_grid,
             "last_token_scores": token_scores,
             "last_region_scores": region_scores,
+            "last_heatmap_grid": heatmap_grid,
+            "last_keep_grid": keep_grid,
         }
 
     def init_rtc_processor(self):

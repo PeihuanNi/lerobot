@@ -42,6 +42,10 @@ class TokenSelectionState:
     last_image_embs: list[Tensor] | None = None
     last_overlay_labels: list[Tensor] | None = None
     last_overlay_grid: list[Tensor] | None = None
+    # Heatmap debug: continuous float score grid per camera
+    last_heatmap_grid: list[Tensor] | None = None
+    # Binary keep mask grid per camera (True = kept, False = pruned)
+    last_keep_grid: list[Tensor] | None = None
     # Dynamic eval interval state
     last_entropy: float | None = None
     last_eval_frame_idx: int = 0
@@ -53,10 +57,16 @@ class TokenSelectionState:
     total_possible: int = 0
     # Stats for tqdm postfix (updated every frame when token_selection_enabled)
     last_stats: dict = None  # type: ignore[assignment]
+    # Action L1 norm history: list of (frame_idx, l1_norm) per inference frame
+    actions_l1_history: list = None  # type: ignore[assignment]
+    # Last frame's action L1 norm (used by L1 dynamic prune ratio)
+    last_actions_l1: float | None = None
 
     def __post_init__(self):
         if self.last_stats is None:
             self.last_stats = {}
+        if self.actions_l1_history is None:
+            self.actions_l1_history = []
 
     def reset(self) -> None:
         self.frame_idx = 0
@@ -67,6 +77,8 @@ class TokenSelectionState:
         self.last_image_embs = None
         self.last_overlay_labels = None
         self.last_overlay_grid = None
+        self.last_heatmap_grid = None
+        self.last_keep_grid = None
         self.last_entropy = None
         self.last_eval_frame_idx = 0
         self.eval_frame_count = 0
@@ -74,6 +86,8 @@ class TokenSelectionState:
         self.total_kept = 0
         self.total_possible = 0
         self.last_stats = {}
+        self.actions_l1_history = []
+        self.last_actions_l1 = None
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:
