@@ -46,20 +46,18 @@ from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.token_selection_utils import (
     TokenSelectionState,
-    apply_partial_update,
     apply_min_max_constraints,
     build_overlay,
     build_overlay_labels,
-    compute_region_embeddings,
+    compute_relative_deviation,
     compute_region_scores,
-    compute_spatial_mask,
-    compute_temporal_mask,
-    detect_static_background,
+    discard_top_scoring_regions,
     expand_region_mask,
     prune_image_embeddings,
-    select_regions_by_mass,
-    select_regions_by_topk_ratio,
+    ratio_to_keep_tokens,
+    sigmoid_ratio,
     split_patch_tokens,
+    update_ema_mean_and_var,
 )
 from lerobot.utils.constants import (
     ACTION,
@@ -959,16 +957,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         eval_interval = cfg.region_eval_interval if cfg.region_eval_interval > 0 else 1
         if cfg.score_debug_heatmap:
             eval_frame = True  # debug heatmap: evaluate every frame
-        elif cfg.dynamic_eval_enabled:
-            frames_since_eval = token_state.frame_idx - token_state.last_eval_frame_idx
-            if token_state.frame_idx == 0:
-                eval_frame = True
-            elif frames_since_eval >= cfg.max_eval_interval:
-                eval_frame = True  # hard-cap fallback
-            elif token_state.last_entropy is not None and token_state.last_entropy > cfg.eval_entropy_threshold:
-                eval_frame = True  # model confused (high entropy) -> re-evaluate full image
-            else:
-                eval_frame = False  # model focused -> keep pruning
         else:
             eval_frame = token_state.frame_idx % eval_interval == 0
 
@@ -991,51 +979,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         token_state.reset()
                         break
 
-        region_embs = []
-        background_regions = []
         valid_masks = []
-        for idx, patch_emb in enumerate(patch_embs):
-            meta = metas[idx]
-            region_emb = compute_region_embeddings(patch_emb, meta.patches_per_side, cfg.region_patch_size)
-            region_embs.append(region_emb)
-            valid_mask = img_masks[idx][:, None].expand(bsize, region_emb.shape[1])
-            valid_masks.append(valid_mask)
-            prev_region = None
-            if token_state.last_region_embs is not None and len(token_state.last_region_embs) == len(patch_embs):
-                prev_region = token_state.last_region_embs[idx]
-                if prev_region.shape != region_emb.shape:
-                    prev_region = None
-            temporal = compute_temporal_mask(region_emb, prev_region, cfg.token_temporal_threshold, valid_mask)
-            spatial = compute_spatial_mask(
-                region_emb,
-                meta.patches_per_side,
-                cfg.region_patch_size,
-                cfg.token_spatial_radius,
-                cfg.token_spatial_threshold,
-            )
-            background_regions.append(temporal & spatial & valid_mask)
-
-        # ── Static background: capture reference on the very first frame ─────
-        _bg_first_frame = False
-        if cfg.static_bg_enabled and token_state.reference_region_embs is None:
-            token_state.reference_region_embs = [emb.detach().clone() for emb in region_embs]
-            _bg_first_frame = True
+        for idx, meta in enumerate(metas):
+            num_regions = (meta.patches_per_side // cfg.region_patch_size) ** 2
+            valid_masks.append(img_masks[idx][:, None].expand(bsize, num_regions))
 
         token_norms = [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
-
-        def compute_gate_weights(values: Tensor) -> tuple[Tensor, Tensor]:
-            grip = values[..., -1]
-            if grip.shape[1] > 1:
-                m = (grip[:, 1:] - grip[:, :-1]).abs().mean(dim=1)
-            else:
-                m = grip.abs().mean(dim=1)
-            if cfg.grad_tau <= 0:
-                gate = torch.zeros_like(m)
-            else:
-                gate = (m / cfg.grad_tau).clamp(0.0, 1.0)
-            lambda_grip = 1.0 + cfg.grad_alpha * gate
-            lambda_pos = 1.0 + cfg.grad_beta * (1.0 - gate)
-            return lambda_pos, lambda_grip
 
         def build_prefix(image_embs, image_pad_masks=None):
             return self.embed_prefix(
@@ -1135,54 +1084,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         actions = None
         prefix_pad_masks = None
         last_attn = None
-        last_v_t = None
 
         if eval_frame:
-            if cfg.grad_score_method == "full_grad":
-                image_embs = [emb.detach().requires_grad_(True) for emb in image_embs]
-                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
-                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
-                with torch.enable_grad():
-                    grad_steps = max(1, min(cfg.grad_denoise_steps, num_steps))
-                    start_step = num_steps - grad_steps
-                    dt = -1.0 / num_steps
-                    x_t = noise
-                    objective = torch.zeros((), device=device)
-                    for step in range(num_steps):
-                        time = 1.0 + step * dt
-                        time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-                        v_t_raw, suffix_out, _ = self.denoise_step(
-                            prefix_pad_masks=prefix_pad_masks,
-                            past_key_values=past_key_values,
-                            x_t=x_t,
-                            timestep=time_tensor,
-                            return_suffix_out=True,
-                        )
-                        proxy = suffix_out[..., : v_t_raw.shape[-1]] + (
-                            v_t_raw - suffix_out[..., : v_t_raw.shape[-1]]
-                        ).detach()
-                        if step >= start_step:
-                            lambda_pos, lambda_grip = compute_gate_weights(proxy)
-                            pos_sq = (proxy[..., :-1].float() ** 2).sum(dim=-1)
-                            grip_sq = (proxy[..., -1].float() ** 2)
-                            objective = objective + (lambda_pos[:, None] * pos_sq + lambda_grip[:, None] * grip_sq).sum()
-                        v_t = v_t_raw
-                        x_t = x_t + dt * v_t
-                        if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                            self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-                    grads = torch.autograd.grad(objective, image_embs, retain_graph=False, allow_unused=True)
-                score_tokens = []
-                for grad, emb, meta in zip(grads, image_embs, metas, strict=True):
-                    if grad is None:
-                        score_tokens.append(torch.zeros(emb.shape[0], meta.num_patches, device=emb.device))
-                        continue
-                    grad_patch = grad[:, meta.num_extra_tokens :, :]
-                    emb_patch = emb[:, meta.num_extra_tokens :, :]
-                    grad_norm = torch.linalg.vector_norm(grad_patch.float(), dim=-1)
-                    emb_norm = torch.linalg.vector_norm(emb_patch.float(), dim=-1)
-                    score_tokens.append(grad_norm * emb_norm)
-                actions = x_t.detach()
-            elif cfg.grad_score_method == "transformer_interpretability":
+            if cfg.grad_score_method == "transformer_interpretability":
                 # ── Gradient-Weighted Attention (GradxAttn) ───────────────
                 # For each scored denoise step:
                 #   1. Forward with x_t.requires_grad_(True).
@@ -1401,15 +1305,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 actions = x_t.detach()
 
 
-            else:
+            elif cfg.grad_score_method == "attn_only":
                 prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
                 past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
-                x_t, last_v_t, last_attn = run_diffusion(
+                x_t, _, last_attn = run_diffusion(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     capture_attn=True,
                 )
-                if last_attn is None or last_v_t is None:
+                if last_attn is None:
                     raise ValueError("Missing attention output for attention-based scoring.")
                 # Aggregate attention over last N Expert layers (mean pooling)
                 _n_layers = max(1, min(cfg.attn_num_layers, len(last_attn)))
@@ -1439,63 +1343,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         score_tokens = token_norms
                     else:
                         alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
-                        if cfg.grad_score_method == "attn_only":
-                            if cfg.grad_action_agg == "max":
-                                score = alpha.max(dim=2).values.sum(dim=1)
-                            else:
-                                score = alpha.sum(dim=(1, 2))
+                        if cfg.grad_action_agg == "max":
+                            score = alpha.max(dim=2).values.sum(dim=1)
                         else:
-                            pos = last_v_t[..., :-1]
-                            grip = last_v_t[..., -1:]
-                            if cfg.partial_grad_phi == "l1":
-                                pos_grad = pos.sign()
-                                grip_grad = grip.sign()
-                            else:
-                                pos_grad = 2 * pos
-                                grip_grad = 2 * grip
-                            grad_action = torch.cat(
-                                [
-                                    pos_grad * cfg.partial_grad_pos_weight,
-                                    grip_grad * cfg.partial_grad_grip_weight,
-                                ],
-                                dim=-1,
-                            )
-                            last_layer = self.paligemma_with_expert.gemma_expert.model.layers[-1]
-                            wo = last_layer.self_attn.o_proj.weight
-                            hidden_size = wo.shape[0]
-                            action_dim = grad_action.shape[-1]
-                            if action_dim >= hidden_size:
-                                grad_hidden = grad_action[..., :hidden_size]
-                            else:
-                                grad_hidden = torch.zeros(
-                                    bsize, action_len, hidden_size, device=grad_action.device, dtype=grad_action.dtype
-                                )
-                                grad_hidden[..., :action_dim] = grad_action
-                            grad_hidden = grad_hidden.to(dtype=wo.dtype)
-                            grad_attn = torch.matmul(grad_hidden.reshape(-1, hidden_size), wo)
-                            head_dim = last_layer.self_attn.head_dim
-                            num_heads = grad_attn.shape[1] // head_dim
-                            grad_attn = grad_attn.view(bsize, action_len, num_heads, head_dim)
-                            g_head_norm = torch.linalg.vector_norm(grad_attn.float(), dim=-1)
-                            if cfg.grad_head_beta != 1.0:
-                                g_head_norm = g_head_norm.clamp_min(1e-8).pow(cfg.grad_head_beta)
-                            if cfg.grad_head_norm == "max":
-                                denom = g_head_norm.max(dim=-1, keepdim=True).values
-                            else:
-                                denom = g_head_norm.sum(dim=-1, keepdim=True)
-                            head_count = g_head_norm.shape[-1]
-                            g_head_norm = torch.where(
-                                denom > 0,
-                                g_head_norm / denom,
-                                torch.full_like(g_head_norm, 1.0 / head_count),
-                            )
-                            g_weight = g_head_norm.permute(0, 2, 1).unsqueeze(-1)
-                            if g_weight.shape[2] != alpha.shape[2]:
-                                g_weight = g_weight[:, :, -alpha.shape[2] :, :]
-                            if cfg.grad_action_agg == "max":
-                                score = (alpha * g_weight).max(dim=2).values.sum(dim=1)
-                            else:
-                                score = (alpha * g_weight).sum(dim=(1, 2))
+                            score = alpha.sum(dim=(1, 2))
                         score_tokens = []
                         start = 0
                         for meta in metas:
@@ -1503,6 +1354,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             score_tokens.append(score[:, start:end])
                             start = end
                 actions = x_t.detach()
+            else:
+                raise ValueError(f"Unsupported grad_score_method: {cfg.grad_score_method}")
         else:
             if token_state.last_score_token is not None:
                 score_tokens = token_state.last_score_token
@@ -1513,13 +1366,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         important_regions = []
         keep_regions = []
         clipped_regions = []
-        static_bg_regions = []
-        raw_cosine_static_regions = []
         keep_token_masks = []
-        important_token_masks = []
-        effective_important_token_masks = []
         overlay_labels = []
         overlay_grids = []
+        if token_state.global_active_region_masks is None:
+            token_state.global_active_region_masks = [torch.ones_like(vm) for vm in valid_masks]
+        _restore_global_pool_now = (
+            eval_frame
+            and cfg.reset_discard_pool_on_gripper_close
+            and token_state.pending_global_pool_restore
+        )
+        if _restore_global_pool_now:
+            token_state.global_active_region_masks = [torch.ones_like(vm) for vm in valid_masks]
+            token_state.pending_global_pool_restore = False
         for idx, score_token in enumerate(score_tokens):
             meta = metas[idx]
             score_region = compute_region_scores(score_token, meta.patches_per_side, cfg.region_patch_size)
@@ -1528,6 +1387,58 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     cfg.grad_region_ema * token_state.last_score_region[idx]
                     + (1.0 - cfg.grad_region_ema) * score_region
                 )
+
+            # --- Global Active Token Pool: Discard previous top-scoring regions ---
+            if eval_frame and not _restore_global_pool_now and cfg.discard_prev_kept_ratio > 0.0:
+                if (token_state.last_score_region is not None and token_state.last_keep_grid is not None
+                        and len(token_state.last_score_region) > idx and len(token_state.last_keep_grid) > idx):
+                    _prev_scores = token_state.last_score_region[idx]
+                    
+                    # keep_grid is stored as a boolean grid, potentially [H, W] or [B, H, W]
+                    _prev_kept_tokens = token_state.last_keep_grid[idx]
+                    
+                    # Store original shape to revert later if needed, though we just need it to match _prev_scores shape
+                    # which is [NumRegions] when unbatched, or [B, NumRegions] when batched.
+                    _is_batched = (_prev_scores.dim() == 2)
+                    
+                    # Force it to [B, NumPatches] internally for compute_region_scores
+                    _prev_kept_flat = _prev_kept_tokens.reshape(-1) # [B * NumPatches] or [NumPatches]
+                    _num_patches = metas[idx].num_patches
+                    if len(_prev_kept_flat) == _num_patches:
+                        # It was unbatched
+                        _prev_kept_flat = _prev_kept_flat.unsqueeze(0) # [1, NumPatches]
+                    else:
+                        # It was batched
+                        _b = len(_prev_kept_flat) // _num_patches
+                        _prev_kept_flat = _prev_kept_flat.view(_b, _num_patches) # [B, NumPatches]
+                        
+                    _pps = metas[idx].patches_per_side
+                    _rps = cfg.region_patch_size
+                    
+                    # compute_region_scores expects [B, NumPatches]
+                    _prev_kept_regions = compute_region_scores(_prev_kept_flat.float(), _pps, _rps) > 0.5
+                    
+                    # Revert to original batching structure
+                    if not _is_batched:
+                        _prev_kept_regions = _prev_kept_regions.squeeze(0)
+                    
+                    # Safeguard: Do not deplete global pool below min_kept_tokens
+                    _current_active = token_state.global_active_region_masks[idx].sum(dim=-1)
+                    _max_discard = torch.clamp_min(_current_active - cfg.min_kept_tokens, 0)
+                    
+                    _discard_mask = discard_top_scoring_regions(
+                        _prev_scores, _prev_kept_regions, cfg.discard_prev_kept_ratio, _max_discard,
+                        mode=cfg.discard_mode
+                    )
+                    # Permanently remove from global active pool
+                    token_state.global_active_region_masks[idx] &= ~_discard_mask
+            
+            # Sub-select valid masks by what is left in the global pool
+            _global_mask = token_state.global_active_region_masks[idx]
+            valid_masks[idx] = valid_masks[idx] & _global_mask
+            
+            # Mask out discarded tokens from being selected (score=-inf)
+            _eff_score_region = torch.where(valid_masks[idx], score_region, torch.full_like(score_region, -float('inf')))
             # ── Debug heatmap: skip all pruning / bg logic, just collect scores ──
             if cfg.score_debug_heatmap:
                 num_r = score_region.shape[1]
@@ -1537,81 +1448,34 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 important_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
                 keep_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
                 clipped_regions.append(torch.zeros(bsize, num_r, dtype=torch.bool, device=device))
-                static_bg_regions.append(None)
-                raw_cosine_static_regions.append(None)
                 keep_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
-                important_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
-                effective_important_token_masks.append(torch.ones(bsize, num_p, dtype=torch.bool, device=device))
                 overlay_labels.append(torch.zeros(bsize, num_p, dtype=torch.long, device=device))
                 overlay_grids.append(torch.zeros(bsize, pps, pps, dtype=torch.long, device=device))
                 continue
 
             # ── 3. Pruning Ratio: select "important" regions ─────────────────
-            def _select_important(sr):
-                if cfg.pruning_mode == "fixed_count":
-                    # All valid → min/max_kept_tokens does the TopK trimming later
-                    return valid_masks[idx].clone()
-                elif cfg.pruning_mode == "cumulative_mass":
-                    return select_regions_by_mass(sr, cfg.grad_region_mass)
-                else:  # "entropy_dynamic"
-                    import math as _math
-                    _r = sr.float()
-                    _r_total = _r.sum(dim=-1, keepdim=True)
-                    _r_norm = torch.where(
-                        _r_total > 0, _r / _r_total,
-                        torch.full_like(_r, 1.0 / _r.shape[-1]),
-                    )
-                    _r_ent = -(_r_norm * torch.log(_r_norm.clamp_min(1e-8))).sum(dim=-1)
-                    _h = (_r_ent / _math.log(_r.shape[-1])).mean().item()
-                    if cfg.pruning_method == "topk_ratio":
-                        _eff = cfg.keep_ratio_low + _h * (cfg.keep_ratio_high - cfg.keep_ratio_low)
-                        return select_regions_by_topk_ratio(sr, _eff)
-                    else:  # "mass"
-                        _eff = cfg.mass_low + _h * (cfg.mass_high - cfg.mass_low)
-                        return select_regions_by_mass(sr, _eff)
+            def _select_important():
+                # Fixed-count TopK is hardcoded: start from all valid regions,
+                # then apply min/max keep-token constraints below.
+                return valid_masks[idx].clone()
 
             if eval_frame:
-                important_region = _select_important(score_region)
+                important_region = _select_important()
                 if cfg.grad_keep_prev and token_state.last_important_region is not None:
-                    important_region = important_region | token_state.last_important_region[idx]
+                    # Also prune the previous kept memory against the global mask so we 
+                    # don't accidentally resurrect permanently discarded tokens
+                    _prev_imp = token_state.last_important_region[idx] & valid_masks[idx]
+                    important_region = important_region | _prev_imp
             else:
                 if token_state.last_important_region is not None:
-                    important_region = token_state.last_important_region[idx]
+                    important_region = token_state.last_important_region[idx] & valid_masks[idx]
                 else:
-                    important_region = _select_important(score_region)
-            # ── Static background detection (cosine sim to first-frame ref) ────
-            static_bg_region = None
-            static_bg_token = None
-            raw_cosine_static_region = None
-            raw_cosine_static_token = None
-            if (cfg.static_bg_enabled
-                    and idx == cfg.static_bg_camera_idx
-                    and not _bg_first_frame
-                    and token_state.reference_region_embs is not None):
-                static_bg_region, raw_cosine_static_region = detect_static_background(
-                    region_embs[idx],
-                    token_state.reference_region_embs[idx],
-                    cfg.static_bg_threshold,
-                    valid_masks[idx],
-                    score_region=score_region,
-                    score_gate=cfg.static_bg_score_gate,
-                )
-                static_bg_token = expand_region_mask(
-                    static_bg_region, meta.patches_per_side, cfg.region_patch_size,
-                )
-                raw_cosine_static_token = expand_region_mask(
-                    raw_cosine_static_region, meta.patches_per_side, cfg.region_patch_size,
-                )
+                    important_region = _select_important()
             keep_pre = important_region & valid_masks[idx]
-            if static_bg_region is not None:
-                keep_pre = keep_pre & ~static_bg_region
-            # When dynamic_mass is enabled, mass already controls how many
-            # regions to keep — skip the hard min/max clamp so the adaptive
-            # mass has full effect.  Otherwise use fixed min/max counts.
             # min/max guardrails: always applied in all pruning modes
             # ── L1 Dynamic Prune Ratio: select effective min/max based on
             #    previous frame's action L1 norm ──
-            if cfg.l1_dynamic_prune_enabled:
+            if cfg.dynamic_prune_mode == "l1_threshold":
                 _prev_l1 = token_state.last_actions_l1
                 if _prev_l1 is not None and _prev_l1 > cfg.l1_dynamic_prune_threshold:
                     # High L1 → aggressive pruning (fewer tokens kept)
@@ -1621,7 +1485,58 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     # Low L1 or first frame → conservative (more tokens kept)
                     _eff_min = cfg.max_kept_tokens
                     _eff_max = cfg.max_kept_tokens
-            else:
+            elif cfg.dynamic_prune_mode == "ema":
+                _ema = token_state.ema_l1
+                _raw_l1 = token_state.last_actions_l1
+                if _ema is not None and _raw_l1 is not None and _ema > 1e-8:
+                    _dev = compute_relative_deviation(_raw_l1, _ema)
+                    assert _dev is not None
+                    _ratio = sigmoid_ratio(_dev)
+                    _eff = ratio_to_keep_tokens(
+                        _ratio,
+                        cfg.min_kept_tokens,
+                        cfg.max_kept_tokens,
+                        cfg.ema_direction,
+                    )
+                    _eff_min = _eff
+                    _eff_max = _eff
+                else:
+                    _eff_min = cfg.max_kept_tokens
+                    _eff_max = cfg.max_kept_tokens
+            elif cfg.dynamic_prune_mode == "accel":
+                # Acceleration-based: map xyz / rotation independently into half
+                # of the token span so translation and rotation have equal weight.
+                _ema_xyz = token_state.ema_accel_xyz
+                _raw_xyz = token_state.last_accel_xyz
+                _ema_rot = token_state.ema_accel_rot
+                _raw_rot = token_state.last_accel_rot
+                if (
+                    _ema_xyz is not None
+                    and _raw_xyz is not None
+                    and _ema_xyz > 1e-8
+                    and _ema_rot is not None
+                    and _raw_rot is not None
+                    and _ema_rot > 1e-8
+                ):
+                    _xyz_dev = compute_relative_deviation(_raw_xyz, _ema_xyz)
+                    _rot_dev = compute_relative_deviation(_raw_rot, _ema_rot)
+                    assert _xyz_dev is not None and _rot_dev is not None
+                    _xyz_ratio = sigmoid_ratio(_xyz_dev)
+                    _rot_ratio = sigmoid_ratio(_rot_dev)
+                    _half_span = (cfg.max_kept_tokens - cfg.min_kept_tokens) / 2.0
+                    _xyz_delta = _xyz_ratio * _half_span
+                    _rot_delta = _rot_ratio * _half_span
+                    if cfg.ema_direction == "reverse":
+                        _eff = int(round(cfg.min_kept_tokens + _xyz_delta + _rot_delta))
+                    else:
+                        _eff = int(round(cfg.max_kept_tokens - _xyz_delta - _rot_delta))
+                    _eff = max(min(_eff, cfg.max_kept_tokens), cfg.min_kept_tokens)
+                    _eff_min = _eff
+                    _eff_max = _eff
+                else:
+                    _eff_min = cfg.max_kept_tokens
+                    _eff_max = cfg.max_kept_tokens
+            else:  # "none"
                 # Fixed prune ratio mode: use prune_ratio for both min and max
                 _eff_min = cfg.prune_ratio
                 _eff_max = cfg.prune_ratio
@@ -1633,24 +1548,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 else score_region.shape[1]
             )
             keep_region, clipped_region = apply_min_max_constraints(
-                keep_pre, score_region, min_regions, max_regions
+                keep_pre, _eff_score_region, min_regions, max_regions
             )
             keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
             important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
-            effective_important_token = important_token & keep_token
             clipped_token = expand_region_mask(clipped_region, meta.patches_per_side, cfg.region_patch_size)
-            overlay_label = build_overlay_labels(keep_token, important_token, clipped_token, static_bg=static_bg_token, raw_cosine_static=raw_cosine_static_token)
+            overlay_label = build_overlay_labels(keep_token, important_token, clipped_token)
             overlay_labels.append(overlay_label)
             overlay_grids.append(overlay_label.view(bsize, meta.patches_per_side, meta.patches_per_side))
             score_regions.append(score_region)
             important_regions.append(important_region)
             keep_regions.append(keep_region)
             clipped_regions.append(clipped_region)
-            static_bg_regions.append(static_bg_region)
-            raw_cosine_static_regions.append(raw_cosine_static_region)
             keep_token_masks.append(keep_token)
-            important_token_masks.append(important_token)
-            effective_important_token_masks.append(effective_important_token)
 
         # ── Build normalised heatmap grids for debug visualisation ──────────
         heatmap_grids = []
@@ -1669,25 +1579,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )
                 heatmap_grids.append(sr_norm.view(-1, rps, rps))
 
-        # Build mask that removes ONLY static-bg tokens (for eval-frame pruning)
-        _has_static_bg = any(s is not None for s in static_bg_regions)
-        if _has_static_bg:
-            static_bg_keep_masks = []
-            for idx, sbg in enumerate(static_bg_regions):
-                if sbg is not None:
-                    sbg_token = expand_region_mask(
-                        sbg, metas[idx].patches_per_side, cfg.region_patch_size,
-                    )
-                    static_bg_keep_masks.append(~sbg_token)  # keep = NOT background
-                else:
-                    # No bg detection for this camera — keep all
-                    static_bg_keep_masks.append(
-                        torch.ones(bsize, metas[idx].num_patches, dtype=torch.bool,
-                                   device=region_embs[idx].device)
-                    )
-        else:
-            static_bg_keep_masks = None
-
         if eval_frame and (cfg.overlay_show_scores or cfg.overlay_show_ids):
             base_dir = cfg.local_log_dir or cfg.rollout_dir
             if base_dir:
@@ -1703,10 +1594,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         if img.shape[0] == 3:
                             img = img.permute(1, 2, 0)
                         img = ((img + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
-                        _sbg = (static_bg_regions[img_idx][batch_idx].cpu()
-                               if static_bg_regions[img_idx] is not None else None)
-                        _rcs = (raw_cosine_static_regions[img_idx][batch_idx].cpu()
-                                if raw_cosine_static_regions[img_idx] is not None else None)
                         overlay = build_overlay(
                             img,
                             region_h,
@@ -1718,8 +1605,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             cfg.overlay_show_scores,
                             cfg.overlay_show_ids,
                             scores=score_regions[img_idx][batch_idx].detach().cpu(),
-                            static_bg=_sbg,
-                            raw_cosine_static=_rcs,
                         )
                         try:
                             from PIL import Image
@@ -1729,24 +1614,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             out_dir / f"overlay_f{token_state.frame_idx:06d}_i{img_idx}_b{batch_idx}.png"
                         )
 
-        if not cfg.score_debug_heatmap and not eval_frame and cfg.vision_partial_update_enabled:
-            image_embs = apply_partial_update(
-                image_embs, token_state.last_image_embs, effective_important_token_masks, metas
-            )
-
-        cache_image_embs = image_embs
-
         image_pad_masks = None
-        if not cfg.score_debug_heatmap:
-            if not eval_frame and cfg.token_prune_enabled:
-                image_embs, image_pad_masks = prune_image_embeddings(
-                    image_embs, keep_token_masks, img_masks, metas
-                )
-            elif eval_frame and cfg.token_prune_enabled and _has_static_bg and static_bg_keep_masks is not None:
-                # Even on eval frames, prune static-background tokens
-                image_embs, image_pad_masks = prune_image_embeddings(
-                    image_embs, static_bg_keep_masks, img_masks, metas
-                )
+        if not cfg.score_debug_heatmap and not eval_frame and cfg.token_prune_enabled:
+            image_embs, image_pad_masks = prune_image_embeddings(
+                image_embs, keep_token_masks, img_masks, metas
+            )
 
         if actions is None:
             prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
@@ -1761,8 +1633,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         token_state.last_score_token = [score.detach() for score in score_tokens]
         token_state.last_score_region = [score.detach() for score in score_regions]
         token_state.last_important_region = [mask.detach() for mask in important_regions]
-        token_state.last_region_embs = [emb.detach() for emb in region_embs]
-        token_state.last_image_embs = [emb.detach() for emb in cache_image_embs]
         token_state.last_overlay_labels = [label.detach() for label in overlay_labels]
         token_state.last_overlay_grid = [grid.detach() for grid in overlay_grids]
         token_state.last_heatmap_grid = [g.detach() for g in heatmap_grids] if heatmap_grids else None
@@ -1775,29 +1645,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             token_state.last_keep_grid = None
 
-        # Compute entropy of score distribution for dynamic eval interval
-        if eval_frame and score_tokens:
+        if eval_frame:
             token_state.eval_frame_count += 1
-            token_state.last_eval_frame_idx = token_state.frame_idx
-            _entropy_sum = 0.0
-            for _st in score_tokens:
-                # z-score normalise before softmax so that tiny differences between
-                # summed attention weights (≈ 0.31 ± tiny) are amplified into a
-                # meaningful distribution (otherwise entropy is always ≈ ln(N_tokens))
-                _s = _st.float()
-                _mean = _s.mean(dim=-1, keepdim=True)
-                _std  = _s.std(dim=-1, keepdim=True).clamp_min(1e-8)
-                _probs = torch.nn.functional.softmax((_s - _mean) / _std, dim=-1)
-                _ent = -(_probs * torch.log(_probs + 1e-8)).sum(dim=-1)
-                _entropy_sum += _ent.mean().item()
-            token_state.last_entropy = _entropy_sum / len(score_tokens)
-
-
 
         if cfg.token_selection_enabled and token_state.frame_idx > 0:
-            _eval_rate = token_state.eval_frame_count / (token_state.frame_idx + 1)
-            _avg_interval = 1.0 / _eval_rate if _eval_rate > 0 else float("inf")
-            _entropy_str = f"{token_state.last_entropy:.3f}" if token_state.last_entropy is not None else "N/A"
             # Store stats in token_state so the eval loop can show them in tqdm postfix
             # Only count tokens from *valid* images (img_masks=True); placeholder
             # images (missing cameras) have img_mask=False and should not inflate
@@ -1808,20 +1659,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             ] if keep_token_masks else []
             _marked_n = sum(int(m.sum().item()) for m in _valid_masks)
             _total_n = sum(m.shape[-1] for m in _valid_masks)
-            # Count actually-kept tokens this frame:
-            #  - non-eval + prune_enabled: standard keep_token_masks
-            #  - eval + static_bg: only bg tokens are pruned
-            #  - otherwise: full tokens (no pruning)
-            if not cfg.token_prune_enabled:
-                _actual_kept = _total_n
-            elif not eval_frame:
+            if cfg.token_prune_enabled and not eval_frame:
                 _actual_kept = _marked_n
-            elif _has_static_bg and static_bg_keep_masks is not None:
-                _sbg_valid = [
-                    m for m, im in zip(static_bg_keep_masks, img_masks)
-                    if im.any()
-                ]
-                _actual_kept = sum(int(m.sum().item()) for m in _sbg_valid)
             else:
                 _actual_kept = _total_n
             _prune_pct = (1.0 - _actual_kept / _total_n) * 100.0 if _total_n > 0 else 0.0
@@ -1829,24 +1668,92 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             token_state.total_kept += _actual_kept
             token_state.total_possible += _total_n
             token_state.last_stats = {
-                "entropy": _entropy_str,
-                "avg_ivl": f"{_avg_interval:.1f}f ({_eval_rate:.0%})",
+                "interval": f"{eval_interval}f",
                 "kept": f"{_actual_kept}/{_total_n}",
                 "prune": f"{_prune_pct:.1f}%",
                 "eval": "Y" if eval_frame else "N",
             }
 
-        # ── Collect action L1 norm for plotting ──
-        if cfg.interp_plot_actions_l1 and actions is not None:
-            _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
-            token_state.actions_l1_history.append(
-                (token_state.frame_idx, _l1)
-            )
-            token_state.last_actions_l1 = _l1
-        # ── Also track L1 for dynamic prune ratio (even without plotting) ──
-        elif cfg.l1_dynamic_prune_enabled and actions is not None:
+        _need_l1 = (cfg.interp_plot_actions_l1
+                     or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel"))
+        if _need_l1 and actions is not None:
             _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
             token_state.last_actions_l1 = _l1
+            if cfg.interp_plot_actions_l1:
+                token_state.actions_l1_history.append(
+                    (token_state.frame_idx, _l1)
+                )
+            if cfg.dynamic_prune_mode in ("ema", "accel"):
+                # Update L1 EMA (used by both ema and accel modes for reference)
+                if token_state.ema_l1 is None:
+                    token_state.ema_l1 = _l1
+                else:
+                    token_state.ema_l1 = (cfg.l1_ema_alpha * token_state.ema_l1
+                                          + (1.0 - cfg.l1_ema_alpha) * _l1)
+                token_state.ema_l1_mean, token_state.ema_l1_var = update_ema_mean_and_var(
+                    _l1,
+                    token_state.ema_l1_mean,
+                    token_state.ema_l1_var,
+                    cfg.l1_ema_alpha,
+                )
+            if cfg.dynamic_prune_mode == "accel":
+                # Compute chunk-internal acceleration:
+                # A_xyz / A_rot = sum_i( |v_{i+1} - v_i| ) over the corresponding dims.
+                _act = actions.detach().float()  # [B, ChunkSize, ActionDim]
+                if _act.dim() == 3 and _act.shape[1] > 1:
+                    _xyz_dims = min(3, _act.shape[-1])
+                    _xyz = _act[:, :, :_xyz_dims]
+                    _xyz_dv = (_xyz[:, 1:, :] - _xyz[:, :-1, :]).abs()
+                    _accel_xyz = _xyz_dv.sum().item() / _act.shape[0]
+                    _rot_start = min(3, _act.shape[-1])
+                    _rot_end = min(6, _act.shape[-1])
+                    if _rot_end > _rot_start:
+                        _rot = _act[:, :, _rot_start:_rot_end]
+                        _rot_dv = (_rot[:, 1:, :] - _rot[:, :-1, :]).abs()
+                        _accel_rot = _rot_dv.sum().item() / _act.shape[0]
+                    else:
+                        _accel_rot = 0.0
+                else:
+                    _accel_xyz = 0.0
+                    _accel_rot = 0.0
+                token_state.last_accel_xyz = _accel_xyz
+                token_state.last_accel_rot = _accel_rot
+                token_state.last_accel = 0.5 * (_accel_xyz + _accel_rot)
+                _prev_ema_xyz = token_state.ema_accel_xyz
+                _prev_ema_rot = token_state.ema_accel_rot
+                if token_state.ema_accel_xyz is None:
+                    token_state.ema_accel_xyz = _accel_xyz
+                else:
+                    token_state.ema_accel_xyz = (
+                        cfg.l1_ema_alpha * token_state.ema_accel_xyz
+                        + (1.0 - cfg.l1_ema_alpha) * _accel_xyz
+                    )
+                if token_state.ema_accel_rot is None:
+                    token_state.ema_accel_rot = _accel_rot
+                else:
+                    token_state.ema_accel_rot = (
+                        cfg.l1_ema_alpha * token_state.ema_accel_rot
+                        + (1.0 - cfg.l1_ema_alpha) * _accel_rot
+                    )
+                token_state.ema_accel = 0.5 * (
+                    token_state.ema_accel_xyz + token_state.ema_accel_rot
+                )
+                _, token_state.ema_accel_xyz_var = update_ema_mean_and_var(
+                    _accel_xyz,
+                    _prev_ema_xyz,
+                    token_state.ema_accel_xyz_var,
+                    cfg.l1_ema_alpha,
+                )
+                _, token_state.ema_accel_rot_var = update_ema_mean_and_var(
+                    _accel_rot,
+                    _prev_ema_rot,
+                    token_state.ema_accel_rot_var,
+                    cfg.l1_ema_alpha,
+                )
+        if cfg.reset_discard_pool_on_gripper_close and actions is not None:
+            _act = actions.detach().float()
+            if _act.numel() > 0 and (_act[..., -1] > cfg.gripper_close_threshold).any().item():
+                token_state.pending_global_pool_restore = True
 
         token_state.frame_idx += 1
 

@@ -59,8 +59,9 @@ class PI05Config(PreTrainedConfig):
     #    Determines how vision-token importance is computed.
     #    Each method outputs per-token scores; downstream modules are unaffected.
     # ═══════════════════════════════════════════════════════════════════════
-    grad_score_method: str = "full_grad"
-    # full_grad | partial_grad | attn_only | transformer_interpretability
+    grad_score_method: str = "transformer_interpretability"
+    # Supported: attn_only | transformer_interpretability
+    # Legacy values are still accepted during config loading for compatibility.
 
     # -- transformer_interpretability params --
     interp_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
@@ -75,91 +76,106 @@ class PI05Config(PreTrainedConfig):
     attn_num_layers: int = 1       # avg attention over last N Expert layers (1=last only, 18=all)
     attn_num_denoise_steps: int = 1  # avg attention over last N denoise steps (1=last only)
     attn_score_beta: float = 1.0
-    grad_head_beta: float = 1.0
-    grad_head_norm: str = "sum"      # sum | max
+    grad_head_beta: float = 1.0      # legacy unused field kept for config compatibility
+    grad_head_norm: str = "sum"      # legacy unused field kept for config compatibility
     grad_action_agg: str = "sum"     # sum | max — action-step & head aggregation
 
-    # -- partial_grad params --
-    partial_grad_phi: str = "l2"           # l1 | l2
-    partial_grad_pos_weight: float = 1.0
-    partial_grad_grip_weight: float = 2.0
+    # -- legacy full_grad / partial_grad params --
+    partial_grad_phi: str = "l2"           # legacy unused field kept for config compatibility
+    partial_grad_pos_weight: float = 1.0   # legacy unused field kept for config compatibility
+    partial_grad_grip_weight: float = 2.0  # legacy unused field kept for config compatibility
 
     # -- General scoring params --
-    grad_denoise_steps: int = 1
-    grad_tau: float = 0.1
-    grad_alpha: float = 1.0
-    grad_beta: float = 1.0
+    grad_denoise_steps: int = 1           # legacy unused field kept for config compatibility
+    grad_tau: float = 0.1                 # legacy unused field kept for config compatibility
+    grad_alpha: float = 1.0               # legacy unused field kept for config compatibility
+    grad_beta: float = 1.0                # legacy unused field kept for config compatibility
     grad_region_ema: float = 0.0  # EMA smoothing for region scores (0=none)
     grad_keep_prev: bool = False
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # 2. Background Filtering  (independent of scoring & pruning ratio)
-    #    Cosine-similarity to first-frame reference → static background mask.
-    #    Applied per-camera before pruning; protected by score_gate.
-    # ═══════════════════════════════════════════════════════════════════════
+    # Legacy background-filtering fields kept for config compatibility.
     static_bg_enabled: bool = False
-    static_bg_threshold: float = 0.95   # cosine sim threshold (higher = stricter)
-    static_bg_camera_idx: int = 0       # image slot (0 = agentview, 1 = wrist)
-    static_bg_score_gate: float = 0.3   # protect top (1-gate) scored regions (1.0 = no protection)
+    static_bg_threshold: float = 0.95
+    static_bg_camera_idx: int = 0
+    static_bg_score_gate: float = 0.3
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 3. Pruning Ratio  (independent of scoring method & background filter)
+    # 2. Pruning Ratio
     #    Controls *how many* tokens to keep after scoring.
     #
-    #    pruning_mode selects the strategy:
-    #      "fixed_count"      — keep TopK by score; count set by min/max_kept_tokens.
-    #      "cumulative_mass"  — normalize scores to sum=1, keep until cumulative
-    #                           sum >= grad_region_mass.  min/max still enforced.
-    #      "entropy_dynamic"  — entropy-coupled: h∈[0,1] interpolates between
-    #                           low/high params.  pruning_method picks "mass" or
-    #                           "topk_ratio".  min/max still enforced.
+    #    Runtime now hardcodes fixed-count TopK. The fields below are kept only
+    #    so older config.json files still parse cleanly.
     # ═══════════════════════════════════════════════════════════════════════
-    pruning_mode: str = "fixed_count"  # "fixed_count" | "cumulative_mass" | "entropy_dynamic"
+    pruning_mode: str = "fixed_count"  # legacy unused field kept for config compatibility
 
-    # -- cumulative_mass params --
-    grad_region_mass: float = 0.7  # cumulative-score threshold (used when pruning_mode="cumulative_mass")
+    # Legacy mass-based pruning fields kept for config compatibility.
+    grad_region_mass: float = 0.7
+    pruning_method: str = "topk_ratio"
+    mass_low: float = 0.5
+    mass_high: float = 0.95
 
-    # -- entropy_dynamic params --
-    pruning_method: str = "topk_ratio"   # "mass" | "topk_ratio"  (used when pruning_mode="entropy_dynamic")
-    keep_ratio_low: float = 0.5          # keep ratio when h≈0 (focused)
-    keep_ratio_high: float = 0.9         # keep ratio when h≈1 (diffuse)
-    mass_low: float = 0.5               # mass threshold when h≈0
-    mass_high: float = 0.95             # mass threshold when h≈1
+    # Legacy entropy-dynamic fields kept for config compatibility.
+    keep_ratio_low: float = 0.5
+    keep_ratio_high: float = 0.9
 
     # -- Shared: min/max guardrails (applied in ALL pruning modes) --
     min_kept_tokens: int = 0
     max_kept_tokens: int = 1_000_000
 
-    # -- L1 Dynamic Prune Ratio --
-    #    When enabled, the pruning count switches between min_kept_tokens and
-    #    max_kept_tokens based on the previous frame's action L1 norm:
-    #      L1 > threshold → aggressive prune (min_kept_tokens)
-    #      L1 ≤ threshold → conservative prune (max_kept_tokens)
-    #    When disabled, a fixed prune_ratio is used for both min/max.
-    l1_dynamic_prune_enabled: bool = False
+    # -- Global Active Token Pool --
+    # Ratio of the *previously kept* tokens to permanently discard in the next eval frame.
+    # Discards the highest-scoring tokens from the previous frame.
+    discard_prev_kept_ratio: float = 0.0
+    # "top" = discard highest-scoring (trajectory remnants); "bottom" = discard lowest-scoring
+    discard_mode: str = "top"
+    # If enabled, a gripper-close action schedules the global discard pool to be
+    # fully restored on the next eval frame.
+    reset_discard_pool_on_gripper_close: bool = False
+    gripper_close_threshold: float = 0.0
+
+    # -- Dynamic Prune Mode --
+    #    Controls how kept_tokens adapts at runtime:
+    #      "none"          — fixed prune_ratio for both min and max
+    #      "l1_threshold"  — binary switch: L1 > threshold → min_kept, else → max_kept
+    #      "ema"           — continuous: sigmoid((L - L_hat) / L_hat) → interpolate [max, min] (or reverse)
+    #      "accel"         — chunk-internal xyz/rot acceleration, each using half of the [min, max] span
+    dynamic_prune_mode: str = "none"  # "none" | "l1_threshold" | "ema" | "accel"
+    prune_ratio: int = 64  # fixed kept-token count (when dynamic_prune_mode="none")
+
+    # -- l1_threshold params --
     l1_dynamic_prune_threshold: float = 8.0
-    prune_ratio: int = 64  # fixed kept-token count when l1_dynamic_prune is disabled
+
+    # -- ema / accel params --
+    l1_ema_alpha: float = 0.7        # EMA coefficient: higher = more smoothing / slower response
+    ema_sigmoid_gain: float = 4.0    # legacy unused field kept for config compatibility
+    accel_sigmoid_gain: float = 4.0  # legacy unused field kept for config compatibility
+    l1_ema_threshold: float = 8.0    # legacy field kept for compatibility
+    l1_ema_temperature: float = 2.0  # legacy field kept for compatibility
+    l1_ema_adaptive: bool = False    # legacy field kept for compatibility
+    l1_ema_adaptive_k: float = 1.0   # legacy field kept for compatibility
+    # Shared direction for ema / accel:
+    # "normal"  = high deviation / accel → fewer tokens (toward MIN)
+    # "reverse" = high deviation / accel → more tokens (toward MAX)
+    ema_direction: str = "normal"
 
     region_patch_size: int = 1
-    token_temporal_threshold: float = 0.9
-    token_spatial_threshold: float = 0.9
-    token_spatial_radius: int = 1
     token_prune_enabled: bool = False
-    vision_partial_update_enabled: bool = False
+    token_temporal_threshold: float = 0.9  # legacy unused field kept for config compatibility
+    token_spatial_threshold: float = 0.9   # legacy unused field kept for config compatibility
+    token_spatial_radius: int = 1          # legacy unused field kept for config compatibility
+    mask_dilation_radius: int = 0          # legacy unused field kept for config compatibility
+    vision_partial_update_enabled: bool = False  # legacy unused field kept for config compatibility
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 4. Eval Interval  (independent of everything above)
-    #    Controls how often the scoring + pruning pipeline runs.
-    #      dynamic_eval_enabled=False → fixed interval (region_eval_interval)
-    #      dynamic_eval_enabled=True  → entropy-triggered re-eval
+    # 3. Eval Interval
     # ═══════════════════════════════════════════════════════════════════════
     region_eval_interval: int = 1
-    dynamic_eval_enabled: bool = False
-    eval_entropy_threshold: float = 3.5  # re-eval trigger threshold
-    max_eval_interval: int = 5           # hard-cap: re-eval at least every N frames
+    dynamic_eval_enabled: bool = False    # legacy unused field kept for config compatibility
+    eval_entropy_threshold: float = 3.5   # legacy unused field kept for config compatibility
+    max_eval_interval: int = 5            # legacy unused field kept for config compatibility
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 5. Overlay / Visualization  (independent of scoring & pruning)
+    # 4. Overlay / Visualization
     #    overlay_mode selects rendering style:
     #      "heatmap" — continuous jet colormap; pruned regions darkened+hatched
     #      "label"   — discrete 5-color overlay (green/yellow/red/blue/transparent)
@@ -172,7 +188,7 @@ class PI05Config(PreTrainedConfig):
     score_debug_heatmap: bool = False   # debug: no pruning, every frame scored
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 6. Logging / Debug
+    # 5. Logging / Debug
     # ═══════════════════════════════════════════════════════════════════════
     rollout_dir: str | None = None
     local_log_dir: str | None = None
@@ -257,9 +273,6 @@ class PI05Config(PreTrainedConfig):
                 valid_action_agg = {"sum", "max"}
                 if self.grad_action_agg not in valid_action_agg:
                     raise ValueError(f"Invalid grad_action_agg: {self.grad_action_agg}")
-            valid_pruning_modes = {"fixed_count", "cumulative_mass", "entropy_dynamic"}
-            if self.pruning_mode not in valid_pruning_modes:
-                raise ValueError(f"Invalid pruning_mode: {self.pruning_mode}")
             valid_overlay_modes = {"heatmap", "label"}
             if self.overlay_mode not in valid_overlay_modes:
                 raise ValueError(f"Invalid overlay_mode: {self.overlay_mode}")
@@ -267,6 +280,9 @@ class PI05Config(PreTrainedConfig):
                 raise ValueError("region_patch_size must be > 0")
             if self.dynamic_eval_enabled and self.max_eval_interval <= 0:
                 raise ValueError("max_eval_interval must be > 0")
+            valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel"}
+            if self.dynamic_prune_mode not in valid_dynamic_prune_modes:
+                raise ValueError(f"Invalid dynamic_prune_mode: {self.dynamic_prune_mode}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

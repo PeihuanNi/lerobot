@@ -786,8 +786,6 @@ def eval_policy(
         if _ts_final.frame_idx > 0 and _ts_final.eval_frame_count > 0:
             _token_sel_stats["avg_eval_interval"] = round(_ts_final.frame_idx / _ts_final.eval_frame_count, 2)
             _token_sel_stats["eval_rate"] = round(_ts_final.eval_frame_count / _ts_final.frame_idx, 4)
-        if _ts_final.last_entropy is not None:
-            _token_sel_stats["final_entropy"] = round(_ts_final.last_entropy, 4)
         # Per-episode average pruning ratio
         if _ts_final.total_possible > 0:
             _avg_prune = (1.0 - _ts_final.total_kept / _ts_final.total_possible) * 100.0

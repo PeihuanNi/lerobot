@@ -38,20 +38,18 @@ class TokenSelectionState:
     last_score_token: list[Tensor] | None = None
     last_score_region: list[Tensor] | None = None
     last_important_region: list[Tensor] | None = None
-    last_region_embs: list[Tensor] | None = None
-    last_image_embs: list[Tensor] | None = None
     last_overlay_labels: list[Tensor] | None = None
     last_overlay_grid: list[Tensor] | None = None
+    # Global token pool: binary mask tracking permanently discarded tokens across the trajectory
+    global_active_region_masks: list[Tensor] | None = None
+    # Restore the global token pool on the next eval frame.
+    pending_global_pool_restore: bool = False
     # Heatmap debug: continuous float score grid per camera
     last_heatmap_grid: list[Tensor] | None = None
     # Binary keep mask grid per camera (True = kept, False = pruned)
     last_keep_grid: list[Tensor] | None = None
-    # Dynamic eval interval state
-    last_entropy: float | None = None
-    last_eval_frame_idx: int = 0
+    # Number of frames that ran the full scoring pipeline.
     eval_frame_count: int = 0
-    # Reference region embeddings for static-background detection (first eval frame)
-    reference_region_embs: list[Tensor] | None = None
     # Accumulated pruning counters for per-episode average pruning ratio
     total_kept: int = 0
     total_possible: int = 0
@@ -61,6 +59,20 @@ class TokenSelectionState:
     actions_l1_history: list = None  # type: ignore[assignment]
     # Last frame's action L1 norm (used by L1 dynamic prune ratio)
     last_actions_l1: float | None = None
+    # EMA-smoothed L1 norm (used by "ema" dynamic prune mode)
+    ema_l1: float | None = None
+    # EMA-tracked L1 mean and variance (used by adaptive EMA threshold)
+    ema_l1_mean: float | None = None
+    ema_l1_var: float = 0.0
+    # Acceleration-based pruning: chunk-internal velocity jerk
+    last_accel: float | None = None
+    ema_accel: float | None = None
+    last_accel_xyz: float | None = None
+    ema_accel_xyz: float | None = None
+    ema_accel_xyz_var: float = 0.0
+    last_accel_rot: float | None = None
+    ema_accel_rot: float | None = None
+    ema_accel_rot_var: float = 0.0
 
     def __post_init__(self):
         if self.last_stats is None:
@@ -73,21 +85,29 @@ class TokenSelectionState:
         self.last_score_token = None
         self.last_score_region = None
         self.last_important_region = None
-        self.last_region_embs = None
-        self.last_image_embs = None
         self.last_overlay_labels = None
         self.last_overlay_grid = None
+        self.global_active_region_masks = None
+        self.pending_global_pool_restore = False
         self.last_heatmap_grid = None
         self.last_keep_grid = None
-        self.last_entropy = None
-        self.last_eval_frame_idx = 0
         self.eval_frame_count = 0
-        self.reference_region_embs = None
         self.total_kept = 0
         self.total_possible = 0
         self.last_stats = {}
         self.actions_l1_history = []
         self.last_actions_l1 = None
+        self.ema_l1 = None
+        self.ema_l1_mean = None
+        self.ema_l1_var = 0.0
+        self.last_accel = None
+        self.ema_accel = None
+        self.last_accel_xyz = None
+        self.ema_accel_xyz = None
+        self.ema_accel_xyz_var = 0.0
+        self.last_accel_rot = None
+        self.ema_accel_rot = None
+        self.ema_accel_rot_var = 0.0
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:
@@ -105,30 +125,6 @@ def split_patch_tokens(img_emb: Tensor) -> tuple[Tensor, PatchGridMeta]:
     if meta.num_extra_tokens > 0:
         return img_emb[:, meta.num_extra_tokens :, :], meta
     return img_emb, meta
-
-
-def compute_region_embeddings(
-    patch_emb: Tensor, patches_per_side: int, region_patch_size: int
-) -> Tensor:
-    if patches_per_side % region_patch_size != 0:
-        raise ValueError(
-            f"region_patch_size ({region_patch_size}) must divide patches_per_side ({patches_per_side})."
-        )
-    batch_size, num_patches, hidden = patch_emb.shape
-    if num_patches != patches_per_side * patches_per_side:
-        raise ValueError("Patch embeddings do not match the inferred grid.")
-    region_h = patches_per_side // region_patch_size
-    region_w = patches_per_side // region_patch_size
-    reshaped = patch_emb.view(
-        batch_size,
-        region_h,
-        region_patch_size,
-        region_w,
-        region_patch_size,
-        hidden,
-    )
-    region_emb = reshaped.mean(dim=(2, 4))
-    return region_emb.view(batch_size, region_h * region_w, hidden)
 
 
 def compute_region_scores(
@@ -165,56 +161,44 @@ def expand_region_mask(
     return expanded.view(batch_size, patches_per_side * patches_per_side)
 
 
-def select_regions_by_topk_ratio(score_region: Tensor, keep_ratio: float) -> Tensor:
-    """Select the top-k regions by score, where k = ceil(keep_ratio * num_regions).
-
-    Unlike ``select_regions_by_mass`` (which depends on the *cumulative score*
-    and is therefore very sensitive to the score distribution shape), this
-    function directly controls the *fraction of regions* that are kept.  The
-    mapping from ``keep_ratio`` to the number of kept regions is perfectly
-    linear and does not exhibit cliff-like jumps.
-
-    Args:
-        score_region: ``[B, R]`` importance scores (any non-negative values).
-        keep_ratio:   Fraction of regions to keep, in ``(0, 1]``.
-                      ``0.5`` keeps half of all regions; ``1.0`` keeps all.
-
-    Returns:
-        Boolean mask ``[B, R]`` with ``True`` for kept regions.
-    """
-    batch_size, num_regions = score_region.shape
-    keep_ratio = max(0.0, min(keep_ratio, 1.0))
-    k = max(1, math.ceil(keep_ratio * num_regions))
-    k = min(k, num_regions)
-    order = torch.argsort(score_region, dim=-1, descending=True)
-    mask = torch.zeros_like(score_region, dtype=torch.bool)
-    for batch_idx in range(batch_size):
-        mask[batch_idx, order[batch_idx, :k]] = True
-    return mask
+def compute_relative_deviation(raw_value: float | None, ema_value: float | None) -> float | None:
+    if raw_value is None or ema_value is None:
+        return None
+    denom = max(abs(ema_value), 1e-8)
+    return (raw_value - ema_value) / denom
 
 
-def select_regions_by_mass(score_region: Tensor, mass: float) -> Tensor:
-    batch_size, num_regions = score_region.shape
-    total = score_region.sum(dim=-1, keepdim=True)
-    if mass <= 0:
-        keep_count = torch.ones(batch_size, dtype=torch.long, device=score_region.device)
-        order = torch.argsort(score_region, dim=-1, descending=True)
+def sigmoid_ratio(value: float) -> float:
+    x = max(min(value, 60.0), -60.0)
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def ratio_to_keep_tokens(
+    ratio: float,
+    min_kept_tokens: int,
+    max_kept_tokens: int,
+    direction: str,
+) -> int:
+    ratio = max(min(ratio, 1.0), 0.0)
+    span = max_kept_tokens - min_kept_tokens
+    if direction == "reverse":
+        eff = min_kept_tokens + ratio * span
     else:
-        normalized = torch.where(
-            total > 0,
-            score_region / total,
-            torch.full_like(score_region, 1.0 / num_regions),
-        )
-        order = torch.argsort(normalized, dim=-1, descending=True)
-        sorted_scores = torch.gather(normalized, 1, order)
-        cumulative = torch.cumsum(sorted_scores, dim=-1)
-        keep_count = (cumulative < mass).sum(dim=-1) + 1
-    keep_count = torch.clamp(keep_count, min=1, max=num_regions)
-    mask = torch.zeros_like(score_region, dtype=torch.bool)
-    for batch_idx in range(batch_size):
-        selected = order[batch_idx, : keep_count[batch_idx]]
-        mask[batch_idx, selected] = True
-    return mask
+        eff = max_kept_tokens - ratio * span
+    return int(round(min(max(eff, min_kept_tokens), max_kept_tokens)))
+
+
+def update_ema_mean_and_var(
+    value: float,
+    mean: float | None,
+    var: float,
+    alpha: float,
+) -> tuple[float, float]:
+    if mean is None:
+        return value, 0.0
+    new_mean = alpha * mean + (1.0 - alpha) * value
+    new_var = alpha * var + (1.0 - alpha) * (value - mean) * (value - new_mean)
+    return new_mean, max(new_var, 0.0)
 
 
 def apply_min_max_constraints(
@@ -244,120 +228,70 @@ def apply_min_max_constraints(
     return keep_mask, clipped_mask
 
 
-def cosine_similarity(a: Tensor, b: Tensor, eps: float = 1e-6) -> Tensor:
-    a_f = a.float()
-    b_f = b.float()
-    a_norm = torch.linalg.vector_norm(a_f, dim=-1)
-    b_norm = torch.linalg.vector_norm(b_f, dim=-1)
-    denom = (a_norm * b_norm).clamp_min(eps)
-    return (a_f * b_f).sum(dim=-1) / denom
-
-
-def detect_static_background(
-    region_emb: Tensor,
-    reference_emb: Tensor,
-    threshold: float,
-    valid_mask: Tensor,
-    score_region: Tensor | None = None,
-    score_gate: float = 1.0,
-) -> tuple[Tensor, Tensor]:
-    """Detect static background by cosine similarity to reference embeddings.
-
-    A region is marked as static background only when **both**:
-      1. Its cosine similarity to the first-frame reference >= ``threshold``.
-      2. Its gradient importance score is NOT in the top ``1 - score_gate``
-         fraction (i.e., the model does not consider it highly important).
-
-    ``score_gate = 1.0`` disables the gate (all static regions are background).
-    ``score_gate = 0.3`` protects the top 70% scored regions from being pruned,
-    only pruning static regions in the bottom 30%.
-
+def discard_top_scoring_regions(
+    score_region: Tensor, 
+    keep_region: Tensor, 
+    discard_ratio: float,
+    max_discard: Tensor | None = None,
+    mode: str = "top",
+) -> Tensor:
+    """Select regions from the previously *kept* regions to discard.
+    
     Args:
-        region_emb:    ``[B, R, D]`` current region embeddings.
-        reference_emb: ``[B, R, D]`` reference (first-frame) region embeddings.
-        threshold:     Cosine similarity threshold; higher = stricter.
-        valid_mask:    ``[B, R]`` bool mask (True = real image, False = padding).
-        score_region:  ``[B, R]`` gradient importance scores (optional).
-        score_gate:    Fraction in (0, 1].  A static region is protected from
-                       background pruning if its score rank is in the top
-                       ``1 - score_gate`` of all valid regions.
-
+        score_region: [B, R] raw scores from the previous frame.
+        keep_region: [B, R] boolean mask of regions kept in the previous frame.
+        discard_ratio: Fraction (0.0 to 1.0) of previous kept regions to discard.
+        max_discard: [B] integer tensor specifying max allowed discards per batch item 
+                     to avoid depleting the global token pool.
+        mode: "top"    = discard highest-scoring (old center, trajectory remnants);
+              "bottom" = discard lowest-scoring (least relevant background);
+              "middle" = discard mid-scoring (ambiguous/uncertain tokens).
+                     
     Returns:
-        Tuple of two ``[B, R]`` bool masks:
-          - ``bg_mask``: True for static-background regions (after score gate).
-          - ``raw_static``: True for ALL cosine-static regions (before score gate).
+        Boolean mask [B, R] with True for regions scheduled to be permanently discarded.
     """
-    cos = cosine_similarity(region_emb, reference_emb)  # [B, R]
-    raw_static = (cos >= threshold) & valid_mask
-    is_static = raw_static.clone()
-
-    # Score gate: protect high-scoring static regions from being pruned
-    if score_region is not None and 0 < score_gate < 1.0:
-        sr = score_region.float()
-        sr = torch.where(valid_mask, sr, torch.full_like(sr, float("-inf")))
-        n_valid = max(1, int(valid_mask.sum(dim=-1).float().mean().item()))
-        k = max(1, int((1.0 - score_gate) * n_valid))
-        # top-k scores: regions with score >= kth-largest are protected
-        topk_vals, _ = sr.topk(k, dim=-1)               # [B, k]
-        cutoff = topk_vals[:, -1:]                        # [B, 1]
-        is_high_score = sr >= cutoff                      # [B, R]
-        # Only mark as background if static AND NOT high-score
-        is_static = is_static & ~is_high_score
-
-    return is_static, raw_static
-
-
-def compute_temporal_mask(
-    region_emb: Tensor, prev_region_emb: Tensor | None, threshold: float, valid_mask: Tensor
-) -> Tensor:
-    if prev_region_emb is None:
-        return torch.zeros_like(valid_mask, dtype=torch.bool)
-    cos = cosine_similarity(region_emb, prev_region_emb)
-    return (cos >= threshold) & valid_mask
-
-
-def compute_spatial_mask(
-    region_emb: Tensor, patches_per_side: int, region_patch_size: int, radius: int, threshold: float
-) -> Tensor:
-    batch_size, num_regions, hidden = region_emb.shape
-    region_h = patches_per_side // region_patch_size
-    region_w = patches_per_side // region_patch_size
-    if num_regions != region_h * region_w:
-        raise ValueError("Region embeddings do not match the inferred grid.")
-    region_emb_2d = region_emb.view(batch_size, region_h, region_w, hidden)
-    spatial_mask = torch.zeros(batch_size, region_h, region_w, dtype=torch.bool, device=region_emb.device)
-    for row in range(region_h):
-        r0 = max(0, row - radius)
-        r1 = min(region_h, row + radius + 1)
-        for col in range(region_w):
-            c0 = max(0, col - radius)
-            c1 = min(region_w, col + radius + 1)
-            anchor = region_emb_2d[:, row, col, :].unsqueeze(1)
-            neighbors = region_emb_2d[:, r0:r1, c0:c1, :].reshape(batch_size, -1, hidden)
-            cos = cosine_similarity(anchor, neighbors)
-            mean_cos = cos.mean(dim=-1)
-            spatial_mask[:, row, col] = mean_cos >= threshold
-    return spatial_mask.view(batch_size, region_h * region_w)
-
+    batch_size = score_region.shape[0]
+    discard_mask = torch.zeros_like(keep_region, dtype=torch.bool)
+    if discard_ratio <= 0.0:
+        return discard_mask
+        
+    for batch_idx in range(batch_size):
+        kept_indices = keep_region[batch_idx].nonzero(as_tuple=True)[0]
+        if len(kept_indices) == 0:
+            continue
+            
+        num_to_discard = int(math.ceil(len(kept_indices) * discard_ratio))
+        if max_discard is not None:
+            num_to_discard = min(num_to_discard, max_discard[batch_idx].item())
+            
+        if num_to_discard <= 0:
+            continue
+            
+        kept_scores = score_region[batch_idx, kept_indices]
+        
+        if mode == "middle":
+            # Sort ascending, pick the middle slice
+            sorted_idx = torch.argsort(kept_scores, descending=False)
+            n = len(sorted_idx)
+            mid_start = (n - num_to_discard) // 2
+            mid_end = mid_start + num_to_discard
+            selected_idx = sorted_idx[mid_start:mid_end]
+        else:
+            # "top" → sort descending (highest first); "bottom" → sort ascending
+            _descending = (mode == "top")
+            sorted_idx = torch.argsort(kept_scores, descending=_descending)[:num_to_discard]
+            selected_idx = sorted_idx
+        
+        absolute_discard_indices = kept_indices[selected_idx]
+        discard_mask[batch_idx, absolute_discard_indices] = True
+        
+    return discard_mask
 
 def build_overlay_labels(
-    keep: Tensor, important: Tensor, clipped: Tensor,
-    static_bg: Tensor | None = None,
-    raw_cosine_static: Tensor | None = None,
+    keep: Tensor,
+    important: Tensor,
+    clipped: Tensor,
 ) -> Tensor:
-    """Build per-token overlay label map.
-
-    Label meanings (when raw_cosine_static is provided — bg camera):
-        0 = not important & not background  (green       — gradient-pruned foreground)
-        1 = important & cosine-static       (yellow      — gate-protected, looks bg but important)
-        2 = important & not cosine-static   (red         — important foreground)
-        3 = important & pruned as bg        (blue        — important but gate didn't protect)
-        4 = not important & pruned as bg    (transparent — no overlay, original image)
-
-    Fallback (no bg detection — other cameras):
-        0 = pruned (green)
-        2 = kept & important (red)
-    """
     if keep.dim() == 1:
         keep = keep.unsqueeze(0)
     if important.dim() == 1:
@@ -366,27 +300,9 @@ def build_overlay_labels(
         clipped = clipped.unsqueeze(0)
 
     overlay = torch.zeros_like(keep, dtype=torch.uint8)  # default = 0 (green)
-
-    if raw_cosine_static is not None and static_bg is not None:
-        # 4-way classification for bg-detected camera
-        if raw_cosine_static.dim() == 1:
-            raw_cosine_static = raw_cosine_static.unsqueeze(0)
-        if static_bg.dim() == 1:
-            static_bg = static_bg.unsqueeze(0)
-        overlay[important & ~raw_cosine_static] = 2   # red: important + not static
-        overlay[important & raw_cosine_static] = 1    # yellow: important + cosine-static (gate-protected)
-        overlay[static_bg] = 4                         # transparent: pruned background (not important)
-        overlay[important & static_bg] = 3             # blue: important but pruned as bg (gate didn't protect)
-        # Everything else stays 0 (green): not important, not bg
-    else:
-        # Fallback: original scheme (no bg detection for this camera)
-        overlay[keep & ~important] = 1
-        overlay[keep & important] = 2
-        overlay[clipped] = 3
-        if static_bg is not None:
-            if static_bg.dim() == 1:
-                static_bg = static_bg.unsqueeze(0)
-            overlay[static_bg] = 4
+    overlay[keep & ~important] = 1
+    overlay[keep & important] = 2
+    overlay[clipped] = 3
     return overlay
 
 
@@ -401,8 +317,6 @@ def build_overlay(
     show_scores: bool,
     show_ids: bool,
     scores: Tensor | None = None,
-    static_bg: Tensor | None = None,
-    raw_cosine_static: Tensor | None = None,
 ) -> Tensor:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -431,16 +345,14 @@ def build_overlay(
         x0 = col * region_width
         y1 = y0 + region_height
         x1 = x0 + region_width
-        if static_bg is not None and static_bg[idx] and important[idx]:
-            color = (0, 0, 255)       # blue: important but pruned as bg (gate didn't protect)
-        elif static_bg is not None and static_bg[idx]:
-            continue  # pruned bg (not important): no overlay, keep original image
-        elif raw_cosine_static is not None and raw_cosine_static[idx] and important[idx]:
-            color = (255, 255, 0)     # yellow: gate-protected (important + cosine-static)
+        if clipped[idx]:
+            color = (0, 0, 255)
         elif important[idx]:
-            color = (255, 0, 0)       # red: important & not static
+            color = (255, 0, 0)
+        elif keep[idx]:
+            color = (255, 255, 0)
         else:
-            color = (0, 255, 0)       # green: not important
+            color = (0, 255, 0)
         draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
         if show_scores or show_ids:
             label_parts = []
@@ -455,38 +367,6 @@ def build_overlay(
 
 def to_tensor_list(values: Iterable[Tensor]) -> list[Tensor]:
     return [value for value in values]
-
-
-def apply_partial_update(
-    image_embs: list[Tensor],
-    last_image_embs: list[Tensor] | None,
-    important_token_masks: list[Tensor] | None,
-    metas: list[PatchGridMeta],
-) -> list[Tensor]:
-    if last_image_embs is None or important_token_masks is None:
-        return image_embs
-    updated = []
-    for emb, prev, mask, meta in zip(image_embs, last_image_embs, important_token_masks, metas, strict=True):
-        if prev is None or prev.shape != emb.shape:
-            updated.append(emb)
-            continue
-        if meta.num_extra_tokens > 0:
-            extra = emb[:, : meta.num_extra_tokens, :]
-            cur_patch = emb[:, meta.num_extra_tokens :, :]
-            prev_patch = prev[:, meta.num_extra_tokens :, :]
-        else:
-            extra = None
-            cur_patch = emb
-            prev_patch = prev
-        if mask.shape[-1] != cur_patch.shape[1]:
-            updated.append(emb)
-            continue
-        combined_patch = torch.where(mask.unsqueeze(-1), cur_patch, prev_patch)
-        if extra is not None:
-            updated.append(torch.cat([extra, combined_patch], dim=1))
-        else:
-            updated.append(combined_patch)
-    return updated
 
 
 def prune_image_embeddings(

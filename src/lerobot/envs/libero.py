@@ -311,6 +311,10 @@ class LiberoEnv(gym.Env):
                 robot.controller.use_delta = True
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
+            
+        # [RELAXED] Track if success has been achieved at least once in the episode
+        self._success_recorded = False
+            
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
         return observation, info
@@ -323,7 +327,15 @@ class LiberoEnv(gym.Env):
             )
         raw_obs, reward, done, info = self._env.step(action)
 
-        is_success = self._env.check_success()
+        current_is_success = self._env.check_success()
+        
+        # [RELAXED] Once successful, lock it in for the rest of the episode
+        # This prevents mechanical jitter from breaking the success condition 
+        # in the last few frames.
+        if current_is_success:
+            self._success_recorded = True
+            
+        is_success = self._success_recorded
         terminated = done or is_success
         info.update(
             {
