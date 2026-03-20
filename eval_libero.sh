@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR="./outputs/eval/pi0_object"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
+OUTPUT_DIR="./outputs/eval/gt-pi0_object"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
 POLICY_TYPE="pi0"
@@ -25,7 +25,7 @@ USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
 TOKEN_SELECTION_ENABLED=true
-TOKEN_PRUNE_ENABLED=true
+TOKEN_PRUNE_ENABLED=false
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
@@ -38,7 +38,7 @@ INTERP_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific st
 INTERP_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
 INTERP_ACTION_START=5              # first action step for objective (0-indexed)
 INTERP_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
-INTERP_VARIANT="abs_heads"     # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-action-dim backprop
+INTERP_VARIANT="dimension_independent"     # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-action-dim backprop
 INTERP_OBJECTIVE="action_sample_L1"    # action_sample_L1 | vector_field_L2
 INTERP_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 

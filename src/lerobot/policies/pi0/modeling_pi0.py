@@ -1148,6 +1148,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         _x_in = x_t.detach().requires_grad_(True)
                         with torch.enable_grad():
                             _v_raw, _, _step_attns = self.denoise_step(
+                                state=state,
                                 prefix_pad_masks=prefix_pad_masks,
                                 past_key_values=past_key_values,
                                 x_t=_x_in,
@@ -1313,6 +1314,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     else:
                         with torch.no_grad():
                             _v_t = self.denoise_step(
+                                state=state,
                                 prefix_pad_masks=prefix_pad_masks,
                                 past_key_values=past_key_values,
                                 x_t=x_t,
