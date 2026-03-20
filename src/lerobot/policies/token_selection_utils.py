@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
 
@@ -48,11 +49,18 @@ class TokenSelectionState:
     last_heatmap_grid: list[Tensor] | None = None
     # Binary keep mask grid per camera (True = kept, False = pruned)
     last_keep_grid: list[Tensor] | None = None
+    # Heatmap overlay marker grid per camera. Its semantics depend on
+    # `last_heatmap_mask_mode` (e.g. pruned vs reused).
+    last_heatmap_mask_grid: list[Tensor] | None = None
+    last_heatmap_mask_mode: str | None = None
     # Number of frames that ran the full scoring pipeline.
     eval_frame_count: int = 0
     # Accumulated pruning counters for per-episode average pruning ratio
     total_kept: int = 0
     total_possible: int = 0
+    # Accumulated reuse counters for VLA-Cache reporting.
+    total_reused: int = 0
+    total_reusable: int = 0
     # Stats for tqdm postfix (updated every frame when token_selection_enabled)
     last_stats: dict = None  # type: ignore[assignment]
     # Action L1 norm history: list of (frame_idx, l1_norm) per inference frame
@@ -73,6 +81,21 @@ class TokenSelectionState:
     last_accel_rot: float | None = None
     ema_accel_rot: float | None = None
     ema_accel_rot_var: float = 0.0
+    # VLA-Cache: previous-frame per-camera input images.
+    last_vla_cache_images: list[Tensor] | None = None
+    # VLA-Cache: previous-frame aggregated vision-token relevance scores per camera.
+    last_vla_cache_attention_scores: list[Tensor] | None = None
+    # VLA-Cache: previous-frame expert attention maps used to derive layer reuse ratios.
+    last_vla_cache_attentions: list[Tensor] | None = None
+    # VLA-Cache: prefix outputs after each prefix layer from the previous frame.
+    last_prefix_layer_outputs: list[Tensor] | None = None
+    # VLA-Cache: previous-frame prefix KV cache stored as legacy tuples.
+    last_prefix_past_key_values: list[tuple[Tensor, Tensor]] | None = None
+    # VLA-Cache: cached language prompt tokens and masks; cache reuse is disabled if these change.
+    last_lang_tokens: Tensor | None = None
+    last_lang_masks: Tensor | None = None
+    # VLA-Cache: last-frame reused visual token mask per camera.
+    last_vla_cache_reuse_masks: list[Tensor] | None = None
 
     def __post_init__(self):
         if self.last_stats is None:
@@ -91,9 +114,13 @@ class TokenSelectionState:
         self.pending_global_pool_restore = False
         self.last_heatmap_grid = None
         self.last_keep_grid = None
+        self.last_heatmap_mask_grid = None
+        self.last_heatmap_mask_mode = None
         self.eval_frame_count = 0
         self.total_kept = 0
         self.total_possible = 0
+        self.total_reused = 0
+        self.total_reusable = 0
         self.last_stats = {}
         self.actions_l1_history = []
         self.last_actions_l1 = None
@@ -108,6 +135,14 @@ class TokenSelectionState:
         self.last_accel_rot = None
         self.ema_accel_rot = None
         self.ema_accel_rot_var = 0.0
+        self.last_vla_cache_images = None
+        self.last_vla_cache_attention_scores = None
+        self.last_vla_cache_attentions = None
+        self.last_prefix_layer_outputs = None
+        self.last_prefix_past_key_values = None
+        self.last_lang_tokens = None
+        self.last_lang_masks = None
+        self.last_vla_cache_reuse_masks = None
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:
@@ -199,6 +234,184 @@ def update_ema_mean_and_var(
     new_mean = alpha * mean + (1.0 - alpha) * value
     new_var = alpha * var + (1.0 - alpha) * (value - mean) * (value - new_mean)
     return new_mean, max(new_var, 0.0)
+
+
+def _to_channels_first(images: Tensor) -> Tensor:
+    if images.dim() != 4:
+        raise ValueError(f"Expected 4D image tensor, got shape {tuple(images.shape)}")
+    if images.shape[1] in {1, 3, 4}:
+        return images
+    if images.shape[-1] in {1, 3, 4}:
+        return images.permute(0, 3, 1, 2)
+    raise ValueError(f"Unable to infer channels dimension from shape {tuple(images.shape)}")
+
+
+def compute_patch_cosine_similarity(
+    current_images: Tensor,
+    previous_images: Tensor,
+    patches_per_side: int,
+) -> Tensor:
+    current = _to_channels_first(current_images).float()
+    previous = _to_channels_first(previous_images).float()
+    if current.shape != previous.shape:
+        raise ValueError(
+            "Current and previous images must share the same shape for VLA-Cache similarity computation."
+        )
+
+    # The reference VLA-Cache implementation computes patch similarity on raw
+    # RGB images. PI policies preprocess images to [-1, 1] for PaliGemma, so
+    # map them back to [0, 1] before patchifying to keep the original
+    # similarity threshold semantics (e.g. 0.996) meaningful.
+    if current.min().item() < 0.0 or previous.min().item() < 0.0:
+        current = (current + 1.0) * 0.5
+        previous = (previous + 1.0) * 0.5
+
+    _, _, height, width = current.shape
+    if height % patches_per_side != 0 or width % patches_per_side != 0:
+        raise ValueError(
+            f"Image size {(height, width)} is not divisible by patches_per_side={patches_per_side}."
+        )
+
+    patch_h = height // patches_per_side
+    patch_w = width // patches_per_side
+
+    def patchify(images: Tensor) -> Tensor:
+        patches = images.unfold(2, patch_h, patch_h).unfold(3, patch_w, patch_w)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        return patches.view(images.shape[0], patches_per_side * patches_per_side, -1)
+
+    current_patches = F.normalize(patchify(current), dim=-1)
+    previous_patches = F.normalize(patchify(previous), dim=-1)
+    return (current_patches * previous_patches).sum(dim=-1)
+
+
+def select_vla_cache_reuse_tokens(
+    similarity_scores: Tensor,
+    valid_mask: Tensor,
+    reuse_tokens: int,
+    similarity_threshold: float,
+    protected_scores: Tensor | None = None,
+    protect_top_tokens: int = 0,
+) -> tuple[Tensor, Tensor]:
+    if similarity_scores.dim() != 2:
+        raise ValueError("similarity_scores must have shape [batch, num_patches].")
+    if valid_mask.dim() == 1:
+        valid_mask = valid_mask[:, None].expand_as(similarity_scores)
+    elif valid_mask.shape != similarity_scores.shape:
+        raise ValueError("valid_mask must broadcast to similarity_scores.")
+
+    scores = similarity_scores.clone()
+    scores = torch.where(valid_mask, scores, torch.full_like(scores, -float("inf")))
+
+    if protected_scores is not None and protect_top_tokens > 0:
+        protect_top_tokens = min(protect_top_tokens, protected_scores.shape[-1])
+        if protect_top_tokens > 0:
+            protected_mask = torch.zeros_like(scores, dtype=torch.bool)
+            protected_valid_scores = torch.where(
+                valid_mask,
+                protected_scores,
+                torch.full_like(protected_scores, -float("inf")),
+            )
+            top_idx = torch.topk(
+                protected_valid_scores,
+                k=protect_top_tokens,
+                dim=-1,
+            ).indices
+            protected_mask.scatter_(1, top_idx, True)
+            scores = torch.where(protected_mask, torch.full_like(scores, -float("inf")), scores)
+
+    reuse_mask = torch.zeros_like(scores, dtype=torch.bool)
+    selected_scores = torch.full_like(scores, -float("inf"))
+    if reuse_tokens <= 0:
+        return reuse_mask, selected_scores
+
+    top_k = min(reuse_tokens, scores.shape[-1])
+    top_values, top_idx = torch.topk(scores, k=top_k, dim=-1)
+    keep = torch.isfinite(top_values) & (top_values >= similarity_threshold)
+    if keep.any():
+        reuse_mask.scatter_(1, top_idx, keep)
+        selected_scores.scatter_(1, top_idx, torch.where(keep, top_values, torch.full_like(top_values, -float("inf"))))
+
+    return reuse_mask, selected_scores
+
+
+@torch.no_grad()
+def compute_vla_cache_layer_schedule(
+    attentions: list[Tensor],
+    apply_weighted_growth: bool = True,
+    growth_factor: float = 0.55,
+) -> Tensor | None:
+    if not attentions:
+        return None
+
+    device = attentions[0].device
+    entropies = []
+    for attn in attentions:
+        if attn.dim() != 4:
+            raise ValueError("Attention tensors must have shape [batch, heads, query, key].")
+        attn_mean = attn.float().mean(dim=1)
+        attn_mean = attn_mean / attn_mean.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+        attn_mean = torch.nan_to_num(attn_mean, nan=0.0)
+        token_entropy = -(attn_mean * (attn_mean + 1e-10).log()).sum(dim=-1)
+        entropies.append(token_entropy.mean())
+
+    entropies_t = torch.stack(entropies)
+    if torch.allclose(entropies_t.max(), entropies_t.min()):
+        reuse = torch.ones_like(entropies_t)
+    else:
+        norm_entropy = (entropies_t - entropies_t.min()) / (entropies_t.max() - entropies_t.min() + 1e-10)
+        reuse = 1.0 - norm_entropy
+
+    if apply_weighted_growth and reuse.numel() > 1:
+        reuse_list = reuse.tolist()
+        for idx in range(1, len(reuse_list)):
+            delta = reuse_list[idx] - reuse_list[idx - 1]
+            if delta > 0:
+                reuse_list[idx] = reuse_list[idx - 1] + delta * growth_factor
+        reuse = torch.tensor(reuse_list, dtype=torch.float32, device=device)
+
+    return reuse.clamp(0.0, 1.0)
+
+
+def build_layer_reuse_masks(
+    selected_scores: Tensor,
+    always_reuse_mask: Tensor,
+    layer_schedule: Tensor | None,
+) -> list[Tensor]:
+    if selected_scores.dim() != 2 or always_reuse_mask.shape != selected_scores.shape:
+        raise ValueError("selected_scores and always_reuse_mask must share shape [batch, num_tokens].")
+
+    if layer_schedule is None:
+        return [always_reuse_mask | torch.isfinite(selected_scores)]
+
+    eligible_mask = torch.isfinite(selected_scores)
+    selected_count = eligible_mask.sum(dim=-1)
+    masks: list[Tensor] = []
+    for ratio in layer_schedule.tolist():
+        layer_mask = always_reuse_mask.clone()
+        if ratio <= 0.0:
+            masks.append(layer_mask)
+            continue
+        max_k = int(selected_scores.shape[-1])
+        if max_k <= 0:
+            masks.append(layer_mask)
+            continue
+        want_k = torch.round(selected_count.float() * float(ratio)).to(dtype=torch.int64)
+        want_k = torch.clamp(want_k, min=0, max=max_k)
+        if int(want_k.max().item()) == 0:
+            masks.append(layer_mask)
+            continue
+        top_idx = torch.topk(
+            torch.where(eligible_mask, selected_scores, torch.full_like(selected_scores, -float("inf"))),
+            k=int(want_k.max().item()),
+            dim=-1,
+        ).indices
+        top_rank = torch.arange(top_idx.shape[1], device=selected_scores.device)[None, :]
+        keep = top_rank < want_k[:, None]
+        layer_selected = torch.zeros_like(layer_mask)
+        layer_selected.scatter_(1, top_idx, keep)
+        masks.append(layer_mask | layer_selected)
+    return masks
 
 
 def apply_min_max_constraints(

@@ -61,7 +61,7 @@ class PI0Config(PreTrainedConfig):
     #    Each method outputs per-token scores; downstream modules are unaffected.
     # ═══════════════════════════════════════════════════════════════════════
     grad_score_method: str = "transformer_interpretability"
-    # Supported: attn_only | transformer_interpretability
+    # Supported: attn_only | transformer_interpretability | vla_cache
     # Legacy values are still accepted during config loading for compatibility.
 
     # -- transformer_interpretability params --
@@ -93,6 +93,17 @@ class PI0Config(PreTrainedConfig):
     grad_beta: float = 1.0                # legacy unused field kept for config compatibility
     grad_region_ema: float = 0.0  # EMA smoothing for region scores (0=none)
     grad_keep_prev: bool = False
+
+    # -- VLA-Cache params --
+    # Reuse up to this many visual patch tokens per image on each eval frame.
+    vla_cache_reuse_tokens: int = 130
+    # Exclude the top-N task-relevant tokens from reuse using previous-frame attention scores.
+    vla_cache_protect_top_tokens: int = 120
+    # Minimum raw-pixel patch cosine similarity required before a token can be reused.
+    vla_cache_similarity_threshold: float = 0.996
+    # Smooth the layer-wise reuse schedule, matching the reference implementation.
+    vla_cache_apply_layer_schedule: bool = True
+    vla_cache_growth_factor: float = 0.55
 
     # Legacy background-filtering fields kept for config compatibility.
     static_bg_enabled: bool = False
@@ -178,12 +189,17 @@ class PI0Config(PreTrainedConfig):
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Overlay / Visualization
     #    overlay_mode selects rendering style:
-    #      "heatmap" — continuous jet colormap; pruned regions darkened+hatched
-    #      "label"   — discrete 5-color overlay (green/yellow/red/blue/transparent)
+    #      "heatmap"       — continuous jet colormap with prune/reuse hatching
+    #      "heatmap_plain" — continuous jet colormap without any hatch overlay
+    #      "heatmap_kept_only" — continuous jet colormap on final kept regions only
+    #      "label"         — discrete 5-color overlay (green/yellow/red/blue/transparent)
+    #    overlay_heatmap_threshold hides low-score heatmap regions after the
+    #    per-frame [0, 1] normalisation. Higher values remove more blue.
     #    score_debug_heatmap overrides everything: forces every-frame scoring,
     #    disables pruning, shows pure heatmap without prune marks.
     # ═══════════════════════════════════════════════════════════════════════
-    overlay_mode: str = "heatmap"       # "heatmap" | "label"
+    overlay_mode: str = "heatmap"       # "heatmap" | "heatmap_plain" | "heatmap_kept_only" | "label"
+    overlay_heatmap_threshold: float = 0.0
     overlay_show_scores: bool = False
     overlay_show_ids: bool = False
     score_debug_heatmap: bool = False   # debug: no pruning, every frame scored
@@ -261,7 +277,7 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
         if self.token_selection_enabled:
-            valid_grad_methods = {"full_grad", "partial_grad", "attn_only", "transformer_interpretability"}
+            valid_grad_methods = {"full_grad", "partial_grad", "attn_only", "transformer_interpretability", "vla_cache"}
             if self.grad_score_method not in valid_grad_methods:
                 raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
             valid_phi = {"l1", "l2"}
@@ -274,11 +290,21 @@ class PI0Config(PreTrainedConfig):
                 valid_action_agg = {"sum", "max"}
                 if self.grad_action_agg not in valid_action_agg:
                     raise ValueError(f"Invalid grad_action_agg: {self.grad_action_agg}")
-            valid_overlay_modes = {"heatmap", "label"}
+            valid_overlay_modes = {"heatmap", "heatmap_plain", "heatmap_kept_only", "label"}
             if self.overlay_mode not in valid_overlay_modes:
                 raise ValueError(f"Invalid overlay_mode: {self.overlay_mode}")
+            if not 0.0 <= self.overlay_heatmap_threshold <= 1.0:
+                raise ValueError("overlay_heatmap_threshold must be within [0, 1]")
             if self.region_patch_size <= 0:
                 raise ValueError("region_patch_size must be > 0")
+            if self.vla_cache_reuse_tokens < 0:
+                raise ValueError("vla_cache_reuse_tokens must be >= 0")
+            if self.vla_cache_protect_top_tokens < 0:
+                raise ValueError("vla_cache_protect_top_tokens must be >= 0")
+            if not 0.0 <= self.vla_cache_similarity_threshold <= 1.0:
+                raise ValueError("vla_cache_similarity_threshold must be within [0, 1]")
+            if self.vla_cache_growth_factor < 0.0:
+                raise ValueError("vla_cache_growth_factor must be >= 0")
             if self.dynamic_eval_enabled and self.max_eval_interval <= 0:
                 raise ValueError("max_eval_interval must be > 0")
             valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel"}

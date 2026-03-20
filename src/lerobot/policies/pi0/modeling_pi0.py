@@ -30,12 +30,14 @@ from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers.cache_utils import DynamicCache
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
     CONFIG_MAPPING = None
+    DynamicCache = None
     modeling_gemma = None
     GemmaForCausalLM = None
     PaliGemmaForConditionalGeneration = None
@@ -47,14 +49,18 @@ from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.token_selection_utils import (
     TokenSelectionState,
     apply_min_max_constraints,
+    build_layer_reuse_masks,
     build_overlay,
     build_overlay_labels,
+    compute_patch_cosine_similarity,
     compute_relative_deviation,
     compute_region_scores,
+    compute_vla_cache_layer_schedule,
     discard_top_scoring_regions,
     expand_region_mask,
     prune_image_embeddings,
     ratio_to_keep_tokens,
+    select_vla_cache_reuse_tokens,
     sigmoid_ratio,
     split_patch_tokens,
     update_ema_mean_and_var,
@@ -304,6 +310,208 @@ def compute_layer_complete(
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
+
+
+def compute_prefix_layer_full(
+    layer, hidden_states, attention_mask, position_ids, rotary_emb, return_attentions: bool = False
+):
+    normalized_states, gate = layer.input_layernorm(hidden_states, cond=None)
+    input_shape = normalized_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+    query_states = layer.self_attn.q_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+    key_states = layer.self_attn.k_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+    value_states = layer.self_attn.v_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+
+    dummy_tensor = torch.zeros(
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+        layer.self_attn.head_dim,
+        device=hidden_states.device,
+        dtype=query_states.dtype,
+    )
+    cos, sin = rotary_emb(dummy_tensor, position_ids)
+    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+        query_states, key_states, cos, sin, unsqueeze_dim=1
+    )
+
+    att_output, attn_weights = modeling_gemma.eager_attention_forward(
+        layer.self_attn,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        layer.self_attn.scaling,
+    )
+    att_output = att_output.reshape(hidden_states.shape[0], -1, layer.self_attn.o_proj.in_features)
+    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+    att_output = layer.self_attn.o_proj(att_output)
+    att_output = modeling_gemma._gated_residual(hidden_states, att_output, gate)  # noqa: SLF001
+    residual = att_output.clone()
+    att_output, post_gate = layer.post_attention_layernorm(att_output, cond=None)
+    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+        att_output = att_output.to(dtype=torch.bfloat16)
+    att_output = layer.mlp(att_output)
+    output_states = modeling_gemma._gated_residual(residual, att_output, post_gate)  # noqa: SLF001
+    if return_attentions:
+        return output_states, key_states, value_states, attn_weights
+    return output_states, key_states, value_states
+
+
+def compute_prefix_layer_with_reuse(
+    layer,
+    hidden_states,
+    pad_masks,
+    attention_mask,
+    position_ids,
+    rotary_emb,
+    reuse_mask,
+    prev_layer_output,
+    prev_key_states,
+    prev_value_states,
+    return_attentions: bool = False,
+):
+    if return_attentions:
+        outputs, key_states, value_states, attn_weights = compute_prefix_layer_full(
+            layer, hidden_states, attention_mask, position_ids, rotary_emb, return_attentions=True
+        )
+    else:
+        outputs, key_states, value_states = compute_prefix_layer_full(
+            layer, hidden_states, attention_mask, position_ids, rotary_emb
+        )
+    if (
+        reuse_mask is None
+        or prev_layer_output is None
+        or prev_key_states is None
+        or prev_value_states is None
+        or not bool(reuse_mask.any().item())
+    ):
+        if return_attentions:
+            return outputs, key_states, value_states, attn_weights
+        return outputs, key_states, value_states
+
+    batch_reuse_mask = reuse_mask & pad_masks
+    if bool(batch_reuse_mask.any().item()):
+        outputs = outputs.clone()
+        key_states = key_states.clone()
+        value_states = value_states.clone()
+        outputs[batch_reuse_mask] = prev_layer_output[batch_reuse_mask].to(outputs.dtype)
+        key_states = torch.where(
+            batch_reuse_mask[:, None, :, None],
+            prev_key_states.to(key_states.dtype),
+            key_states,
+        )
+        value_states = torch.where(
+            batch_reuse_mask[:, None, :, None],
+            prev_value_states.to(value_states.dtype),
+            value_states,
+        )
+    if return_attentions:
+        return outputs, key_states, value_states, attn_weights
+    return outputs, key_states, value_states
+
+
+def build_prefix_cache_with_reuse(
+    paligemma,
+    prefix_embs,
+    prefix_pad_masks,
+    prefix_att_masks,
+    layer_reuse_masks=None,
+    prev_layer_outputs=None,
+    prev_past_key_values=None,
+    return_attentions: bool = False,
+):
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    attention_mask = torch.where(
+        prefix_att_2d_masks[:, None, :, :],
+        0.0,
+        OPENPI_ATTENTION_MASK_VALUE,
+    )
+
+    rotary_emb = paligemma.model.language_model.rotary_emb
+    hidden_states = prefix_embs
+    layer_outputs = []
+    past_key_values = []
+    layer_attentions = [] if return_attentions else None
+    for layer_idx, layer in enumerate(paligemma.language_model.layers):
+        reuse_mask = None if layer_reuse_masks is None else layer_reuse_masks[layer_idx]
+        prev_output = None if prev_layer_outputs is None else prev_layer_outputs[layer_idx]
+        prev_keys = None
+        prev_values = None
+        if prev_past_key_values is not None:
+            prev_keys, prev_values = prev_past_key_values[layer_idx]
+
+        if return_attentions:
+            hidden_states, key_states, value_states, attn_weights = compute_prefix_layer_with_reuse(
+                layer=layer,
+                hidden_states=hidden_states,
+                pad_masks=prefix_pad_masks,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=rotary_emb,
+                reuse_mask=reuse_mask,
+                prev_layer_output=prev_output,
+                prev_key_states=prev_keys,
+                prev_value_states=prev_values,
+                return_attentions=True,
+            )
+            layer_attentions.append(attn_weights)
+        else:
+            hidden_states, key_states, value_states = compute_prefix_layer_with_reuse(
+                layer=layer,
+                hidden_states=hidden_states,
+                pad_masks=prefix_pad_masks,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                rotary_emb=rotary_emb,
+                reuse_mask=reuse_mask,
+                prev_layer_output=prev_output,
+                prev_key_states=prev_keys,
+                prev_value_states=prev_values,
+            )
+        layer_outputs.append(hidden_states)
+        past_key_values.append((key_states, value_states))
+
+    legacy_cache = tuple(past_key_values)
+    if DynamicCache is None:
+        cache = legacy_cache
+    else:
+        cache = DynamicCache.from_legacy_cache(legacy_cache)
+    if return_attentions:
+        return cache, layer_outputs, tuple(layer_attentions)
+    return cache, layer_outputs
+
+
+def aggregate_prefix_text_attention_scores(metas, lang_masks, prefix_attentions):
+    if prefix_attentions is None or len(prefix_attentions) == 0:
+        return None
+
+    attn_weights = prefix_attentions[-1]
+    if attn_weights.dim() != 4:
+        return None
+    attn_map = attn_weights.float().mean(dim=1)
+    lang_start = sum(meta.num_extra_tokens + meta.num_patches for meta in metas)
+    lang_end = min(lang_start + lang_masks.shape[1], attn_map.shape[1])
+    if lang_end <= lang_start:
+        return None
+    valid_lang = lang_masks[:, : lang_end - lang_start].bool()
+    if not bool(valid_lang.any().item()):
+        return None
+    score_tokens = []
+    offset = 0
+    for meta in metas:
+        vis_start = offset + meta.num_extra_tokens
+        vis_end = min(vis_start + meta.num_patches, attn_map.shape[2])
+        scores = attn_map.new_zeros((attn_map.shape[0], meta.num_patches))
+        if vis_end > vis_start:
+            relation = attn_map[:, lang_start:lang_end, vis_start:vis_end]
+            weights = valid_lang[:, : relation.shape[1]].to(relation.dtype)
+            denom = weights.sum(dim=1, keepdim=True).clamp(min=1.0)
+            scores[:, : relation.shape[2]] = (relation * weights.unsqueeze(-1)).sum(dim=1) / denom
+        score_tokens.append(scores)
+        offset += meta.num_extra_tokens + meta.num_patches
+    return score_tokens
 
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
@@ -988,6 +1196,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             eval_frame = True  # debug heatmap: evaluate every frame
         else:
             eval_frame = token_state.frame_idx % eval_interval == 0
+        if cfg.grad_score_method == "vla_cache":
+            eval_frame = True
 
         with torch.no_grad():
             image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
@@ -1038,6 +1248,59 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=True,
             )
             return past_key_values
+
+        def compute_vla_cache_prefix_cache(
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            selected_prefix_scores=None,
+            always_reuse_mask=None,
+        ):
+            prev_layer_outputs = token_state.last_prefix_layer_outputs
+            prev_past_key_values = token_state.last_prefix_past_key_values
+            layer_reuse_masks = None
+            num_layers = len(self.paligemma_with_expert.paligemma.language_model.layers)
+
+            can_reuse = (
+                selected_prefix_scores is not None
+                and always_reuse_mask is not None
+                and prev_layer_outputs is not None
+                and prev_past_key_values is not None
+                and len(prev_layer_outputs) == num_layers
+                and len(prev_past_key_values) == num_layers
+            )
+            if can_reuse:
+                layer_schedule = compute_vla_cache_layer_schedule(
+                    token_state.last_vla_cache_attentions or [],
+                    apply_weighted_growth=cfg.vla_cache_apply_layer_schedule,
+                    growth_factor=cfg.vla_cache_growth_factor,
+                )
+                if layer_schedule is None:
+                    layer_schedule = torch.ones(num_layers, device=prefix_embs.device)
+                elif layer_schedule.numel() < num_layers:
+                    pad_value = layer_schedule[-1] if layer_schedule.numel() > 0 else torch.tensor(
+                        1.0, device=prefix_embs.device
+                    )
+                    pad = pad_value.expand(num_layers - layer_schedule.numel())
+                    layer_schedule = torch.cat([layer_schedule, pad], dim=0)
+                elif layer_schedule.numel() > num_layers:
+                    layer_schedule = layer_schedule[:num_layers]
+                layer_reuse_masks = build_layer_reuse_masks(
+                    selected_scores=selected_prefix_scores,
+                    always_reuse_mask=always_reuse_mask,
+                    layer_schedule=layer_schedule,
+                )
+
+            return build_prefix_cache_with_reuse(
+                paligemma=self.paligemma_with_expert.paligemma,
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_att_masks=prefix_att_masks,
+                layer_reuse_masks=layer_reuse_masks,
+                prev_layer_outputs=prev_layer_outputs if can_reuse else None,
+                prev_past_key_values=prev_past_key_values if can_reuse else None,
+                return_attentions=True,
+            )
 
         def run_diffusion(
             prefix_pad_masks,
@@ -1115,9 +1378,133 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         actions = None
         prefix_pad_masks = None
         last_attn = None
+        vla_cache_reuse_masks = None
 
         if eval_frame:
-            if cfg.grad_score_method == "transformer_interpretability":
+            if cfg.grad_score_method == "vla_cache":
+                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+
+                prefix_len = prefix_embs.shape[1]
+                visual_selected_scores = prefix_embs.new_full((bsize, prefix_len), -float("inf"), dtype=torch.float32)
+                always_reuse_mask = torch.zeros(bsize, prefix_len, dtype=torch.bool, device=device)
+                camera_reuse_masks = []
+
+                num_prefix_layers = len(self.paligemma_with_expert.paligemma.language_model.layers)
+                reuse_block_reason = "ready"
+                if cfg.vla_cache_reuse_tokens <= 0:
+                    reuse_block_reason = "reuse0"
+                    can_reuse_from_prev = False
+                elif token_state.last_vla_cache_images is None:
+                    reuse_block_reason = "cold"
+                    can_reuse_from_prev = False
+                elif len(token_state.last_vla_cache_images) != len(images):
+                    reuse_block_reason = "cam_mismatch"
+                    can_reuse_from_prev = False
+                elif token_state.last_prefix_layer_outputs is None:
+                    reuse_block_reason = "no_prefix_out"
+                    can_reuse_from_prev = False
+                elif token_state.last_prefix_past_key_values is None:
+                    reuse_block_reason = "no_kv"
+                    can_reuse_from_prev = False
+                elif len(token_state.last_prefix_layer_outputs) != num_prefix_layers:
+                    reuse_block_reason = "layer_out_mismatch"
+                    can_reuse_from_prev = False
+                elif len(token_state.last_prefix_past_key_values) != num_prefix_layers:
+                    reuse_block_reason = "kv_layers_mismatch"
+                    can_reuse_from_prev = False
+                elif token_state.last_prefix_layer_outputs[0].shape != prefix_embs.shape:
+                    reuse_block_reason = "prefix_shape"
+                    can_reuse_from_prev = False
+                elif token_state.last_prefix_past_key_values[0][0].shape[0] != bsize:
+                    reuse_block_reason = "batch_shape"
+                    can_reuse_from_prev = False
+                else:
+                    can_reuse_from_prev = True
+
+                similarity_max = None
+                similarity_above_threshold = 0
+                similarity_total = 0
+
+                prefix_offset = 0
+                for idx, meta in enumerate(metas):
+                    vis_start = prefix_offset + meta.num_extra_tokens
+                    vis_end = vis_start + meta.num_patches
+                    reuse_mask = torch.zeros(bsize, meta.num_patches, dtype=torch.bool, device=device)
+                    selected_scores = torch.full(
+                        (bsize, meta.num_patches),
+                        -float("inf"),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if (
+                        can_reuse_from_prev
+                        and token_state.last_vla_cache_images[idx].shape == images[idx].shape
+                    ):
+                        similarity_scores = compute_patch_cosine_similarity(
+                            images[idx],
+                            token_state.last_vla_cache_images[idx],
+                            meta.patches_per_side,
+                        )
+                        prev_attention_scores = None
+                        if (
+                            token_state.last_vla_cache_attention_scores is not None
+                            and len(token_state.last_vla_cache_attention_scores) > idx
+                            and token_state.last_vla_cache_attention_scores[idx].shape == similarity_scores.shape
+                        ):
+                            prev_attention_scores = token_state.last_vla_cache_attention_scores[idx]
+                        valid_patch_mask = img_masks[idx][:, None].expand_as(similarity_scores)
+                        valid_similarity = similarity_scores[valid_patch_mask]
+                        if valid_similarity.numel() > 0:
+                            cam_sim_max = float(valid_similarity.max().item())
+                            similarity_max = cam_sim_max if similarity_max is None else max(similarity_max, cam_sim_max)
+                            similarity_above_threshold += int(
+                                (valid_similarity >= cfg.vla_cache_similarity_threshold).sum().item()
+                            )
+                            similarity_total += int(valid_similarity.numel())
+                        reuse_mask, selected_scores = select_vla_cache_reuse_tokens(
+                            similarity_scores=similarity_scores,
+                            valid_mask=valid_patch_mask,
+                            reuse_tokens=cfg.vla_cache_reuse_tokens,
+                            similarity_threshold=cfg.vla_cache_similarity_threshold,
+                            protected_scores=prev_attention_scores,
+                            protect_top_tokens=cfg.vla_cache_protect_top_tokens,
+                        )
+
+                    visual_selected_scores[:, vis_start:vis_end] = selected_scores
+                    camera_reuse_masks.append(reuse_mask)
+                    prefix_offset += meta.num_extra_tokens + meta.num_patches
+
+                past_key_values, prefix_layer_outputs, prefix_attentions = compute_vla_cache_prefix_cache(
+                    prefix_embs=prefix_embs,
+                    prefix_pad_masks=prefix_pad_masks,
+                    prefix_att_masks=prefix_att_masks,
+                    selected_prefix_scores=visual_selected_scores if can_reuse_from_prev else None,
+                    always_reuse_mask=always_reuse_mask if can_reuse_from_prev else None,
+                )
+                actions, _, _ = run_diffusion(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    capture_attn=False,
+                )
+                actions = actions.detach()
+                score_tokens = aggregate_prefix_text_attention_scores(metas, lang_masks, prefix_attentions)
+                if score_tokens is None:
+                    score_tokens = token_norms
+
+                token_state.last_vla_cache_images = [img.detach().clone() for img in images]
+                token_state.last_vla_cache_attention_scores = [score.detach() for score in score_tokens]
+                token_state.last_vla_cache_attentions = (
+                    [att.detach() for att in prefix_attentions] if prefix_attentions is not None else None
+                )
+                token_state.last_prefix_layer_outputs = [out.detach() for out in prefix_layer_outputs]
+                token_state.last_prefix_past_key_values = [
+                    (key.detach(), value.detach()) for key, value in past_key_values
+                ]
+                token_state.last_lang_tokens = lang_tokens.detach().clone()
+                token_state.last_lang_masks = lang_masks.detach().clone()
+                token_state.last_vla_cache_reuse_masks = [mask.detach() for mask in camera_reuse_masks]
+                vla_cache_reuse_masks = camera_reuse_masks
+            elif cfg.grad_score_method == "transformer_interpretability":
                 # ── Gradient-Weighted Attention (GradxAttn) ───────────────
                 # For each scored denoise step:
                 #   1. Forward with x_t.requires_grad_(True).
@@ -1595,7 +1982,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # ── Build normalised heatmap grids for debug visualisation ──────────
         heatmap_grids = []
-        if cfg.score_debug_heatmap or cfg.overlay_mode == "heatmap":
+        if cfg.score_debug_heatmap or cfg.overlay_mode in {"heatmap", "heatmap_plain", "heatmap_kept_only"}:
             for idx, sr in enumerate(score_regions):
                 meta = metas[idx]
                 rps = meta.patches_per_side // cfg.region_patch_size
@@ -1675,6 +2062,27 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             ]
         else:
             token_state.last_keep_grid = None
+        if cfg.overlay_mode == "heatmap_kept_only" and keep_token_masks:
+            token_state.last_heatmap_mask_grid = [
+                m.detach().view(bsize, metas[i].patches_per_side, metas[i].patches_per_side)
+                for i, m in enumerate(keep_token_masks)
+            ]
+            token_state.last_heatmap_mask_mode = "keep_only"
+        elif cfg.grad_score_method == "vla_cache" and vla_cache_reuse_masks is not None:
+            token_state.last_heatmap_mask_grid = [
+                m.detach().view(bsize, metas[i].patches_per_side, metas[i].patches_per_side)
+                for i, m in enumerate(vla_cache_reuse_masks)
+            ]
+            token_state.last_heatmap_mask_mode = "reused"
+        elif keep_token_masks:
+            token_state.last_heatmap_mask_grid = [
+                m.detach().view(bsize, metas[i].patches_per_side, metas[i].patches_per_side)
+                for i, m in enumerate(keep_token_masks)
+            ]
+            token_state.last_heatmap_mask_mode = "pruned"
+        else:
+            token_state.last_heatmap_mask_grid = None
+            token_state.last_heatmap_mask_mode = None
 
         if eval_frame:
             token_state.eval_frame_count += 1
@@ -1684,26 +2092,50 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Only count tokens from *valid* images (img_masks=True); placeholder
             # images (missing cameras) have img_mask=False and should not inflate
             # the total count or appear as "pruned" tokens.
-            _valid_masks = [
-                m for m, im in zip(keep_token_masks, img_masks)
-                if im.any()
-            ] if keep_token_masks else []
-            _marked_n = sum(int(m.sum().item()) for m in _valid_masks)
-            _total_n = sum(m.shape[-1] for m in _valid_masks)
-            if cfg.token_prune_enabled and not eval_frame:
-                _actual_kept = _marked_n
+            if cfg.grad_score_method == "vla_cache" and vla_cache_reuse_masks is not None:
+                _valid_reuse_pairs = [
+                    (mask, im) for mask, im in zip(vla_cache_reuse_masks, img_masks, strict=True) if im.any()
+                ]
+                _reuse_total = sum(int(im.sum().item()) * mask.shape[-1] for mask, im in _valid_reuse_pairs)
+                _reuse_kept = sum(int(mask[im.bool()].sum().item()) for mask, im in _valid_reuse_pairs)
+                _reuse_pct = (100.0 * _reuse_kept / _reuse_total) if _reuse_total > 0 else 0.0
+                token_state.total_reused += _reuse_kept
+                token_state.total_reusable += _reuse_total
+                _avg_reuse_pct = (
+                    100.0 * token_state.total_reused / token_state.total_reusable
+                    if token_state.total_reusable > 0
+                    else 0.0
+                )
+                token_state.last_stats = {
+                    "method": "vla_cache",
+                    "cache": reuse_block_reason if not can_reuse_from_prev else "on",
+                    "reuse": f"{_reuse_kept}/{_reuse_total}",
+                    "reuse%": f"{_reuse_pct:.1f}%",
+                    "avg_reuse%": f"{_avg_reuse_pct:.1f}%",
+                }
+                if similarity_max is not None:
+                    token_state.last_stats["sim_max"] = f"{similarity_max:.4f}"
+                    token_state.last_stats["sim>=thr"] = f"{similarity_above_threshold}/{similarity_total}"
             else:
-                _actual_kept = _total_n
-            _prune_pct = (1.0 - _actual_kept / _total_n) * 100.0 if _total_n > 0 else 0.0
-            # Accumulate for per-episode average pruning ratio
-            token_state.total_kept += _actual_kept
-            token_state.total_possible += _total_n
-            token_state.last_stats = {
-                "interval": f"{eval_interval}f",
-                "kept": f"{_actual_kept}/{_total_n}",
-                "prune": f"{_prune_pct:.1f}%",
-                "eval": "Y" if eval_frame else "N",
-            }
+                _valid_masks = [
+                    m for m, im in zip(keep_token_masks, img_masks, strict=True)
+                    if im.any()
+                ] if keep_token_masks else []
+                _marked_n = sum(int(m.sum().item()) for m in _valid_masks)
+                _total_n = sum(m.shape[-1] for m in _valid_masks)
+                if cfg.token_prune_enabled and not eval_frame:
+                    _actual_kept = _marked_n
+                else:
+                    _actual_kept = _total_n
+                _prune_pct = (1.0 - _actual_kept / _total_n) * 100.0 if _total_n > 0 else 0.0
+                token_state.total_kept += _actual_kept
+                token_state.total_possible += _total_n
+                token_state.last_stats = {
+                    "interval": f"{eval_interval}f",
+                    "kept": f"{_actual_kept}/{_total_n}",
+                    "prune": f"{_prune_pct:.1f}%",
+                    "eval": "Y" if eval_frame else "N",
+                }
 
         _need_l1 = (cfg.interp_plot_actions_l1
                      or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel"))
@@ -2078,7 +2510,7 @@ class PI0Policy(PreTrainedPolicy):
         if hasattr(self, "model"):
             self.model.reset_token_selection_state()
 
-    def get_token_selection_state(self) -> dict[str, Tensor] | None:
+    def get_token_selection_state(self) -> dict[str, Tensor | str] | None:
         if not hasattr(self, "model") or not hasattr(self.model, "_token_selection_state"):
             return None
         state = self.model._token_selection_state
@@ -2105,12 +2537,18 @@ class PI0Policy(PreTrainedPolicy):
         if state.last_keep_grid:
             keep_grid = torch.stack(state.last_keep_grid, dim=0)
 
+        heatmap_mask_grid = None
+        if state.last_heatmap_mask_grid:
+            heatmap_mask_grid = torch.stack(state.last_heatmap_mask_grid, dim=0)
+
         return {
             "last_overlay_grid": overlay_grid,
             "last_token_scores": token_scores,
             "last_region_scores": region_scores,
             "last_heatmap_grid": heatmap_grid,
             "last_keep_grid": keep_grid,
+            "last_heatmap_mask_grid": heatmap_mask_grid,
+            "last_heatmap_mask_mode": state.last_heatmap_mask_mode,
         }
 
     def init_rtc_processor(self):

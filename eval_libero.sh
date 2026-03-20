@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR="./outputs/eval/accel_opt-mid-restore-64-128_10"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
+OUTPUT_DIR="./outputs/figure/vla-cache_10_kept_only"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
 POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_TYPE="pi05"
 N_ACTION_STEPS=10 # available action chunk
@@ -14,9 +14,9 @@ ENV_TYPE="libero"
 # ENV_TASK="libero_spatial, libero_object, libero_goal, libero_10"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 ENV_TASK="libero_10"
-ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
-EVAL_BATCH_SIZE=2
-EVAL_N_EPISODES=50
+ENV_TASK_ID="[2]"
+EVAL_BATCH_SIZE=1
+EVAL_N_EPISODES=5
 MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s
 
 USE_L1_REGRESSION=false
@@ -29,8 +29,8 @@ TOKEN_PRUNE_ENABLED=true
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
-GRAD_SCORE_METHOD="transformer_interpretability"
-# transformer_interpretability | attn_only
+GRAD_SCORE_METHOD="vla_cache"
+# transformer_interpretability | attn_only | vla_cache
 
 # -- transformer_interpretability --
 INTERP_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
@@ -50,6 +50,18 @@ GRAD_ACTION_AGG="max"              # sum | max
 # -- General scoring --
 GRAD_REGION_EMA=0.0                # EMA smoothing (0=none)
 GRAD_KEEP_PREV=false
+
+# -- vla_cache --
+# OpenVLA-OFT dual-camera reference defaults from the original VLA-Cache repo.
+# Current pi+LIBERO eval uses two image streams (`image` + `image2`), so we
+# align to the dual-camera branch here:
+#   stable patch top_k = 150 per camera, task-relevant top_k = 100 per camera
+# Single-camera OpenVLA reference would be 130 / 120 instead.
+VLA_CACHE_REUSE_TOKENS=150         # per-image stable patch candidates
+VLA_CACHE_PROTECT_TOP_TOKENS=100   # top task-relevant tokens never reused
+VLA_CACHE_SIMILARITY_THRESHOLD=0.996
+VLA_CACHE_APPLY_LAYER_SCHEDULE=true
+VLA_CACHE_GROWTH_FACTOR=0.55
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Pruning Ratio
@@ -87,13 +99,25 @@ REGION_EVAL_INTERVAL=2
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Overlay / Visualization
-#    "heatmap" — continuous jet colormap; pruned regions darkened+hatched
-#    "label"   — discrete 5-color overlay
+#    "heatmap"       — continuous jet colormap with hatch marks
+#    "heatmap_plain" — continuous jet colormap without hatch marks
+#    "heatmap_kept_only" — continuous jet colormap on final kept regions only
+#    "label"         — discrete 5-color overlay
 # ══════════════════════════════════════════════════════════════════════════════
-OVERLAY_MODE="heatmap"             # "heatmap" | "label"
+OVERLAY_MODE="heatmap_kept_only"             # "heatmap" | "heatmap_plain" | "heatmap_kept_only" | "label"
+OVERLAY_HEATMAP_THRESHOLD=0.2      # 0.0 = show all; higher = hide more low-score blue
 OVERLAY_SHOW_SCORES=false
 OVERLAY_SHOW_IDS=false
 SCORE_DEBUG_HEATMAP=false          # debug: no pruning, every frame scored
+
+if [ "${GRAD_SCORE_METHOD}" = "vla_cache" ]; then
+  TOKEN_PRUNE_ENABLED=false
+  REGION_EVAL_INTERVAL=1
+  # VLA-Cache is trajectory-temporal reuse. Batch size 1 matches the
+  # reference single-rollout inference flow and avoids one env reset/finish
+  # invalidating reuse for the whole batched tensor.
+  EVAL_BATCH_SIZE=1
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Logging / Debug
@@ -127,6 +151,11 @@ ARGS=(
   "--policy.grad_action_agg=${GRAD_ACTION_AGG}"
   "--policy.grad_region_ema=${GRAD_REGION_EMA}"
   "--policy.grad_keep_prev=${GRAD_KEEP_PREV}"
+  "--policy.vla_cache_reuse_tokens=${VLA_CACHE_REUSE_TOKENS}"
+  "--policy.vla_cache_protect_top_tokens=${VLA_CACHE_PROTECT_TOP_TOKENS}"
+  "--policy.vla_cache_similarity_threshold=${VLA_CACHE_SIMILARITY_THRESHOLD}"
+  "--policy.vla_cache_apply_layer_schedule=${VLA_CACHE_APPLY_LAYER_SCHEDULE}"
+  "--policy.vla_cache_growth_factor=${VLA_CACHE_GROWTH_FACTOR}"
   # 2. Pruning Ratio
   "--policy.min_kept_tokens=${MIN_KEPT_TOKENS}"
   "--policy.max_kept_tokens=${MAX_KEPT_TOKENS}"
@@ -145,6 +174,7 @@ ARGS=(
   "--policy.region_eval_interval=${REGION_EVAL_INTERVAL}"
   # 4. Overlay
   "--policy.overlay_mode=${OVERLAY_MODE}"
+  "--policy.overlay_heatmap_threshold=${OVERLAY_HEATMAP_THRESHOLD}"
   "--policy.overlay_show_scores=${OVERLAY_SHOW_SCORES}"
   "--policy.overlay_show_ids=${OVERLAY_SHOW_IDS}"
   "--policy.score_debug_heatmap=${SCORE_DEBUG_HEATMAP}"

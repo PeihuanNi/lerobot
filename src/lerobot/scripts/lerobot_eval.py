@@ -110,14 +110,14 @@ def _to_numpy(value):
 
 def _extract_overlay_state(policy: PreTrainedPolicy):
     if not hasattr(policy, "get_token_selection_state"):
-        return None, None, None, None
+        return None, None, None, None, None
     state = policy.get_token_selection_state()
     if state is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     overlay_grid = _to_numpy(state.get("last_overlay_grid"))
     if overlay_grid is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     if overlay_grid.ndim == 4:
         overlay_grid = overlay_grid[0]
@@ -126,7 +126,7 @@ def _extract_overlay_state(policy: PreTrainedPolicy):
     elif overlay_grid.ndim == 2:
         overlay_grid = overlay_grid[None, ...]
     else:
-        return None, None, None, None
+        return None, None, None, None, None
 
     token_scores = _to_numpy(state.get("last_token_scores"))
     if token_scores is not None:
@@ -173,33 +173,51 @@ def _extract_overlay_state(policy: PreTrainedPolicy):
     heatmap_grid_out = _to_numpy(state.get("last_heatmap_grid"))
     if heatmap_grid_out is not None:
         # Shape from torch.stack: [num_cameras, B, H, W]
-        # We want [num_cameras, H, W] (take batch=0)
+        # Video rendering uses the main render camera (`image`), so select the
+        # first camera and preserve the env batch dimension: [B, H, W].
         if heatmap_grid_out.ndim == 4:
-            heatmap_grid_out = heatmap_grid_out[:, 0]
+            heatmap_grid_out = heatmap_grid_out[0]
         elif heatmap_grid_out.ndim == 2:
             heatmap_grid_out = heatmap_grid_out[None, ...]
 
-    keep_grid_out = _to_numpy(state.get("last_keep_grid"))
-    if keep_grid_out is not None:
-        if keep_grid_out.ndim == 4:
-            keep_grid_out = keep_grid_out[:, 0]  # [num_cameras, H, W]
-        elif keep_grid_out.ndim == 2:
-            keep_grid_out = keep_grid_out[None, ...]
+    heatmap_mask_grid_out = _to_numpy(state.get("last_heatmap_mask_grid"))
+    if heatmap_mask_grid_out is not None:
+        if heatmap_mask_grid_out.ndim == 4:
+            heatmap_mask_grid_out = heatmap_mask_grid_out[0]  # [B, H, W]
+        elif heatmap_mask_grid_out.ndim == 2:
+            heatmap_mask_grid_out = heatmap_mask_grid_out[None, ...]
 
-    return overlay_grid.astype(np.uint8), region_scores, heatmap_grid_out, keep_grid_out
+    return (
+        overlay_grid.astype(np.uint8),
+        region_scores,
+        heatmap_grid_out,
+        heatmap_mask_grid_out,
+        state.get("last_heatmap_mask_mode"),
+    )
 
 
-def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
-                          keep_grid=None, prune_darken=0.5, prune_stripe_gap=4):
+def _apply_heatmap_overlay(
+    img,
+    heatmap_grid,
+    region_scores=None,
+    alpha=0.5,
+    heatmap_threshold: float = 0.0,
+    mask_grid=None,
+    mask_mode="pruned",
+    prune_darken=0.5,
+    prune_stripe_gap=4,
+    plain_style: bool = False,
+):
     """Overlay a continuous heatmap (blue→red) on *img* based on *heatmap_grid*.
 
     Args:
         heatmap_grid: float [H_region, W_region] in [0, 1].
-        keep_grid:    bool/uint8 [H_region, W_region] (optional).
-                      True/1 = kept, False/0 = pruned.
-                      When provided, pruned regions are darkened and overlaid
-                      with diagonal stripe hatching so you can clearly see which
-                      tokens were pruned while still reading the heatmap colour.
+        mask_grid:    bool/uint8 [H_region, W_region] (optional).
+                      For `mask_mode="pruned"`: True/1 = kept, False/0 = pruned.
+                      For `mask_mode="reused"`: True/1 = reused, False/0 = recomputed.
+                      For `mask_mode="keep_only"`: True/1 = finally kept, False/0 = original image.
+                      When provided, the mask is used to darken, hatch, or hide
+                      regions depending on `mask_mode`.
         prune_darken: brightness multiplier for pruned regions (0=black, 1=no change).
         prune_stripe_gap: pixel spacing of diagonal hatching lines.
     """
@@ -214,7 +232,9 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
     img_np = img.astype(np.uint8, copy=False)
     height, width = img_np.shape[:2]
 
-    # Upsample heatmap to image resolution (nearest for sharp region boundaries)
+    # Upsample heatmap to image resolution. `heatmap_plain` still keeps discrete
+    # patch boundaries; it only removes hatch marks and uses continuous score
+    # colours across cells.
     hm_h, hm_w = heatmap_grid.shape
     hm_img = Image.fromarray(heatmap_grid.astype(np.float32), mode="F")
     hm_up = np.array(hm_img.resize((width, height), resample=Image.NEAREST))
@@ -226,29 +246,43 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
         b = np.clip(1.5 - np.abs(v - 0.25) * 4.0, 0.0, 1.0)
         return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
-    heat_rgb = _jet_colormap(hm_up)
-    blended = (img_np.astype(np.float32) * (1.0 - alpha)
-               + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+    hm_vis = np.clip(hm_up, 0.0, 1.0)
+    heat_source = hm_vis if plain_style else np.clip(hm_up, 0.0, 1.0)
+    heat_rgb = _jet_colormap(heat_source)
+    heat_blended = (img_np.astype(np.float32) * (1.0 - alpha)
+                    + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+    if heatmap_threshold > 0.0:
+        heatmap_active_mask = hm_vis >= heatmap_threshold
+        blended = img_np.copy()
+        blended[heatmap_active_mask] = heat_blended[heatmap_active_mask]
+    else:
+        heatmap_active_mask = np.ones((height, width), dtype=bool)
+        blended = heat_blended
 
-    # ── Mark pruned regions: darken + diagonal stripe hatching ────────────
-    if keep_grid is not None:
-        kg_arr = keep_grid.astype(np.uint8) if keep_grid.dtype != np.uint8 else keep_grid
-        kg_img = Image.fromarray(kg_arr, mode='L').resize((width, height), resample=Image.NEAREST)
-        kg_up = np.array(kg_img)
-        pruned_mask = (kg_up == 0)  # True where pruned (keep=0)
+    # ── Apply the optional mask: pruning mode darkens pruned areas, reuse mode
+    # hatches reused areas, keep-only mode restores non-kept regions to the
+    # original image and only overlays colours on the final kept regions. ──
+    if mask_grid is not None:
+        mask_arr = mask_grid.astype(np.uint8) if mask_grid.dtype != np.uint8 else mask_grid
+        mask_img = Image.fromarray(mask_arr, mode="L").resize((width, height), resample=Image.NEAREST)
+        mask_up = np.array(mask_img)
+        marked_mask = (mask_up != 0) if mask_mode == "reused" else (mask_up == 0)
+        if mask_mode != "keep_only":
+            marked_mask &= heatmap_active_mask
 
-        # 1) Darken pruned pixels
-        blended_f = blended.astype(np.float32)
-        blended_f[pruned_mask] *= prune_darken
-        blended = blended_f.astype(np.uint8)
+        if mask_mode == "keep_only":
+            blended = blended.copy()
+            blended[marked_mask] = img_np[marked_mask]
+        elif mask_mode != "reused":
+            blended_f = blended.astype(np.float32)
+            blended_f[marked_mask] *= prune_darken
+            blended = blended_f.astype(np.uint8)
 
-        # 2) Diagonal stripe hatching (white, semi-transparent) on pruned regions
-        #    Pattern: pixel (x, y) is on a stripe if (x + y) % gap < gap//3
-        if prune_stripe_gap > 0:
+        if mask_mode != "keep_only" and prune_stripe_gap > 0:
             yy, xx = np.mgrid[:height, :width]
             stripe = ((xx + yy) % prune_stripe_gap) < max(1, prune_stripe_gap // 3)
-            stripe_mask = pruned_mask & stripe
-            # Blend stripe colour (white, 40% opacity) onto the darkened image
+            stripe_mask = marked_mask & stripe
+            # Blend stripe colour (white, 40% opacity) onto the marked image
             blended_f2 = blended.astype(np.float32)
             blended_f2[stripe_mask] = blended_f2[stripe_mask] * 0.6 + 255.0 * 0.4
             blended = blended_f2.astype(np.uint8)
@@ -266,6 +300,13 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
     region_h, region_w = heatmap_grid.shape
     cell_w = width / max(region_w, 1)
     cell_h = height / max(region_h, 1)
+    visible_region_mask = None
+    if heatmap_threshold > 0.0:
+        visible_region_mask = np.clip(heatmap_grid, 0.0, 1.0) >= heatmap_threshold
+    kept_region_mask = None
+    if mask_mode == "keep_only" and mask_grid is not None:
+        keep_region_img = Image.fromarray(mask_arr, mode="L").resize((region_w, region_h), resample=Image.NEAREST)
+        kept_region_mask = np.array(keep_region_img) != 0
     pil_img = Image.fromarray(blended)
     draw = ImageDraw.Draw(pil_img)
     score_font_size = max(7, min(12, int(min(cell_w, cell_h) * 0.38)))
@@ -279,6 +320,10 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
     score_font = _load_font(score_font_size)
     for r in range(region_h):
         for c in range(region_w):
+            if visible_region_mask is not None and not visible_region_mask[r, c]:
+                continue
+            if kept_region_mask is not None and not kept_region_mask[r, c]:
+                continue
             x = int((c + 0.03) * cell_w)
             y = int((r + 0.03) * cell_h)
             score = region_scores[r, c]
@@ -570,7 +615,11 @@ def eval_policy(
 
     overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
     heatmap_debug = bool(getattr(getattr(policy, "config", None), "score_debug_heatmap", False))
-    overlay_heatmap = getattr(getattr(policy, "config", None), "overlay_mode", "label") == "heatmap"
+    overlay_mode = getattr(getattr(policy, "config", None), "overlay_mode", "label")
+    heatmap_threshold = float(getattr(getattr(policy, "config", None), "overlay_heatmap_threshold", 0.0))
+    overlay_heatmap = overlay_mode in {"heatmap", "heatmap_plain", "heatmap_kept_only"}
+    overlay_heatmap_marks = overlay_mode == "heatmap"
+    overlay_heatmap_kept_only = overlay_mode == "heatmap_kept_only"
     show_scores = bool(getattr(getattr(policy, "config", None), "overlay_show_scores", False))
     show_ids = bool(getattr(getattr(policy, "config", None), "overlay_show_ids", False))
     last_overlay_grid = None
@@ -598,9 +647,12 @@ def eval_policy(
         overlay_grid = None
         region_scores = None
         heatmap_grid = None
-        keep_grid = None
+        heatmap_mask_grid = None
+        heatmap_mask_mode = None
         if overlay_enabled:
-            overlay_grid, region_scores, heatmap_grid, keep_grid = _extract_overlay_state(policy)
+            overlay_grid, region_scores, heatmap_grid, heatmap_mask_grid, heatmap_mask_mode = _extract_overlay_state(
+                policy
+            )
             if overlay_grid is not None:
                 last_overlay_grid = overlay_grid
                 last_region_scores = region_scores
@@ -616,10 +668,24 @@ def eval_policy(
                     scores = None
                     if show_scores and region_scores is not None:
                         scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
-                    kg = None
-                    if keep_grid is not None and not heatmap_debug:
-                        kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
-                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                    mg = None
+                    if (
+                        (overlay_heatmap_marks or overlay_heatmap_kept_only)
+                        and heatmap_mask_grid is not None
+                        and not heatmap_debug
+                    ):
+                        mg = heatmap_mask_grid[idx] if idx < heatmap_mask_grid.shape[0] else heatmap_mask_grid[0]
+                    rendered.append(
+                        _apply_heatmap_overlay(
+                            frame,
+                            hm,
+                            scores,
+                            heatmap_threshold=heatmap_threshold,
+                            mask_grid=mg,
+                            mask_mode=heatmap_mask_mode,
+                            plain_style=overlay_mode == "heatmap_plain",
+                        )
+                    )
                 frames = rendered
             elif overlay_grid is not None:
                 rendered = []
@@ -641,10 +707,24 @@ def eval_policy(
                     scores = None
                     if show_scores and region_scores is not None:
                         scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
-                    kg = None
-                    if keep_grid is not None and not heatmap_debug:
-                        kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
-                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                    mg = None
+                    if (
+                        (overlay_heatmap_marks or overlay_heatmap_kept_only)
+                        and heatmap_mask_grid is not None
+                        and not heatmap_debug
+                    ):
+                        mg = heatmap_mask_grid[idx] if idx < heatmap_mask_grid.shape[0] else heatmap_mask_grid[0]
+                    rendered.append(
+                        _apply_heatmap_overlay(
+                            frame,
+                            hm,
+                            scores,
+                            heatmap_threshold=heatmap_threshold,
+                            mask_grid=mg,
+                            mask_mode=heatmap_mask_mode,
+                            plain_style=overlay_mode == "heatmap_plain",
+                        )
+                    )
                 frames = rendered
             elif overlay_grid is not None:
                 rendered = []
@@ -786,8 +866,12 @@ def eval_policy(
         if _ts_final.frame_idx > 0 and _ts_final.eval_frame_count > 0:
             _token_sel_stats["avg_eval_interval"] = round(_ts_final.frame_idx / _ts_final.eval_frame_count, 2)
             _token_sel_stats["eval_rate"] = round(_ts_final.eval_frame_count / _ts_final.frame_idx, 4)
-        # Per-episode average pruning ratio
-        if _ts_final.total_possible > 0:
+        if getattr(_ts_final, "total_reusable", 0) > 0:
+            _avg_reuse = (_ts_final.total_reused / _ts_final.total_reusable) * 100.0
+            _token_sel_stats["avg_reuse_ratio"] = round(_avg_reuse, 2)
+            _token_sel_stats["total_reused"] = _ts_final.total_reused
+            _token_sel_stats["total_reusable"] = _ts_final.total_reusable
+        elif _ts_final.total_possible > 0:
             _avg_prune = (1.0 - _ts_final.total_kept / _ts_final.total_possible) * 100.0
             _token_sel_stats["avg_prune_ratio"] = round(_avg_prune, 2)
             _token_sel_stats["total_kept"] = _ts_final.total_kept
@@ -1188,23 +1272,34 @@ def eval_policy_all(
             _entropies = [t["final_entropy"] for t in ts_list if "final_entropy" in t]
             if _entropies:
                 group_ts["avg_final_entropy"] = round(float(np.mean(_entropies)), 4)
-            # Aggregate pruning ratio across tasks in this group
-            _g_total_kept = sum(t.get("total_kept", 0) for t in ts_list)
-            _g_total_possible = sum(t.get("total_possible", 0) for t in ts_list)
-            if _g_total_possible > 0:
-                group_ts["avg_prune_ratio"] = round((1.0 - _g_total_kept / _g_total_possible) * 100.0, 2)
-                group_ts["total_kept"] = _g_total_kept
-                group_ts["total_possible"] = _g_total_possible
+            _g_total_reused = sum(t.get("total_reused", 0) for t in ts_list)
+            _g_total_reusable = sum(t.get("total_reusable", 0) for t in ts_list)
+            if _g_total_reusable > 0:
+                group_ts["avg_reuse_ratio"] = round((_g_total_reused / _g_total_reusable) * 100.0, 2)
+                group_ts["total_reused"] = _g_total_reused
+                group_ts["total_reusable"] = _g_total_reusable
+            else:
+                _g_total_kept = sum(t.get("total_kept", 0) for t in ts_list)
+                _g_total_possible = sum(t.get("total_possible", 0) for t in ts_list)
+                if _g_total_possible > 0:
+                    group_ts["avg_prune_ratio"] = round((1.0 - _g_total_kept / _g_total_possible) * 100.0, 2)
+                    group_ts["total_kept"] = _g_total_kept
+                    group_ts["total_possible"] = _g_total_possible
             group_agg["token_selection_stats"] = group_ts
             _sr = group_agg.get("pc_success")
             _sr_str = f"{_sr:.1f}%" if _sr is not None and _sr == _sr else "N/A"
+            _efficiency_str = (
+                f"avg_reuse={group_ts.get('avg_reuse_ratio', 'N/A')}%"
+                if "avg_reuse_ratio" in group_ts
+                else f"avg_prune={group_ts.get('avg_prune_ratio', 'N/A')}%"
+            )
             logging.info(
                 f"[{group}] Token selection: frames={_total_frames}, "
                 f"eval_frames={_total_evals}, "
                 f"avg_interval={group_ts.get('avg_eval_interval', 'N/A')}, "
                 f"eval_rate={group_ts.get('eval_rate', 'N/A')}, "
                 f"avg_entropy={group_ts.get('avg_final_entropy', 'N/A')}, "
-                f"avg_prune={group_ts.get('avg_prune_ratio', 'N/A')}%, "
+                f"{_efficiency_str}, "
                 f"success_rate={_sr_str}"
             )
         groups_aggregated[group] = group_agg
