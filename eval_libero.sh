@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR="./outputs/figure/vla-cache_10_kept_only"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
-POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
-POLICY_TYPE="pi05"
+OUTPUT_DIR="./outputs/figure/gradvla-pi0-spatial"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
+POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
+POLICY_TYPE="pi0"
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -13,10 +13,10 @@ LIBGL_ALWAYS_SOFTWARE=""
 ENV_TYPE="libero"
 # ENV_TASK="libero_spatial, libero_object, libero_goal, libero_10"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
-ENV_TASK="libero_10"
-ENV_TASK_ID="[2]"
+ENV_TASK="libero_spatial"
+ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 EVAL_BATCH_SIZE=1
-EVAL_N_EPISODES=5
+EVAL_N_EPISODES=50
 MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s
 
 USE_L1_REGRESSION=false
@@ -29,7 +29,7 @@ TOKEN_PRUNE_ENABLED=true
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
-GRAD_SCORE_METHOD="vla_cache"
+GRAD_SCORE_METHOD="transformer_interpretability"
 # transformer_interpretability | attn_only | vla_cache
 
 # -- transformer_interpretability --
@@ -104,8 +104,8 @@ REGION_EVAL_INTERVAL=2
 #    "heatmap_kept_only" — continuous jet colormap on final kept regions only
 #    "label"         — discrete 5-color overlay
 # ══════════════════════════════════════════════════════════════════════════════
-OVERLAY_MODE="heatmap_kept_only"             # "heatmap" | "heatmap_plain" | "heatmap_kept_only" | "label"
-OVERLAY_HEATMAP_THRESHOLD=0.2      # 0.0 = show all; higher = hide more low-score blue
+OVERLAY_MODE="heatmap"             # "heatmap" | "heatmap_plain" | "heatmap_kept_only" | "label"
+OVERLAY_HEATMAP_THRESHOLD=0.0      # 0.0 = show all; higher = hide more low-score blue
 OVERLAY_SHOW_SCORES=false
 OVERLAY_SHOW_IDS=false
 SCORE_DEBUG_HEATMAP=false          # debug: no pruning, every frame scored
