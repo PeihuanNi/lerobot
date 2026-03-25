@@ -37,6 +37,7 @@ class TokenSelectionState:
     frame_idx: int = 0
     last_score_token: list[Tensor] | None = None
     last_score_region: list[Tensor] | None = None
+    last_semantic_region: list[Tensor] | None = None
     last_important_region: list[Tensor] | None = None
     last_overlay_labels: list[Tensor] | None = None
     last_overlay_grid: list[Tensor] | None = None
@@ -59,6 +60,8 @@ class TokenSelectionState:
     actions_l1_history: list = None  # type: ignore[assignment]
     # Last frame's action L1 norm (used by L1 dynamic prune ratio)
     last_actions_l1: float | None = None
+    last_motion_speeds: Tensor | None = None
+    last_z_trans: Tensor | None = None
     # EMA-smoothed L1 norm (used by "ema" dynamic prune mode)
     ema_l1: float | None = None
     # EMA-tracked L1 mean and variance (used by adaptive EMA threshold)
@@ -84,6 +87,7 @@ class TokenSelectionState:
         self.frame_idx = 0
         self.last_score_token = None
         self.last_score_region = None
+        self.last_semantic_region = None
         self.last_important_region = None
         self.last_overlay_labels = None
         self.last_overlay_grid = None
@@ -97,6 +101,8 @@ class TokenSelectionState:
         self.last_stats = {}
         self.actions_l1_history = []
         self.last_actions_l1 = None
+        self.last_motion_speeds = None
+        self.last_z_trans = None
         self.ema_l1 = None
         self.ema_l1_mean = None
         self.ema_l1_var = 0.0
@@ -188,6 +194,29 @@ def ratio_to_keep_tokens(
     return int(round(min(max(eff, min_kept_tokens), max_kept_tokens)))
 
 
+def compute_velocity_keep_tokens(
+    speeds: Tensor,
+    total_valid_tokens: Tensor,
+    min_kept_tokens: int,
+    max_kept_tokens: int,
+    velocity_min: float,
+    velocity_max: float,
+) -> Tensor:
+    if velocity_max <= velocity_min:
+        raise ValueError("velocity_max must be greater than velocity_min for velocity-aware pruning.")
+
+    speeds = speeds.float()
+    total_valid_tokens = total_valid_tokens.to(device=speeds.device, dtype=torch.float32)
+    retain_ratio = torch.where(
+        speeds < velocity_min,
+        torch.ones_like(speeds),
+        1.0 - (speeds - velocity_min) / (velocity_max - velocity_min),
+    ).clamp(0.0, 1.0)
+    keep_tokens = torch.round(total_valid_tokens * retain_ratio).to(dtype=torch.long)
+    keep_tokens = torch.clamp(keep_tokens, min=min_kept_tokens, max=max_kept_tokens)
+    return keep_tokens
+
+
 def update_ema_mean_and_var(
     value: float,
     mean: float | None,
@@ -202,30 +231,176 @@ def update_ema_mean_and_var(
 
 
 def apply_min_max_constraints(
-    keep_pre: Tensor, score_region: Tensor, min_regions: int, max_regions: int
+    keep_pre: Tensor, score_region: Tensor, min_regions: int | Tensor, max_regions: int | Tensor
 ) -> tuple[Tensor, Tensor]:
     batch_size, num_regions = keep_pre.shape
-    min_regions = max(min_regions, 0)
-    max_regions = min(max_regions, num_regions) if max_regions > 0 else num_regions
+    if torch.is_tensor(min_regions):
+        min_regions_t = min_regions.to(device=keep_pre.device, dtype=torch.long).flatten()
+    else:
+        min_regions_t = torch.full((batch_size,), int(min_regions), device=keep_pre.device, dtype=torch.long)
+    if torch.is_tensor(max_regions):
+        max_regions_t = max_regions.to(device=keep_pre.device, dtype=torch.long).flatten()
+    else:
+        max_regions_t = torch.full((batch_size,), int(max_regions), device=keep_pre.device, dtype=torch.long)
     keep_mask = keep_pre.clone()
     clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
     order = torch.argsort(score_region, dim=-1, descending=True)
     for batch_idx in range(batch_size):
+        min_r = max(int(min_regions_t[batch_idx].item()), 0)
+        max_r = int(max_regions_t[batch_idx].item())
+        max_r = min(max_r, num_regions) if max_r > 0 else num_regions
         keep_count = int(keep_mask[batch_idx].sum().item())
-        if keep_count < min_regions:
-            needed = min_regions - keep_count
+        if keep_count < min_r:
+            needed = min_r - keep_count
             add_indices = [idx for idx in order[batch_idx].tolist() if not keep_mask[batch_idx, idx]][:needed]
             if add_indices:
                 keep_mask[batch_idx, add_indices] = True
         keep_count = int(keep_mask[batch_idx].sum().item())
-        if keep_count > max_regions:
-            top = order[batch_idx, :max_regions]
+        if keep_count > max_r:
+            top = order[batch_idx, :max_r]
             new_keep = torch.zeros_like(keep_mask[batch_idx])
             new_keep[top] = True
             clipped = keep_mask[batch_idx] & ~new_keep
             keep_mask[batch_idx] = new_keep
             clipped_mask[batch_idx] = clipped
     return keep_mask, clipped_mask
+
+
+def apply_min_max_constraints_with_locked(
+    keep_pre: Tensor,
+    locked_keep: Tensor,
+    score_region: Tensor,
+    min_regions: int | Tensor,
+    max_regions: int | Tensor,
+) -> tuple[Tensor, Tensor]:
+    batch_size, num_regions = keep_pre.shape
+    if torch.is_tensor(min_regions):
+        min_regions_t = min_regions.to(device=keep_pre.device, dtype=torch.long).flatten()
+    else:
+        min_regions_t = torch.full((batch_size,), int(min_regions), device=keep_pre.device, dtype=torch.long)
+    if torch.is_tensor(max_regions):
+        max_regions_t = max_regions.to(device=keep_pre.device, dtype=torch.long).flatten()
+    else:
+        max_regions_t = torch.full((batch_size,), int(max_regions), device=keep_pre.device, dtype=torch.long)
+
+    keep_mask = keep_pre.clone()
+    locked_keep = locked_keep.to(dtype=torch.bool)
+    clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
+    order = torch.argsort(score_region, dim=-1, descending=True)
+
+    for batch_idx in range(batch_size):
+        min_r = max(int(min_regions_t[batch_idx].item()), 0)
+        max_r = int(max_regions_t[batch_idx].item())
+        max_r = min(max_r, num_regions) if max_r > 0 else num_regions
+
+        keep_count = int(keep_mask[batch_idx].sum().item())
+        if keep_count < min_r:
+            needed = min_r - keep_count
+            add_indices = [idx for idx in order[batch_idx].tolist() if not keep_mask[batch_idx, idx]][:needed]
+            if add_indices:
+                keep_mask[batch_idx, add_indices] = True
+
+        keep_count = int(keep_mask[batch_idx].sum().item())
+        if keep_count <= max_r:
+            continue
+
+        locked = locked_keep[batch_idx] & keep_mask[batch_idx]
+        locked_count = int(locked.sum().item())
+        if locked_count >= max_r:
+            new_keep = locked
+        else:
+            budget = max_r - locked_count
+            candidates = keep_mask[batch_idx] & ~locked
+            candidate_indices = [idx for idx in order[batch_idx].tolist() if candidates[idx]][:budget]
+            new_keep = locked.clone()
+            if candidate_indices:
+                new_keep[candidate_indices] = True
+        clipped_mask[batch_idx] = keep_mask[batch_idx] & ~new_keep
+        keep_mask[batch_idx] = new_keep
+
+    return keep_mask, clipped_mask
+
+
+def select_regions_by_cumulative_mass(
+    score_region: Tensor,
+    valid_mask: Tensor,
+    mass_threshold: float | Tensor,
+) -> Tensor:
+    batch_size, num_regions = score_region.shape
+    selected = torch.zeros_like(valid_mask, dtype=torch.bool)
+    if torch.is_tensor(mass_threshold):
+        thresholds = mass_threshold.to(device=score_region.device, dtype=torch.float32).flatten()
+        if thresholds.numel() != batch_size:
+            raise ValueError("mass_threshold tensor must have one value per batch element.")
+    else:
+        threshold_value = float(max(min(mass_threshold, 1.0), 0.0))
+        thresholds = torch.full((batch_size,), threshold_value, device=score_region.device, dtype=torch.float32)
+    for batch_idx in range(batch_size):
+        valid_indices = torch.nonzero(valid_mask[batch_idx], as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            continue
+
+        valid_scores = score_region[batch_idx, valid_indices].float().clamp_min(0.0)
+        if valid_scores.sum() <= 1e-8:
+            selected[batch_idx, valid_indices] = True
+            continue
+
+        order = torch.argsort(valid_scores, descending=True)
+        ordered_indices = valid_indices[order]
+        ordered_scores = valid_scores[order]
+        cumulative = torch.cumsum(ordered_scores / ordered_scores.sum(), dim=0)
+        cutoff = torch.nonzero(cumulative >= thresholds[batch_idx].clamp(0.0, 1.0), as_tuple=False)
+        keep_count = int(cutoff[0].item()) + 1 if cutoff.numel() > 0 else len(ordered_indices)
+        selected[batch_idx, ordered_indices[:keep_count]] = True
+    return selected
+
+
+def compute_canny_region_mask(
+    image: Tensor,
+    patches_per_side: int,
+    region_patch_size: int,
+    low_threshold: int,
+    high_threshold: int,
+) -> Tensor:
+    try:
+        import cv2
+    except ImportError:
+        batch_size = image.shape[0]
+        region_side = patches_per_side // region_patch_size
+        return torch.zeros(
+            (batch_size, region_side * region_side),
+            dtype=torch.bool,
+            device=image.device,
+        )
+
+    img = image
+    if img.dim() != 4:
+        raise ValueError("Expected image tensor with shape [B, C, H, W].")
+
+    batch_size, _, height, width = img.shape
+    if height % patches_per_side != 0 or width % patches_per_side != 0:
+        raise ValueError("Image resolution must be divisible by patches_per_side.")
+
+    patch_h = height // patches_per_side
+    patch_w = width // patches_per_side
+    edge_masks = []
+    for batch_idx in range(batch_size):
+        rgb = ((img[batch_idx].permute(1, 2, 0) + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, low_threshold, high_threshold) > 0
+        patch_mask = torch.from_numpy(edges).view(
+            patches_per_side,
+            patch_h,
+            patches_per_side,
+            patch_w,
+        ).any(dim=(1, 3))
+        region_mask = compute_region_scores(
+            patch_mask.reshape(1, -1).to(dtype=torch.float32),
+            patches_per_side,
+            region_patch_size,
+        ) > 0.0
+        edge_masks.append(region_mask.squeeze(0))
+    return torch.stack(edge_masks, dim=0).to(device=image.device)
 
 
 def discard_top_scoring_regions(

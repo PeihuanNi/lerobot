@@ -44,17 +44,28 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+from lerobot.policies.spvla_utils import (
+    SPVLASchedulerState,
+    capture_last_vision_attention_scores,
+    compute_reference_prune_threshold,
+    fit_ridge_action,
+    fit_reference_ridge_action,
+    passes_action_validity_check,
+)
 from lerobot.policies.token_selection_utils import (
     TokenSelectionState,
-    apply_min_max_constraints,
+    apply_min_max_constraints_with_locked,
     build_overlay,
     build_overlay_labels,
+    compute_canny_region_mask,
     compute_relative_deviation,
     compute_region_scores,
+    compute_velocity_keep_tokens,
     discard_top_scoring_regions,
     expand_region_mask,
     prune_image_embeddings,
     ratio_to_keep_tokens,
+    select_regions_by_cumulative_mass,
     sigmoid_ratio,
     split_patch_tokens,
     update_ema_mean_and_var,
@@ -71,6 +82,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    motion_speeds: Tensor | None
+    z_trans: Tensor | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -615,6 +628,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self._plot_episode_idx += 1
             self._token_selection_state.reset()
 
+    def _embed_images_with_spvla_reference_scores(
+        self,
+        images: list[Tensor],
+        eval_frame: bool,
+    ) -> tuple[list[Tensor], list[Tensor] | None]:
+        image_embs: list[Tensor] = []
+        score_tokens: list[Tensor] | None = [] if eval_frame and self.config.spvla_reference_enabled else None
+        for img in images:
+            if score_tokens is None:
+                image_emb = self.paligemma_with_expert.embed_image(img)
+                image_embs.append(image_emb)
+                continue
+
+            image_emb, scores = capture_last_vision_attention_scores(
+                self.paligemma_with_expert.paligemma.vision_tower,
+                lambda _img=img: self.paligemma_with_expert.embed_image(_img),
+            )
+            image_embs.append(image_emb)
+            if scores is None:
+                score_tokens = None
+            else:
+                score_tokens.append(scores)
+
+        return image_embs, score_tokens
+
     def _save_actions_l1_plot(self, state, episode_idx):
         """Save a line chart of the predicted-action L1 norm at each inference frame."""
         import matplotlib
@@ -961,7 +999,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             eval_frame = token_state.frame_idx % eval_interval == 0
 
         with torch.no_grad():
-            image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
+            image_embs, reference_score_tokens = self._embed_images_with_spvla_reference_scores(
+                images,
+                eval_frame,
+            )
 
         patch_embs = []
         metas = []
@@ -969,6 +1010,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             patch_emb, meta = split_patch_tokens(emb)
             patch_embs.append(patch_emb)
             metas.append(meta)
+
+        if reference_score_tokens is not None:
+            normalized_reference_scores = []
+            for idx, score in enumerate(reference_score_tokens):
+                meta = metas[idx]
+                if score.shape[1] == meta.num_patches + meta.num_extra_tokens:
+                    score = score[:, meta.num_extra_tokens :]
+                if score.shape[1] != meta.num_patches:
+                    normalized_reference_scores = None
+                    break
+                normalized_reference_scores.append(score)
+            reference_score_tokens = normalized_reference_scores
 
         if token_state.last_score_token is not None:
             if len(token_state.last_score_token) != len(patch_embs):
@@ -985,6 +1038,40 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             valid_masks.append(img_masks[idx][:, None].expand(bsize, num_regions))
 
         token_norms = [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
+        motion_speeds = kwargs.get("motion_speeds")
+        if motion_speeds is not None:
+            motion_speeds = motion_speeds.to(device=device, dtype=torch.float32).flatten()
+            if motion_speeds.numel() != bsize:
+                raise ValueError("motion_speeds must have one value per batch element.")
+        elif token_state.last_motion_speeds is not None:
+            motion_speeds = token_state.last_motion_speeds.to(device=device, dtype=torch.float32).flatten()
+            if motion_speeds.numel() != bsize:
+                motion_speeds = None
+
+        z_trans = kwargs.get("z_trans")
+        if z_trans is not None:
+            z_trans = z_trans.to(device=device, dtype=torch.float32).flatten()
+            if z_trans.numel() != bsize:
+                raise ValueError("z_trans must have one value per batch element.")
+        elif token_state.last_z_trans is not None:
+            z_trans = token_state.last_z_trans.to(device=device, dtype=torch.float32).flatten()
+            if z_trans.numel() != bsize:
+                z_trans = None
+
+        spatial_region_masks = []
+        for idx, meta in enumerate(metas):
+            if cfg.spatial_edge_enabled:
+                spatial_region_masks.append(
+                    compute_canny_region_mask(
+                        images[idx],
+                        meta.patches_per_side,
+                        cfg.region_patch_size,
+                        cfg.canny_low_threshold,
+                        cfg.canny_high_threshold,
+                    ) & valid_masks[idx]
+                )
+            else:
+                spatial_region_masks.append(torch.zeros_like(valid_masks[idx], dtype=torch.bool))
 
         def build_prefix(image_embs, image_pad_masks=None):
             return self.embed_prefix(
@@ -1086,7 +1173,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         last_attn = None
 
         if eval_frame:
-            if cfg.grad_score_method == "transformer_interpretability":
+            if cfg.spvla_reference_enabled or cfg.grad_score_method == "spvla_reference":
+                score_tokens = reference_score_tokens if reference_score_tokens is not None else token_norms
+            elif cfg.grad_score_method == "transformer_interpretability":
                 # ── Gradient-Weighted Attention (GradxAttn) ───────────────
                 # For each scored denoise step:
                 #   1. Forward with x_t.requires_grad_(True).
@@ -1363,6 +1452,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 score_tokens = token_norms
 
         score_regions = []
+        semantic_regions = []
         important_regions = []
         keep_regions = []
         clipped_regions = []
@@ -1436,6 +1526,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Sub-select valid masks by what is left in the global pool
             _global_mask = token_state.global_active_region_masks[idx]
             valid_masks[idx] = valid_masks[idx] & _global_mask
+            spatial_region_masks[idx] = spatial_region_masks[idx] & valid_masks[idx]
             
             # Mask out discarded tokens from being selected (score=-inf)
             _eff_score_region = torch.where(valid_masks[idx], score_region, torch.full_like(score_region, -float('inf')))
@@ -1445,6 +1536,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 num_p = meta.num_patches
                 pps = meta.patches_per_side
                 score_regions.append(score_region)
+                semantic_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
                 important_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
                 keep_regions.append(torch.ones(bsize, num_r, dtype=torch.bool, device=device))
                 clipped_regions.append(torch.zeros(bsize, num_r, dtype=torch.bool, device=device))
@@ -1454,102 +1546,162 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 continue
 
             # ── 3. Pruning Ratio: select "important" regions ─────────────────
-            def _select_important():
-                # Fixed-count TopK is hardcoded: start from all valid regions,
-                # then apply min/max keep-token constraints below.
-                return valid_masks[idx].clone()
+            def _select_semantic():
+                if cfg.spvla_reference_enabled:
+                    ref_z = z_trans
+                    if ref_z is None:
+                        ref_z = torch.zeros(bsize, device=device, dtype=torch.float32)
+                    return select_regions_by_cumulative_mass(
+                        _eff_score_region,
+                        valid_masks[idx],
+                        compute_reference_prune_threshold(ref_z, cfg.z_thre_prune, cfg.z_min_prune),
+                    )
+                return select_regions_by_cumulative_mass(
+                    _eff_score_region,
+                    valid_masks[idx],
+                    cfg.semantic_score_mass,
+                )
 
             if eval_frame:
-                important_region = _select_important()
-                if cfg.grad_keep_prev and token_state.last_important_region is not None:
-                    # Also prune the previous kept memory against the global mask so we 
-                    # don't accidentally resurrect permanently discarded tokens
-                    _prev_imp = token_state.last_important_region[idx] & valid_masks[idx]
-                    important_region = important_region | _prev_imp
+                semantic_region = _select_semantic()
+                if (not cfg.spvla_reference_enabled) and cfg.grad_keep_prev and token_state.last_semantic_region is not None:
+                    _prev_sem = token_state.last_semantic_region[idx] & valid_masks[idx]
+                    semantic_region = semantic_region | _prev_sem
             else:
-                if token_state.last_important_region is not None:
-                    important_region = token_state.last_important_region[idx] & valid_masks[idx]
+                if token_state.last_semantic_region is not None:
+                    semantic_region = token_state.last_semantic_region[idx] & valid_masks[idx]
                 else:
-                    important_region = _select_important()
+                    semantic_region = _select_semantic()
+            important_region = semantic_region | spatial_region_masks[idx]
+            if (not cfg.spvla_reference_enabled) and cfg.grad_keep_prev and token_state.last_important_region is not None:
+                important_region = important_region | (token_state.last_important_region[idx] & valid_masks[idx])
             keep_pre = important_region & valid_masks[idx]
-            # min/max guardrails: always applied in all pruning modes
-            # ── L1 Dynamic Prune Ratio: select effective min/max based on
-            #    previous frame's action L1 norm ──
-            if cfg.dynamic_prune_mode == "l1_threshold":
-                _prev_l1 = token_state.last_actions_l1
-                if _prev_l1 is not None and _prev_l1 > cfg.l1_dynamic_prune_threshold:
-                    # High L1 → aggressive pruning (fewer tokens kept)
-                    _eff_min = cfg.min_kept_tokens
-                    _eff_max = cfg.min_kept_tokens
-                else:
-                    # Low L1 or first frame → conservative (more tokens kept)
-                    _eff_min = cfg.max_kept_tokens
-                    _eff_max = cfg.max_kept_tokens
-            elif cfg.dynamic_prune_mode == "ema":
-                _ema = token_state.ema_l1
-                _raw_l1 = token_state.last_actions_l1
-                if _ema is not None and _raw_l1 is not None and _ema > 1e-8:
-                    _dev = compute_relative_deviation(_raw_l1, _ema)
-                    assert _dev is not None
-                    _ratio = sigmoid_ratio(_dev)
-                    _eff = ratio_to_keep_tokens(
-                        _ratio,
-                        cfg.min_kept_tokens,
-                        cfg.max_kept_tokens,
-                        cfg.ema_direction,
-                    )
-                    _eff_min = _eff
-                    _eff_max = _eff
-                else:
-                    _eff_min = cfg.max_kept_tokens
-                    _eff_max = cfg.max_kept_tokens
-            elif cfg.dynamic_prune_mode == "accel":
-                # Acceleration-based: map xyz / rotation independently into half
-                # of the token span so translation and rotation have equal weight.
-                _ema_xyz = token_state.ema_accel_xyz
-                _raw_xyz = token_state.last_accel_xyz
-                _ema_rot = token_state.ema_accel_rot
-                _raw_rot = token_state.last_accel_rot
-                if (
-                    _ema_xyz is not None
-                    and _raw_xyz is not None
-                    and _ema_xyz > 1e-8
-                    and _ema_rot is not None
-                    and _raw_rot is not None
-                    and _ema_rot > 1e-8
-                ):
-                    _xyz_dev = compute_relative_deviation(_raw_xyz, _ema_xyz)
-                    _rot_dev = compute_relative_deviation(_raw_rot, _ema_rot)
-                    assert _xyz_dev is not None and _rot_dev is not None
-                    _xyz_ratio = sigmoid_ratio(_xyz_dev)
-                    _rot_ratio = sigmoid_ratio(_rot_dev)
-                    _half_span = (cfg.max_kept_tokens - cfg.min_kept_tokens) / 2.0
-                    _xyz_delta = _xyz_ratio * _half_span
-                    _rot_delta = _rot_ratio * _half_span
-                    if cfg.ema_direction == "reverse":
-                        _eff = int(round(cfg.min_kept_tokens + _xyz_delta + _rot_delta))
+            if cfg.spvla_reference_enabled:
+                keep_region = keep_pre
+                clipped_region = valid_masks[idx] & ~keep_region
+            else:
+                # min/max guardrails: always applied in all pruning modes
+                # ── L1 Dynamic Prune Ratio: select effective min/max based on
+                #    previous frame's action L1 norm ──
+                if cfg.dynamic_prune_mode == "l1_threshold":
+                    _prev_l1 = token_state.last_actions_l1
+                    if _prev_l1 is not None and _prev_l1 > cfg.l1_dynamic_prune_threshold:
+                        # High L1 → aggressive pruning (fewer tokens kept)
+                        _eff_min = cfg.min_kept_tokens
+                        _eff_max = cfg.min_kept_tokens
                     else:
-                        _eff = int(round(cfg.max_kept_tokens - _xyz_delta - _rot_delta))
-                    _eff = max(min(_eff, cfg.max_kept_tokens), cfg.min_kept_tokens)
-                    _eff_min = _eff
-                    _eff_max = _eff
+                        # Low L1 or first frame → conservative (more tokens kept)
+                        _eff_min = cfg.max_kept_tokens
+                        _eff_max = cfg.max_kept_tokens
+                elif cfg.dynamic_prune_mode == "ema":
+                    _ema = token_state.ema_l1
+                    _raw_l1 = token_state.last_actions_l1
+                    if _ema is not None and _raw_l1 is not None and _ema > 1e-8:
+                        _dev = compute_relative_deviation(_raw_l1, _ema)
+                        assert _dev is not None
+                        _ratio = sigmoid_ratio(_dev)
+                        _eff = ratio_to_keep_tokens(
+                            _ratio,
+                            cfg.min_kept_tokens,
+                            cfg.max_kept_tokens,
+                            cfg.ema_direction,
+                        )
+                        _eff_min = _eff
+                        _eff_max = _eff
+                    else:
+                        _eff_min = cfg.max_kept_tokens
+                        _eff_max = cfg.max_kept_tokens
+                elif cfg.dynamic_prune_mode == "accel":
+                    # Acceleration-based: map xyz / rotation independently into half
+                    # of the token span so translation and rotation have equal weight.
+                    _ema_xyz = token_state.ema_accel_xyz
+                    _raw_xyz = token_state.last_accel_xyz
+                    _ema_rot = token_state.ema_accel_rot
+                    _raw_rot = token_state.last_accel_rot
+                    if (
+                        _ema_xyz is not None
+                        and _raw_xyz is not None
+                        and _ema_xyz > 1e-8
+                        and _ema_rot is not None
+                        and _raw_rot is not None
+                        and _ema_rot > 1e-8
+                    ):
+                        _xyz_dev = compute_relative_deviation(_raw_xyz, _ema_xyz)
+                        _rot_dev = compute_relative_deviation(_raw_rot, _ema_rot)
+                        assert _xyz_dev is not None and _rot_dev is not None
+                        _xyz_ratio = sigmoid_ratio(_xyz_dev)
+                        _rot_ratio = sigmoid_ratio(_rot_dev)
+                        _half_span = (cfg.max_kept_tokens - cfg.min_kept_tokens) / 2.0
+                        _xyz_delta = _xyz_ratio * _half_span
+                        _rot_delta = _rot_ratio * _half_span
+                        if cfg.ema_direction == "reverse":
+                            _eff = int(round(cfg.min_kept_tokens + _xyz_delta + _rot_delta))
+                        else:
+                            _eff = int(round(cfg.max_kept_tokens - _xyz_delta - _rot_delta))
+                        _eff = max(min(_eff, cfg.max_kept_tokens), cfg.min_kept_tokens)
+                        _eff_min = _eff
+                        _eff_max = _eff
+                    else:
+                        _eff_min = cfg.max_kept_tokens
+                        _eff_max = cfg.max_kept_tokens
+                elif cfg.dynamic_prune_mode == "velocity":
+                    if motion_speeds is None:
+                        _eff_tokens = torch.full(
+                            (bsize,),
+                            cfg.max_kept_tokens,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    else:
+                        _valid_regions = valid_masks[idx].sum(dim=-1).to(dtype=torch.long)
+                        _valid_tokens = _valid_regions * (cfg.region_patch_size * cfg.region_patch_size)
+                        _eff_tokens = compute_velocity_keep_tokens(
+                            motion_speeds,
+                            _valid_tokens,
+                            cfg.min_kept_tokens,
+                            cfg.max_kept_tokens,
+                            cfg.prune_velocity_min,
+                            cfg.prune_velocity_max,
+                        )
+                        _eff_tokens = torch.where(
+                            motion_speeds < cfg.prune_velocity_min,
+                            _valid_tokens,
+                            _eff_tokens,
+                        )
+                    _eff_min = _eff_tokens
+                    _eff_max = _eff_tokens
+                else:  # "none"
+                    # Fixed prune ratio mode: use prune_ratio for both min and max
+                    _eff_min = cfg.prune_ratio
+                    _eff_max = cfg.prune_ratio
+                region_area = cfg.region_patch_size * cfg.region_patch_size
+                if torch.is_tensor(_eff_min):
+                    min_regions = torch.div(
+                        _eff_min + region_area - 1,
+                        region_area,
+                        rounding_mode="floor",
+                    )
                 else:
-                    _eff_min = cfg.max_kept_tokens
-                    _eff_max = cfg.max_kept_tokens
-            else:  # "none"
-                # Fixed prune ratio mode: use prune_ratio for both min and max
-                _eff_min = cfg.prune_ratio
-                _eff_max = cfg.prune_ratio
-            region_area = cfg.region_patch_size * cfg.region_patch_size
-            min_regions = math.ceil(_eff_min / region_area) if _eff_min > 0 else 0
-            max_regions = (
-                math.floor(_eff_max / region_area)
-                if _eff_max > 0
-                else score_region.shape[1]
-            )
-            keep_region, clipped_region = apply_min_max_constraints(
-                keep_pre, _eff_score_region, min_regions, max_regions
-            )
+                    min_regions = math.ceil(_eff_min / region_area) if _eff_min > 0 else 0
+                if torch.is_tensor(_eff_max):
+                    max_regions = torch.div(
+                        _eff_max + region_area - 1,
+                        region_area,
+                        rounding_mode="floor",
+                    )
+                else:
+                    max_regions = (
+                        math.floor(_eff_max / region_area)
+                        if _eff_max > 0
+                        else score_region.shape[1]
+                    )
+                keep_region, clipped_region = apply_min_max_constraints_with_locked(
+                    keep_pre,
+                    spatial_region_masks[idx],
+                    _eff_score_region,
+                    min_regions,
+                    max_regions,
+                )
             keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
             important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
             clipped_token = expand_region_mask(clipped_region, meta.patches_per_side, cfg.region_patch_size)
@@ -1557,6 +1709,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             overlay_labels.append(overlay_label)
             overlay_grids.append(overlay_label.view(bsize, meta.patches_per_side, meta.patches_per_side))
             score_regions.append(score_region)
+            semantic_regions.append(semantic_region)
             important_regions.append(important_region)
             keep_regions.append(keep_region)
             clipped_regions.append(clipped_region)
@@ -1615,10 +1768,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         )
 
         image_pad_masks = None
-        if not cfg.score_debug_heatmap and not eval_frame and cfg.token_prune_enabled:
+        if not cfg.score_debug_heatmap and cfg.token_prune_enabled:
             image_embs, image_pad_masks = prune_image_embeddings(
                 image_embs, keep_token_masks, img_masks, metas
             )
+            if eval_frame:
+                actions = None
 
         if actions is None:
             prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
@@ -1632,10 +1787,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         token_state.last_score_token = [score.detach() for score in score_tokens]
         token_state.last_score_region = [score.detach() for score in score_regions]
+        token_state.last_semantic_region = [mask.detach() for mask in semantic_regions]
         token_state.last_important_region = [mask.detach() for mask in important_regions]
         token_state.last_overlay_labels = [label.detach() for label in overlay_labels]
         token_state.last_overlay_grid = [grid.detach() for grid in overlay_grids]
         token_state.last_heatmap_grid = [g.detach() for g in heatmap_grids] if heatmap_grids else None
+        if motion_speeds is not None:
+            token_state.last_motion_speeds = motion_speeds.detach()
+        if z_trans is not None:
+            token_state.last_z_trans = z_trans.detach()
         # Store binary keep mask for heatmap pruning visualization
         if keep_token_masks:
             token_state.last_keep_grid = [
@@ -1843,6 +2003,10 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+        self._spvla_state = SPVLASchedulerState(
+            buffer_size=config.schedule_buffer_size,
+            queue_size=config.n_action_steps,
+        )
 
         self.reset()
 
@@ -2051,6 +2215,7 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._spvla_state.reset()
         if hasattr(self, "model"):
             self.model.reset_token_selection_state()
 
@@ -2088,6 +2253,11 @@ class PI05Policy(PreTrainedPolicy):
             "last_heatmap_grid": heatmap_grid,
             "last_keep_grid": keep_grid,
         }
+
+    def get_model_scheduling_stats(self) -> dict[str, float | int] | None:
+        if not self.config.model_scheduling_enabled:
+            return None
+        return self._spvla_state.summary()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -2185,6 +2355,9 @@ class PI05Policy(PreTrainedPolicy):
 
         self.eval()
 
+        if self.config.model_scheduling_enabled:
+            return self._select_action_with_model_scheduling(batch)
+
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
@@ -2192,6 +2365,161 @@ class PI05Policy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
+
+    @torch.no_grad()
+    def _select_action_with_model_scheduling(self, batch: dict[str, Tensor]) -> Tensor:
+        self.eval()
+        device = next(self.parameters()).device
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        batch_size = next(value.shape[0] for value in batch.values() if torch.is_tensor(value))
+        self._spvla_state.ensure_batch(batch_size)
+
+        if self.config.spvla_reference_enabled:
+            z_trans = self._spvla_state.get_z_translations(device, batch_size)
+            use_lightweight = [
+                self._spvla_state.can_use_reference_skip(
+                    env_idx,
+                    self.config.z_xy_rate_skip,
+                    self.config.z_max_skip,
+                    self.config.step_skip,
+                    self.config.schedule_reference_min_generated_ratio,
+                )
+                for env_idx in range(batch_size)
+            ]
+
+            selected_actions: list[Tensor | None] = [None] * batch_size
+            from_vla_flags = [False] * batch_size
+            full_indices: list[int] = []
+
+            for env_idx in range(batch_size):
+                if use_lightweight[env_idx]:
+                    ridge_action = fit_reference_ridge_action(
+                        self._spvla_state.action_histories[env_idx],
+                        self.config.schedule_generator_reg_lambda,
+                        clip_min=self.config.reference_action_clip_min,
+                        clip_max=self.config.reference_action_clip_max,
+                    )
+                    if ridge_action is not None:
+                        selected_actions[env_idx] = ridge_action.to(device=device, dtype=torch.float32)
+                        from_vla_flags[env_idx] = False
+                    else:
+                        self._spvla_state.num_generator_fallbacks += 1
+                        full_indices.append(env_idx)
+                else:
+                    full_indices.append(env_idx)
+
+            if full_indices:
+                index_tensor = torch.tensor(full_indices, device=device, dtype=torch.long)
+                sub_batch = {
+                    key: value.index_select(0, index_tensor) if torch.is_tensor(value) else value
+                    for key, value in batch.items()
+                }
+                action_chunks = self.predict_action_chunk(
+                    sub_batch,
+                    z_trans=z_trans.index_select(0, index_tensor),
+                )
+                self._spvla_state.num_vla_calls += 1
+                for offset, env_idx in enumerate(full_indices):
+                    selected_actions[env_idx] = action_chunks[offset, 0].to(device=device, dtype=torch.float32)
+                    from_vla_flags[env_idx] = True
+
+            final_actions = []
+            for env_idx in range(batch_size):
+                action = selected_actions[env_idx]
+                from_vla = from_vla_flags[env_idx]
+                if action is None:
+                    if self._spvla_state.action_histories[env_idx]:
+                        action = self._spvla_state.action_histories[env_idx][-1].to(
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        from_vla = False
+                    else:
+                        raise RuntimeError("SP-VLA reference scheduler failed before any valid action was available.")
+
+                action = action[:original_action_dim]
+                final_actions.append(action)
+                self._spvla_state.record_action(env_idx, action, from_vla)
+
+            return torch.stack(final_actions, dim=0)
+
+        motion_speeds = self._spvla_state.get_motion_speeds(device, batch_size)
+        use_lightweight = [
+            self._spvla_state.can_use_lightweight(
+                env_idx,
+                self.config.schedule_velocity_min,
+                self.config.schedule_velocity_max,
+                self.config.schedule_ratio_threshold,
+                self.config.schedule_warmup_vla_steps,
+            )
+            for env_idx in range(batch_size)
+        ]
+
+        def refresh_vla_chunks():
+            action_chunks = self.predict_action_chunk(batch, motion_speeds=motion_speeds)
+            for env_idx in range(batch_size):
+                self._spvla_state.replace_vla_queue(
+                    env_idx, action_chunks[env_idx, : self.config.n_action_steps]
+                )
+
+        need_refresh = any(
+            (not use_lightweight[env_idx]) and not self._spvla_state.vla_action_queues[env_idx]
+            for env_idx in range(batch_size)
+        )
+        if need_refresh:
+            refresh_vla_chunks()
+
+        selected_actions = []
+        refreshed_for_fallback = False
+        for env_idx in range(batch_size):
+            vla_candidate = self._spvla_state.pop_vla_action(env_idx)
+            from_vla = True
+
+            if use_lightweight[env_idx]:
+                ridge_action = fit_ridge_action(
+                    self._spvla_state.action_histories[env_idx],
+                    self.config.schedule_generator_reg_lambda,
+                )
+                if ridge_action is not None and passes_action_validity_check(
+                    ridge_action,
+                    self._spvla_state.action_histories[env_idx],
+                    self.config.schedule_validity_max_scale,
+                    floor=max(self.config.schedule_velocity_min, 1e-4),
+                ):
+                    action = ridge_action.to(device=device, dtype=torch.float32)
+                    from_vla = False
+                    if vla_candidate is not None:
+                        self._spvla_state.num_discarded_vla_actions += 1
+                else:
+                    self._spvla_state.num_generator_fallbacks += 1
+                    if vla_candidate is None and not refreshed_for_fallback:
+                        refresh_vla_chunks()
+                        refreshed_for_fallback = True
+                        vla_candidate = self._spvla_state.pop_vla_action(env_idx)
+                    if vla_candidate is not None:
+                        action = vla_candidate.to(device=device, dtype=torch.float32)
+                    elif self._spvla_state.action_histories[env_idx]:
+                        action = self._spvla_state.action_histories[env_idx][-1].to(
+                            device=device, dtype=torch.float32
+                        )
+                        from_vla = False
+                    else:
+                        raise RuntimeError("SP-VLA fallback failed before any valid action was available.")
+            else:
+                if vla_candidate is None:
+                    if not refreshed_for_fallback:
+                        refresh_vla_chunks()
+                        refreshed_for_fallback = True
+                    vla_candidate = self._spvla_state.pop_vla_action(env_idx)
+                if vla_candidate is None:
+                    raise RuntimeError("Expected a queued VLA action after refresh.")
+                action = vla_candidate.to(device=device, dtype=torch.float32)
+
+            action = action[:original_action_dim]
+            selected_actions.append(action)
+            self._spvla_state.record_action(env_idx, action, from_vla)
+
+        return torch.stack(selected_actions, dim=0)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:

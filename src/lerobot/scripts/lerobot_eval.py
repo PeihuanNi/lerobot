@@ -825,6 +825,14 @@ def eval_policy(
     if _token_sel_stats:
         info["token_selection_stats"] = _token_sel_stats
 
+    _sched_stats = {}
+    if hasattr(policy, "get_model_scheduling_stats"):
+        _maybe_stats = policy.get_model_scheduling_stats()
+        if _maybe_stats:
+            _sched_stats = dict(_maybe_stats)
+    if _sched_stats:
+        info["model_scheduling_stats"] = _sched_stats
+
     if return_episode_data:
         info["episodes"] = episode_data
 
@@ -964,6 +972,7 @@ class TaskMetrics(TypedDict, total=False):
     successes: list[bool]
     video_paths: list[str]
     token_selection_stats: dict
+    model_scheduling_stats: dict
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -1010,6 +1019,8 @@ def eval_one(
     )
     if "token_selection_stats" in task_result:
         result["token_selection_stats"] = task_result["token_selection_stats"]
+    if "model_scheduling_stats" in task_result:
+        result["model_scheduling_stats"] = task_result["model_scheduling_stats"]
     return result
 
 
@@ -1158,10 +1169,14 @@ def eval_policy_all(
 
     # Collect per-group token selection stats from per_task_infos
     group_token_sel: dict[str, list[dict]] = defaultdict(list)
+    group_sched: dict[str, list[dict]] = defaultdict(list)
     for ti in per_task_infos:
         ts = ti["metrics"].get("token_selection_stats")
         if ts:
             group_token_sel[ti["task_group"]].append(ts)
+        sched = ti["metrics"].get("model_scheduling_stats")
+        if sched:
+            group_sched[ti["task_group"]].append(sched)
 
     # compute per-group aggregates
     groups_aggregated = {}
@@ -1207,6 +1222,25 @@ def eval_policy_all(
                 f"avg_prune={group_ts.get('avg_prune_ratio', 'N/A')}%, "
                 f"success_rate={_sr_str}"
             )
+        sched_list = group_sched.get(group, [])
+        if sched_list:
+            group_sched_agg = {
+                "vla_calls": sum(s.get("vla_calls", 0) for s in sched_list),
+                "vla_actions": sum(s.get("vla_actions", 0) for s in sched_list),
+                "lightweight_actions": sum(s.get("lightweight_actions", 0) for s in sched_list),
+                "generator_fallbacks": sum(s.get("generator_fallbacks", 0) for s in sched_list),
+                "discarded_vla_actions": sum(s.get("discarded_vla_actions", 0) for s in sched_list),
+                "scheduler_switches": sum(s.get("scheduler_switches", 0) for s in sched_list),
+            }
+            _total_actions = group_sched_agg["vla_actions"] + group_sched_agg["lightweight_actions"]
+            if _total_actions > 0:
+                group_sched_agg["lightweight_action_rate"] = round(
+                    group_sched_agg["lightweight_actions"] / _total_actions, 4
+                )
+                group_sched_agg["vla_action_rate"] = round(
+                    group_sched_agg["vla_actions"] / _total_actions, 4
+                )
+            group_agg["model_scheduling_stats"] = group_sched_agg
         groups_aggregated[group] = group_agg
 
     # overall aggregates

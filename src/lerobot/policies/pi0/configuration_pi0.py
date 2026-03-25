@@ -53,6 +53,23 @@ class PI0Config(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # SP-VLA model scheduling
+    model_scheduling_enabled: bool = False
+    spvla_reference_enabled: bool = False
+    schedule_buffer_size: int = 6
+    schedule_ratio_threshold: float = 0.5
+    schedule_velocity_min: float = 0.0
+    schedule_velocity_max: float = 1.0
+    schedule_generator_reg_lambda: float = 1e-4
+    schedule_validity_max_scale: float = 2.5
+    schedule_warmup_vla_steps: int = 2
+    schedule_reference_min_generated_ratio: float = 4 / 6
+    step_skip: int = 1
+    z_xy_rate_skip: float = 0.4
+    z_max_skip: float = 0.3
+    reference_action_clip_min: float = -0.9
+    reference_action_clip_max: float = 0.9
+
     # Token selection / pruning (optional, inference-time)
     token_selection_enabled: bool = False
     # ═══════════════════════════════════════════════════════════════════════
@@ -93,6 +110,12 @@ class PI0Config(PreTrainedConfig):
     grad_beta: float = 1.0                # legacy unused field kept for config compatibility
     grad_region_ema: float = 0.0  # EMA smoothing for region scores (0=none)
     grad_keep_prev: bool = False
+    semantic_score_mass: float = 0.7
+    spatial_edge_enabled: bool = True
+    canny_low_threshold: int = 100
+    canny_high_threshold: int = 200
+    z_thre_prune: float = 0.5
+    z_min_prune: float = 0.9
 
     # Legacy background-filtering fields kept for config compatibility.
     static_bg_enabled: bool = False
@@ -140,8 +163,11 @@ class PI0Config(PreTrainedConfig):
     #      "l1_threshold"  — binary switch: L1 > threshold → min_kept, else → max_kept
     #      "ema"           — continuous: sigmoid((L - L_hat) / L_hat) → interpolate [max, min] (or reverse)
     #      "accel"         — chunk-internal xyz/rot acceleration, each using half of the [min, max] span
-    dynamic_prune_mode: str = "none"  # "none" | "l1_threshold" | "ema" | "accel"
+    #      "velocity"      — SP-VLA speed-aware keep ratio using previous executed action speed
+    dynamic_prune_mode: str = "none"  # "none" | "l1_threshold" | "ema" | "accel" | "velocity"
     prune_ratio: int = 64  # fixed kept-token count (when dynamic_prune_mode="none")
+    prune_velocity_min: float = 0.0
+    prune_velocity_max: float = 1.0
 
     # -- l1_threshold params --
     l1_dynamic_prune_threshold: float = 8.0
@@ -260,8 +286,30 @@ class PI0Config(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
+        if self.model_scheduling_enabled:
+            if self.schedule_buffer_size <= 0:
+                raise ValueError("schedule_buffer_size must be > 0")
+            if self.schedule_velocity_max <= self.schedule_velocity_min:
+                raise ValueError("schedule_velocity_max must be greater than schedule_velocity_min")
+            if not 0.0 <= self.schedule_ratio_threshold <= 1.0:
+                raise ValueError("schedule_ratio_threshold must be in [0, 1]")
+            if self.schedule_validity_max_scale <= 0:
+                raise ValueError("schedule_validity_max_scale must be > 0")
+            if self.step_skip <= 0:
+                raise ValueError("step_skip must be > 0")
+            if not 0.0 <= self.schedule_reference_min_generated_ratio <= 1.0:
+                raise ValueError("schedule_reference_min_generated_ratio must be in [0, 1]")
+            if self.reference_action_clip_max < self.reference_action_clip_min:
+                raise ValueError("reference_action_clip_max must be >= reference_action_clip_min")
+
         if self.token_selection_enabled:
-            valid_grad_methods = {"full_grad", "partial_grad", "attn_only", "transformer_interpretability"}
+            valid_grad_methods = {
+                "full_grad",
+                "partial_grad",
+                "attn_only",
+                "transformer_interpretability",
+                "spvla_reference",
+            }
             if self.grad_score_method not in valid_grad_methods:
                 raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
             valid_phi = {"l1", "l2"}
@@ -281,9 +329,17 @@ class PI0Config(PreTrainedConfig):
                 raise ValueError("region_patch_size must be > 0")
             if self.dynamic_eval_enabled and self.max_eval_interval <= 0:
                 raise ValueError("max_eval_interval must be > 0")
-            valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel"}
+            valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel", "velocity"}
             if self.dynamic_prune_mode not in valid_dynamic_prune_modes:
                 raise ValueError(f"Invalid dynamic_prune_mode: {self.dynamic_prune_mode}")
+            if not 0.0 <= self.semantic_score_mass <= 1.0:
+                raise ValueError("semantic_score_mass must be in [0, 1]")
+            if self.prune_velocity_max <= self.prune_velocity_min and self.dynamic_prune_mode == "velocity":
+                raise ValueError("prune_velocity_max must be greater than prune_velocity_min")
+            if not 0.0 <= self.z_thre_prune < 1.0:
+                raise ValueError("z_thre_prune must be in [0, 1)")
+            if self.z_min_prune < 0.0:
+                raise ValueError("z_min_prune must be >= 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
