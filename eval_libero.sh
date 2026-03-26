@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR="./outputs/figure/vla-cache-pi0-10"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
-POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
-POLICY_TYPE="pi0"
+OUTPUT_DIR="./outputs/eval/vla-cache-pi05-object-cuda"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
+POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
+POLICY_TYPE="pi05"
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -13,8 +13,8 @@ LIBGL_ALWAYS_SOFTWARE=""
 ENV_TYPE="libero"
 # ENV_TASK="libero_spatial, libero_object, libero_goal, libero_10"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
-ENV_TASK="libero_10"
-ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
+ENV_TASK="libero_spatial"
+ENV_TASK_ID="[0]"
 EVAL_BATCH_SIZE=1
 EVAL_N_EPISODES=50
 MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s

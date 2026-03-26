@@ -96,12 +96,22 @@ class TokenSelectionState:
     last_lang_masks: Tensor | None = None
     # VLA-Cache: last-frame reused visual token mask per camera.
     last_vla_cache_reuse_masks: list[Tensor] | None = None
+    # CUDA latency samples (milliseconds) measured around model-side VLA-Cache inference only.
+    cuda_latency_ms: list[float] | None = None
+    cuda_latency_with_reuse_ms: list[float] | None = None
+    cuda_latency_without_reuse_ms: list[float] | None = None
 
     def __post_init__(self):
         if self.last_stats is None:
             self.last_stats = {}
         if self.actions_l1_history is None:
             self.actions_l1_history = []
+        if self.cuda_latency_ms is None:
+            self.cuda_latency_ms = []
+        if self.cuda_latency_with_reuse_ms is None:
+            self.cuda_latency_with_reuse_ms = []
+        if self.cuda_latency_without_reuse_ms is None:
+            self.cuda_latency_without_reuse_ms = []
 
     def reset(self) -> None:
         self.frame_idx = 0
@@ -143,6 +153,9 @@ class TokenSelectionState:
         self.last_lang_tokens = None
         self.last_lang_masks = None
         self.last_vla_cache_reuse_masks = None
+        self.cuda_latency_ms = []
+        self.cuda_latency_with_reuse_ms = []
+        self.cuda_latency_without_reuse_ms = []
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:

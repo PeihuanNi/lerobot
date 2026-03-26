@@ -108,6 +108,19 @@ def _to_numpy(value):
     return np.array(value)
 
 
+def _summarize_latency_ms(samples) -> dict[str, float | int] | None:
+    if not samples:
+        return None
+    values = np.asarray(samples, dtype=np.float64)
+    return {
+        "count": int(values.size),
+        "mean": float(values.mean()),
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(values.max()),
+    }
+
+
 def _extract_overlay_state(policy: PreTrainedPolicy):
     if not hasattr(policy, "get_token_selection_state"):
         return None, None, None, None, None
@@ -876,6 +889,23 @@ def eval_policy(
             _token_sel_stats["avg_prune_ratio"] = round(_avg_prune, 2)
             _token_sel_stats["total_kept"] = _ts_final.total_kept
             _token_sel_stats["total_possible"] = _ts_final.total_possible
+        _cuda_latency_stats = {
+            "scope": "model.sample_actions",
+            "unit": "ms",
+        }
+        _overall_latency = _summarize_latency_ms(getattr(_ts_final, "cuda_latency_ms", None))
+        _with_reuse_latency = _summarize_latency_ms(getattr(_ts_final, "cuda_latency_with_reuse_ms", None))
+        _without_reuse_latency = _summarize_latency_ms(
+            getattr(_ts_final, "cuda_latency_without_reuse_ms", None)
+        )
+        if _overall_latency is not None:
+            _cuda_latency_stats["overall"] = _overall_latency
+        if _with_reuse_latency is not None:
+            _cuda_latency_stats["with_reuse"] = _with_reuse_latency
+        if _without_reuse_latency is not None:
+            _cuda_latency_stats["without_reuse"] = _without_reuse_latency
+        if len(_cuda_latency_stats) > 2:
+            _token_sel_stats["cuda_latency"] = _cuda_latency_stats
 
     # Compile eval info.
     info = {

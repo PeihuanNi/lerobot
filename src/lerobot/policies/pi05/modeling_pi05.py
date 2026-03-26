@@ -367,43 +367,113 @@ def compute_prefix_layer_with_reuse(
     prev_layer_output,
     prev_key_states,
     prev_value_states,
+    prev_attn_weights=None,
     return_attentions: bool = False,
 ):
-    if return_attentions:
-        outputs, key_states, value_states, attn_weights = compute_prefix_layer_full(
-            layer, hidden_states, attention_mask, position_ids, rotary_emb, return_attentions=True
-        )
-    else:
-        outputs, key_states, value_states = compute_prefix_layer_full(
-            layer, hidden_states, attention_mask, position_ids, rotary_emb
-        )
+    effective_reuse_mask = None if reuse_mask is None else (reuse_mask & pad_masks)
     if (
-        reuse_mask is None
+        effective_reuse_mask is None
         or prev_layer_output is None
         or prev_key_states is None
         or prev_value_states is None
-        or not bool(reuse_mask.any().item())
+        or not bool(effective_reuse_mask.any().item())
     ):
         if return_attentions:
-            return outputs, key_states, value_states, attn_weights
-        return outputs, key_states, value_states
+            return compute_prefix_layer_full(
+                layer, hidden_states, attention_mask, position_ids, rotary_emb, return_attentions=True
+            )
+        return compute_prefix_layer_full(layer, hidden_states, attention_mask, position_ids, rotary_emb)
 
-    batch_reuse_mask = reuse_mask & pad_masks
-    if bool(batch_reuse_mask.any().item()):
-        outputs = outputs.clone()
-        key_states = key_states.clone()
-        value_states = value_states.clone()
-        outputs[batch_reuse_mask] = prev_layer_output[batch_reuse_mask].to(outputs.dtype)
-        key_states = torch.where(
-            batch_reuse_mask[:, None, :, None],
-            prev_key_states.to(key_states.dtype),
-            key_states,
+    outputs = prev_layer_output.clone()
+    key_states = prev_key_states.clone()
+    value_states = prev_value_states.clone()
+
+    attn_weights = None
+    if return_attentions:
+        if (
+            prev_attn_weights is not None
+            and prev_attn_weights.shape[0] == hidden_states.shape[0]
+            and prev_attn_weights.shape[2] == hidden_states.shape[1]
+            and prev_attn_weights.shape[3] == hidden_states.shape[1]
+        ):
+            attn_weights = prev_attn_weights.clone()
+        else:
+            attn_weights = hidden_states.new_zeros(
+                (
+                    hidden_states.shape[0],
+                    layer.self_attn.num_heads,
+                    hidden_states.shape[1],
+                    hidden_states.shape[1],
+                )
+            )
+
+    batch_size = hidden_states.shape[0]
+    head_dim = layer.self_attn.head_dim
+    kv_dtype = key_states.dtype
+    value_dtype = value_states.dtype
+    output_dtype = outputs.dtype
+    for batch_idx in range(batch_size):
+        recompute_mask = pad_masks[batch_idx] & ~effective_reuse_mask[batch_idx]
+        recompute_idx = torch.nonzero(recompute_mask, as_tuple=False).flatten()
+        if recompute_idx.numel() == 0:
+            continue
+
+        hidden_subset = hidden_states[batch_idx : batch_idx + 1, recompute_idx]
+        normalized_states, gate = layer.input_layernorm(hidden_subset, cond=None)
+        input_shape = normalized_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, head_dim)
+        query_states = layer.self_attn.q_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+        new_key_states = layer.self_attn.k_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+        new_value_states = layer.self_attn.v_proj(normalized_states).view(hidden_shape).transpose(1, 2)
+
+        dummy_tensor = torch.zeros(
+            1,
+            recompute_idx.numel(),
+            head_dim,
+            device=hidden_states.device,
+            dtype=query_states.dtype,
         )
-        value_states = torch.where(
-            batch_reuse_mask[:, None, :, None],
-            prev_value_states.to(value_states.dtype),
-            value_states,
+        subset_position_ids = position_ids[batch_idx : batch_idx + 1, recompute_idx]
+        cos, sin = rotary_emb(dummy_tensor, subset_position_ids)
+        query_states, new_key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states, new_key_states, cos, sin, unsqueeze_dim=1
         )
+
+        key_states[batch_idx : batch_idx + 1, :, recompute_idx, :] = new_key_states.to(kv_dtype)
+        value_states[batch_idx : batch_idx + 1, :, recompute_idx, :] = new_value_states.to(value_dtype)
+
+        layer_key_states = key_states[batch_idx : batch_idx + 1]
+        layer_value_states = value_states[batch_idx : batch_idx + 1]
+        if layer_key_states.dtype != query_states.dtype:
+            layer_key_states = layer_key_states.to(query_states.dtype)
+        if layer_value_states.dtype != query_states.dtype:
+            layer_value_states = layer_value_states.to(query_states.dtype)
+
+        query_attention_mask = attention_mask[batch_idx : batch_idx + 1, :, recompute_idx, :]
+        att_output, attn_subset = modeling_gemma.eager_attention_forward(
+            layer.self_attn,
+            query_states,
+            layer_key_states,
+            layer_value_states,
+            query_attention_mask,
+            layer.self_attn.scaling,
+        )
+        att_output = att_output.reshape(1, -1, layer.self_attn.o_proj.in_features)
+        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+        att_output = layer.self_attn.o_proj(att_output)
+        att_output = modeling_gemma._gated_residual(hidden_subset, att_output, gate)  # noqa: SLF001
+        residual = att_output.clone()
+        att_output, post_gate = layer.post_attention_layernorm(att_output, cond=None)
+        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+            att_output = att_output.to(dtype=torch.bfloat16)
+        att_output = layer.mlp(att_output)
+        recomputed_outputs = modeling_gemma._gated_residual(residual, att_output, post_gate)  # noqa: SLF001
+        outputs[batch_idx : batch_idx + 1, recompute_idx] = recomputed_outputs.to(output_dtype)
+
+        if return_attentions:
+            attn_weights[batch_idx : batch_idx + 1, :, recompute_idx, :] = attn_subset.to(attn_weights.dtype)
+
     if return_attentions:
         return outputs, key_states, value_states, attn_weights
     return outputs, key_states, value_states
@@ -417,6 +487,7 @@ def build_prefix_cache_with_reuse(
     layer_reuse_masks=None,
     prev_layer_outputs=None,
     prev_past_key_values=None,
+    prev_layer_attentions=None,
     return_attentions: bool = False,
 ):
     prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -435,6 +506,9 @@ def build_prefix_cache_with_reuse(
     for layer_idx, layer in enumerate(paligemma.language_model.layers):
         reuse_mask = None if layer_reuse_masks is None else layer_reuse_masks[layer_idx]
         prev_output = None if prev_layer_outputs is None else prev_layer_outputs[layer_idx]
+        prev_attn = None
+        if prev_layer_attentions is not None and len(prev_layer_attentions) > layer_idx:
+            prev_attn = prev_layer_attentions[layer_idx]
         prev_keys = None
         prev_values = None
         if prev_past_key_values is not None:
@@ -452,6 +526,7 @@ def build_prefix_cache_with_reuse(
                 prev_layer_output=prev_output,
                 prev_key_states=prev_keys,
                 prev_value_states=prev_values,
+                prev_attn_weights=prev_attn,
                 return_attentions=True,
             )
             layer_attentions.append(attn_weights)
@@ -1152,6 +1227,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = tokens.shape[0]
         device = tokens.device
+        measure_cuda_latency = cfg.grad_score_method == "vla_cache" and device.type == "cuda"
+        latency_start = None
+        latency_end = None
+        latency_reuse_applied = False
+        if measure_cuda_latency:
+            latency_start = torch.cuda.Event(enable_timing=True)
+            latency_end = torch.cuda.Event(enable_timing=True)
+            latency_start.record()
 
         if noise is None:
             actions_shape = (
@@ -1270,6 +1353,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 layer_reuse_masks=layer_reuse_masks,
                 prev_layer_outputs=prev_layer_outputs if can_reuse else None,
                 prev_past_key_values=prev_past_key_values if can_reuse else None,
+                prev_layer_attentions=token_state.last_vla_cache_attentions if can_reuse else None,
                 return_attentions=True,
             )
 
@@ -1448,6 +1532,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     prefix_att_masks=prefix_att_masks,
                     selected_prefix_scores=visual_selected_scores if can_reuse_from_prev else None,
                     always_reuse_mask=always_reuse_mask if can_reuse_from_prev else None,
+                )
+                latency_reuse_applied = can_reuse_from_prev and any(
+                    bool(mask.any().item()) for mask in camera_reuse_masks
                 )
                 actions, _, _ = run_diffusion(
                     prefix_pad_masks=prefix_pad_masks,
@@ -2015,6 +2102,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                 )
                 actions = actions.detach()
+
+        if measure_cuda_latency and latency_start is not None and latency_end is not None:
+            latency_end.record()
+            latency_end.synchronize()
+            latency_ms = float(latency_start.elapsed_time(latency_end))
+            token_state.cuda_latency_ms.append(latency_ms)
+            if latency_reuse_applied:
+                token_state.cuda_latency_with_reuse_ms.append(latency_ms)
+            else:
+                token_state.cuda_latency_without_reuse_ms.append(latency_ms)
 
         token_state.last_score_token = [score.detach() for score in score_tokens]
         token_state.last_score_region = [score.detach() for score in score_regions]
