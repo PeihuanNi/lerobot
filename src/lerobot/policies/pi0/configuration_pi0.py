@@ -61,15 +61,19 @@ class PI0Config(PreTrainedConfig):
     #    Each method outputs per-token scores; downstream modules are unaffected.
     # ═══════════════════════════════════════════════════════════════════════
     grad_score_method: str = "transformer_interpretability"
-    # Supported: attn_only | transformer_interpretability
+    # Supported: transformer_interpretability | grad_only | attn_only
+    # Aliases: action_vision -> attn_only
     # Legacy values are still accepted during config loading for compatibility.
+    score_attn_source: str = "action_vision"
+    # "action_vision" = diffusion expert action queries -> vision keys
+    # "vision_text"   = prefix language queries -> vision keys
 
     # -- transformer_interpretability params --
     interp_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
     interp_use_residual: bool = False  # True = full Chefer residual propagation across all layers
     interp_action_start: int = 0       # first action step for objective (0-indexed)
     interp_action_end: int = -1        # last action step (exclusive); -1 = chunk_size (all)
-    interp_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-dim backprop
+    interp_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "direct" = signed mean_h(g*A) | "dimension_independent" = per-dim backprop
     interp_objective: str = "vector_field_L2"
     interp_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
 
@@ -127,7 +131,8 @@ class PI0Config(PreTrainedConfig):
     # Ratio of the *previously kept* tokens to permanently discard in the next eval frame.
     # Discards the highest-scoring tokens from the previous frame.
     discard_prev_kept_ratio: float = 0.0
-    # "top" = discard highest-scoring (trajectory remnants); "bottom" = discard lowest-scoring
+    # "top" = discard highest-scoring; "bottom" = discard lowest-scoring;
+    # "middle" = discard mid-scoring; "random" = randomly discard previous kept regions
     discard_mode: str = "top"
     # If enabled, a gripper-close action schedules the global discard pool to be
     # fully restored on the next eval frame.
@@ -140,13 +145,14 @@ class PI0Config(PreTrainedConfig):
     #      "l1_threshold"  — binary switch: L1 > threshold → min_kept, else → max_kept
     #      "ema"           — continuous: sigmoid((L - L_hat) / L_hat) → interpolate [max, min] (or reverse)
     #      "accel"         — chunk-internal xyz/rot acceleration, each using half of the [min, max] span
-    dynamic_prune_mode: str = "none"  # "none" | "l1_threshold" | "ema" | "accel"
+    #      "velocity"      — chunk-internal xyz/rot action magnitude, each using half of the [min, max] span
+    dynamic_prune_mode: str = "none"  # "none" | "l1_threshold" | "ema" | "accel" | "velocity"
     prune_ratio: int = 64  # fixed kept-token count (when dynamic_prune_mode="none")
 
     # -- l1_threshold params --
     l1_dynamic_prune_threshold: float = 8.0
 
-    # -- ema / accel params --
+    # -- ema / accel / velocity params --
     l1_ema_alpha: float = 0.7        # EMA coefficient: higher = more smoothing / slower response
     ema_sigmoid_gain: float = 4.0    # legacy unused field kept for config compatibility
     accel_sigmoid_gain: float = 4.0  # legacy unused field kept for config compatibility
@@ -154,9 +160,9 @@ class PI0Config(PreTrainedConfig):
     l1_ema_temperature: float = 2.0  # legacy field kept for compatibility
     l1_ema_adaptive: bool = False    # legacy field kept for compatibility
     l1_ema_adaptive_k: float = 1.0   # legacy field kept for compatibility
-    # Shared direction for ema / accel:
-    # "normal"  = high deviation / accel → fewer tokens (toward MIN)
-    # "reverse" = high deviation / accel → more tokens (toward MAX)
+    # Shared direction for ema / accel / velocity:
+    # "normal"  = high deviation / motion → fewer tokens (toward MIN)
+    # "reverse" = high deviation / motion → more tokens (toward MAX)
     ema_direction: str = "normal"
 
     region_patch_size: int = 1
@@ -245,6 +251,22 @@ class PI0Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        grad_method_aliases = {
+            "action-vision": "attn_only",
+            "action_vision": "attn_only",
+            "attn-only": "attn_only",
+            "grad-only": "grad_only",
+        }
+        interp_variant_aliases = {
+            "relu": "original",
+            "ReLU": "original",
+            "abs": "abs_heads",
+            "raw": "direct",
+            "none": "direct",
+        }
+        self.grad_score_method = grad_method_aliases.get(self.grad_score_method, self.grad_score_method)
+        self.interp_variant = interp_variant_aliases.get(self.interp_variant, self.interp_variant)
+
         # Validate configuration
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
@@ -261,9 +283,21 @@ class PI0Config(PreTrainedConfig):
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
         if self.token_selection_enabled:
-            valid_grad_methods = {"full_grad", "partial_grad", "attn_only", "transformer_interpretability"}
+            valid_grad_methods = {
+                "full_grad",
+                "partial_grad",
+                "attn_only",
+                "grad_only",
+                "transformer_interpretability",
+            }
             if self.grad_score_method not in valid_grad_methods:
                 raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
+            valid_score_attn_sources = {"action_vision", "vision_text"}
+            if self.score_attn_source not in valid_score_attn_sources:
+                raise ValueError(f"Invalid score_attn_source: {self.score_attn_source}")
+            valid_interp_variants = {"original", "abs_heads", "direct", "dimension_independent"}
+            if self.interp_variant not in valid_interp_variants:
+                raise ValueError(f"Invalid interp_variant: {self.interp_variant}")
             valid_phi = {"l1", "l2"}
             if self.partial_grad_phi not in valid_phi:
                 raise ValueError(f"Invalid partial_grad_phi: {self.partial_grad_phi}")
@@ -277,11 +311,14 @@ class PI0Config(PreTrainedConfig):
             valid_overlay_modes = {"heatmap", "label"}
             if self.overlay_mode not in valid_overlay_modes:
                 raise ValueError(f"Invalid overlay_mode: {self.overlay_mode}")
+            valid_discard_modes = {"top", "bottom", "middle", "random"}
+            if self.discard_mode not in valid_discard_modes:
+                raise ValueError(f"Invalid discard_mode: {self.discard_mode}")
             if self.region_patch_size <= 0:
                 raise ValueError("region_patch_size must be > 0")
             if self.dynamic_eval_enabled and self.max_eval_interval <= 0:
                 raise ValueError("max_eval_interval must be > 0")
-            valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel"}
+            valid_dynamic_prune_modes = {"none", "l1_threshold", "ema", "accel", "velocity"}
             if self.dynamic_prune_mode not in valid_dynamic_prune_modes:
                 raise ValueError(f"Invalid dynamic_prune_mode: {self.dynamic_prune_mode}")
 

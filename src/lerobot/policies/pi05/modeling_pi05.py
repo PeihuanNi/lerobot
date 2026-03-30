@@ -52,8 +52,9 @@ from lerobot.policies.token_selection_utils import (
     compute_relative_deviation,
     compute_region_scores,
     discard_top_scoring_regions,
+    embed_pruned_vision_tokens,
     expand_region_mask,
-    prune_image_embeddings,
+    infer_patch_grid,
     ratio_to_keep_tokens,
     sigmoid_ratio,
     split_patch_tokens,
@@ -422,6 +423,19 @@ class PaliGemmaWithExpertModel(
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
 
+    def embed_image_pruned(self, image: torch.Tensor, keep_mask: torch.Tensor, img_mask: torch.Tensor):
+        vision_model = self.paligemma.model.vision_tower.vision_model
+        return embed_pruned_vision_tokens(
+            pixel_values=image,
+            keep_masks=keep_mask,
+            img_masks=img_mask,
+            patch_embedding=vision_model.embeddings.patch_embedding,
+            position_embedding=vision_model.embeddings.position_embedding,
+            encoder=vision_model.encoder,
+            post_layernorm=vision_model.post_layernorm,
+            projector=self.paligemma.model.multi_modal_projector,
+        )
+
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
@@ -544,6 +558,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.config = config
         self.rtc_processor = rtc_processor
         self._token_selection_state = TokenSelectionState()
+        self.reset_cuda_latency_stats()
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -614,6 +629,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self._save_actions_l1_plot(self._token_selection_state, self._plot_episode_idx)
                 self._plot_episode_idx += 1
             self._token_selection_state.reset()
+
+    def reset_cuda_latency_stats(self):
+        self._cuda_latency_ms = {
+            "overall": [],
+            "baseline": [],
+            "scoring_frame": [],
+            "pruned_frame": [],
+            "token_selection_unpruned": [],
+        }
+
+    def get_cuda_latency_samples(self) -> dict[str, list[float]]:
+        return {
+            bucket: list(samples)
+            for bucket, samples in self._cuda_latency_ms.items()
+            if samples
+        }
+
+    def _start_cuda_latency_timer(self):
+        device = next(self.parameters()).device
+        if device.type != "cuda":
+            return None
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return device, start, end
+
+    def _record_cuda_latency(self, timer, *buckets: str):
+        if timer is None:
+            return
+        device, start, end = timer
+        end.record()
+        torch.cuda.synchronize(device)
+        elapsed_ms = float(start.elapsed_time(end))
+        self._cuda_latency_ms["overall"].append(elapsed_ms)
+        for bucket in buckets:
+            if bucket and bucket in self._cuda_latency_ms:
+                self._cuda_latency_ms[bucket].append(elapsed_ms)
 
     def _save_actions_l1_plot(self, state, episode_idx):
         """Save a line chart of the predicted-action L1 norm at each inference frame."""
@@ -872,6 +925,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )  # Use config max_action_dim for internal processing
                 noise = self.sample_noise(actions_shape, device)
 
+            latency_timer = self._start_cuda_latency_timer()
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -923,6 +977,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                     self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+            self._record_cuda_latency(latency_timer, "baseline")
             return x_t
 
     def _sample_actions_with_token_selection(
@@ -960,31 +1015,47 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             eval_frame = token_state.frame_idx % eval_interval == 0
 
-        with torch.no_grad():
-            image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
+        latency_timer = self._start_cuda_latency_timer()
 
-        patch_embs = []
-        metas = []
-        for emb in image_embs:
-            patch_emb, meta = split_patch_tokens(emb)
-            patch_embs.append(patch_emb)
-            metas.append(meta)
+        image_embs = None
+        patch_embs = None
+        metas = None
+        need_full_image_embs = eval_frame or not cfg.token_prune_enabled or token_state.last_score_token is None
+        if need_full_image_embs:
+            with torch.no_grad():
+                image_embs = [self.paligemma_with_expert.embed_image(img) for img in images]
 
-        if token_state.last_score_token is not None:
-            if len(token_state.last_score_token) != len(patch_embs):
-                token_state.reset()
-            else:
-                for idx, score in enumerate(token_state.last_score_token):
-                    if score.shape[0] != bsize or score.shape[1] != patch_embs[idx].shape[1]:
-                        token_state.reset()
-                        break
+            patch_embs = []
+            metas = []
+            for emb in image_embs:
+                patch_emb, meta = split_patch_tokens(emb)
+                patch_embs.append(patch_emb)
+                metas.append(meta)
+
+            if token_state.last_score_token is not None:
+                if len(token_state.last_score_token) != len(patch_embs):
+                    token_state.reset()
+                else:
+                    for idx, score in enumerate(token_state.last_score_token):
+                        if score.shape[0] != bsize or score.shape[1] != patch_embs[idx].shape[1]:
+                            token_state.reset()
+                            break
+
+            if not eval_frame and token_state.last_score_token is None:
+                eval_frame = True
+        else:
+            metas = [infer_patch_grid(score.shape[1]) for score in token_state.last_score_token]
 
         valid_masks = []
         for idx, meta in enumerate(metas):
             num_regions = (meta.patches_per_side // cfg.region_patch_size) ** 2
             valid_masks.append(img_masks[idx][:, None].expand(bsize, num_regions))
 
-        token_norms = [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
+        token_norms = (
+            [torch.linalg.vector_norm(patch.float(), dim=-1) for patch in patch_embs]
+            if patch_embs is not None
+            else None
+        )
 
         def build_prefix(image_embs, image_pad_masks=None):
             return self.embed_prefix(
@@ -996,19 +1067,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 image_pad_masks=image_pad_masks,
             )
 
-        def compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks):
+        def compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks, capture_attn: bool = False):
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-            _, past_key_values = self.paligemma_with_expert.forward(
+            output = self.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d,
                 position_ids=prefix_position_ids,
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
+                output_attentions=capture_attn,
             )
-            return past_key_values
+            if capture_attn:
+                _, past_key_values, prefix_attns = output
+                return past_key_values, prefix_attns
+            _, past_key_values = output
+            return past_key_values, None
 
         def run_diffusion(
             prefix_pad_masks,
@@ -1085,18 +1161,122 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_pad_masks = None
         last_attn = None
 
+        def _apply_interp_variant(value: Tensor) -> Tensor:
+            if cfg.interp_variant == "original":
+                return torch.relu(value)
+            if cfg.interp_variant == "abs_heads":
+                return torch.abs(value)
+            return value
+
+        def _combine_dim_independent(attn: Tensor, grad: Tensor) -> Tensor:
+            grad_abs = grad.float().abs()
+            if cfg.grad_score_method == "grad_only":
+                return grad_abs.mean(dim=1)
+            return (attn.detach().float() * grad_abs).mean(dim=1)
+
+        def _combine_attn_and_grad(attn: Tensor, grad: Tensor) -> Tensor:
+            grad_f = grad.float()
+            attn_f = attn.detach().float()
+            if cfg.grad_score_method == "grad_only":
+                if cfg.interp_variant == "abs_heads":
+                    return grad_f.abs().mean(dim=1)
+                if cfg.interp_variant == "direct":
+                    return grad_f.mean(dim=1)
+                return torch.relu(grad_f.mean(dim=1))
+            if cfg.interp_variant == "abs_heads":
+                return (grad_f * attn_f).abs().mean(dim=1)
+            if cfg.interp_variant == "direct":
+                return (grad_f * attn_f).mean(dim=1)
+            return torch.relu((grad_f * attn_f).mean(dim=1))
+
+        def _safe_row_normalize(value: Tensor) -> Tensor:
+            row_sum = value.sum(dim=-1, keepdim=True)
+            eps = torch.full_like(row_sum, 1e-12)
+            row_sum = torch.where(row_sum.abs() < 1e-12, torch.where(row_sum < 0, -eps, eps), row_sum)
+            return value / row_sum
+
+        def _build_vision_indices(key_len: int) -> Tensor:
+            vis_idx = []
+            offset = 0
+            for meta in metas:
+                offset += meta.num_extra_tokens
+                vis_idx.extend(range(offset, offset + meta.num_patches))
+                offset += meta.num_patches
+            vis_idx_t = torch.tensor(vis_idx, device=device)
+            if vis_idx_t.numel() > 0 and key_len > 0:
+                vis_idx_t = vis_idx_t[vis_idx_t < key_len]
+            return vis_idx_t
+
+        def _build_text_query_selection(query_len: int) -> tuple[Tensor, Tensor]:
+            text_start = sum(meta.num_extra_tokens + meta.num_patches for meta in metas)
+            text_idx = torch.arange(text_start, text_start + masks.shape[1], device=device)
+            if text_idx.numel() > 0 and query_len > 0:
+                text_idx = text_idx[text_idx < query_len]
+            text_query_mask = masks[:, : text_idx.numel()].to(device=device, dtype=torch.bool)
+            return text_idx, text_query_mask
+
+        def _masked_query_mean(value: Tensor, query_mask: Tensor | None = None) -> Tensor:
+            if query_mask is None:
+                return value.mean(dim=1)
+            weights = query_mask.to(dtype=value.dtype).unsqueeze(-1)
+            denom = weights.sum(dim=1).clamp_min(1.0)
+            return (value * weights).sum(dim=1) / denom
+
+        def _grad_with_zero_for_unused(
+            output: Tensor,
+            inputs: Tensor | list[Tensor] | tuple[Tensor, ...],
+            retain_graph: bool,
+            allow_unused_zero: bool = False,
+        ):
+            input_is_tensor = isinstance(inputs, Tensor)
+            grad_inputs = inputs if input_is_tensor else tuple(inputs)
+            grads = torch.autograd.grad(
+                output,
+                grad_inputs,
+                retain_graph=retain_graph,
+                allow_unused=allow_unused_zero,
+            )
+            if allow_unused_zero:
+                ref_inputs = (grad_inputs,) if input_is_tensor else grad_inputs
+                grads = tuple(
+                    torch.zeros_like(ref_input) if grad is None else grad
+                    for ref_input, grad in zip(ref_inputs, grads, strict=True)
+                )
+            if input_is_tensor:
+                return grads[0]
+            return list(grads)
+
         if eval_frame:
-            if cfg.grad_score_method == "transformer_interpretability":
-                # ── Gradient-Weighted Attention (GradxAttn) ───────────────
+            if cfg.grad_score_method in {"transformer_interpretability", "grad_only"}:
+                # ── Gradient-Based Vision Scoring ──────────────────────────
                 # For each scored denoise step:
                 #   1. Forward with x_t.requires_grad_(True).
                 #   2. Objective: ||v_t||_F^2.
-                #   3. grad_x = dobj/dx_t -> per-action importance w[a]=||grad_x[a]||
-                #   4. Aggregate attention over last N Expert layers.
-                #   5. score_j = sum_a w[a] * sum_h A[h,a,j]
+                #   3. Compute grads on action-query attention.
+                #   4. Combine gradients with attention (GradxAttn) or use grads directly.
+                #   5. Aggregate action->vision relevance into per-token scores.
                 #   6. Accumulate across scored denoise steps, then average.
                 prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
-                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+                _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
+                if _use_prefix_score_attn:
+                    with torch.enable_grad():
+                        past_key_values, prefix_score_attns = compute_prefix_cache(
+                            prefix_embs,
+                            prefix_pad_masks,
+                            prefix_att_masks,
+                            capture_attn=True,
+                        )
+                else:
+                    past_key_values, prefix_score_attns = compute_prefix_cache(
+                        prefix_embs,
+                        prefix_pad_masks,
+                        prefix_att_masks,
+                        capture_attn=False,
+                    )
+                if _use_prefix_score_attn and prefix_score_attns is None:
+                    raise ValueError("Missing prefix attentions for vision_text scoring.")
+                if _use_prefix_score_attn and not any(attn.requires_grad for attn in prefix_score_attns):
+                    raise RuntimeError("vision_text scoring requires prefix attentions with gradients enabled.")
 
                 _interp_step = cfg.interp_denoise_step  # -1 = all steps, >=0 = specific
                 _dt = -1.0 / num_steps
@@ -1107,6 +1287,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     cfg.attn_num_layers,
                     len(self.paligemma_with_expert.gemma_expert.model.layers),
                 ))
+                _scored_steps = [s for s in range(num_steps) if _interp_step < 0 or _interp_step == s]
+                _last_scored_step = _scored_steps[-1] if _scored_steps else None
 
                 for _step in range(num_steps):
                     _time = 1.0 + _step * _dt
@@ -1127,7 +1309,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             # ── Action-step subset for objective ──
                             _a_lo = max(0, cfg.interp_action_start)
                             _a_hi = cfg.chunk_size if cfg.interp_action_end < 0 else min(cfg.interp_action_end, cfg.chunk_size)
-                            _attn_list = list(_step_attns)
+                            _suffix_attn_list = list(_step_attns)
+                            _score_attn_list = list(prefix_score_attns) if _use_prefix_score_attn else _suffix_attn_list
+                            _retain_score_graph = _use_prefix_score_attn and _step != _last_scored_step
 
                             # ── Compute objective target ──
                             if cfg.interp_objective == "action_sample_L1":
@@ -1145,33 +1329,36 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                     _dim_A_bars = None
                                     for _d in range(_action_dim):
                                         _obj_d = _v_sel[:, :, _d].sum()
-                                        _gs = torch.autograd.grad(
-                                            _obj_d, _attn_list,
-                                            retain_graph=(_d < _action_dim - 1),
+                                        _gs = _grad_with_zero_for_unused(
+                                            _obj_d,
+                                            _score_attn_list,
+                                            retain_graph=_retain_score_graph or (_d < _action_dim - 1),
+                                            allow_unused_zero=_use_prefix_score_attn,
                                         )
                                         if _dim_A_bars is None:
                                             _dim_A_bars = [
-                                                (_attn_list[l].detach().float() * _gs[l].float().abs()).mean(dim=1)
-                                                for l in range(len(_attn_list))
+                                                _combine_dim_independent(_score_attn_list[l], _gs[l])
+                                                for l in range(len(_score_attn_list))
                                             ]
                                         else:
-                                            for l in range(len(_attn_list)):
-                                                _dim_A_bars[l] = _dim_A_bars[l] + (
-                                                    _attn_list[l].detach().float() * _gs[l].float().abs()
-                                                ).mean(dim=1)
-                                    for l in range(len(_attn_list)):
+                                            for l in range(len(_score_attn_list)):
+                                                _dim_A_bars[l] = _dim_A_bars[l] + _combine_dim_independent(
+                                                    _score_attn_list[l], _gs[l]
+                                                )
+                                    for l in range(len(_score_attn_list)):
                                         _dim_A_bars[l] = _dim_A_bars[l] / _action_dim
                                 else:
-                                    _last_attn = _attn_list[-1]
-                                    _A_last_d = _last_attn.detach().float()
+                                    _last_attn = _score_attn_list[-1]
                                     _dim_A_bar = None
                                     for _d in range(_action_dim):
                                         _obj_d = _v_sel[:, :, _d].sum()
-                                        _gd = torch.autograd.grad(
-                                            _obj_d, _last_attn,
-                                            retain_graph=(_d < _action_dim - 1),
-                                        )[0]
-                                        _c = (_A_last_d * _gd.float().abs()).mean(dim=1)
+                                        _gd = _grad_with_zero_for_unused(
+                                            _obj_d,
+                                            _last_attn,
+                                            retain_graph=_retain_score_graph or (_d < _action_dim - 1),
+                                            allow_unused_zero=_use_prefix_score_attn,
+                                        )
+                                        _c = _combine_dim_independent(_last_attn, _gd)
                                         _dim_A_bar = _c if _dim_A_bar is None else _dim_A_bar + _c
                                     _dim_A_bar = _dim_A_bar / _action_dim
                             else:
@@ -1180,95 +1367,101 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                 else:
                                     _obj = (_obj_target ** 2).sum()
                                 if cfg.interp_use_residual:
-                                    _grads = torch.autograd.grad(
-                                        _obj, _attn_list, retain_graph=False,
+                                    _grads = _grad_with_zero_for_unused(
+                                        _obj,
+                                        _score_attn_list,
+                                        retain_graph=_retain_score_graph,
+                                        allow_unused_zero=_use_prefix_score_attn,
                                     )
                                 else:
-                                    _last_attn = _attn_list[-1]
-                                    _grad_last = torch.autograd.grad(
-                                        _obj, _last_attn, retain_graph=False,
-                                    )[0]
+                                    _last_attn = _score_attn_list[-1]
+                                    _grad_last = _grad_with_zero_for_unused(
+                                        _obj,
+                                        _last_attn,
+                                        retain_graph=_retain_score_graph,
+                                        allow_unused_zero=_use_prefix_score_attn,
+                                    )
 
-                        # -- build vision-token indices (shared by both paths) --
-                        _ref_A = _step_attns[-1]
-                        _suffix_len = _ref_A.shape[2]
+                        # -- build query/key selections for the chosen scoring source --
+                        _ref_A = _score_attn_list[-1]
+                        _query_len = _ref_A.shape[2]
                         _total_len = _ref_A.shape[3]
-                        _prefix_len = _total_len - _suffix_len
-                        _action_len = cfg.chunk_size
-                        _action_end = _suffix_len
-                        _action_start = max(0, _action_end - _action_len)
-                        # Narrow to user-selected action-step subset
-                        _q_a_start = _action_start + _a_lo
-                        _q_a_end = _action_start + _a_hi
-                        _sel_alen = _a_hi - _a_lo
-
-                        _vis_idx = []
-                        _off = 0
-                        for meta in metas:
-                            _off += meta.num_extra_tokens
-                            _vis_idx.extend(range(_off, _off + meta.num_patches))
-                            _off += meta.num_patches
-                        _vis_idx_t = torch.tensor(_vis_idx, device=device)
-                        if _vis_idx_t.numel() > 0 and _total_len > 0:
-                            _vis_idx_t = _vis_idx_t[_vis_idx_t < _total_len]
+                        _query_key_offset = 0 if _use_prefix_score_attn else (_total_len - _query_len)
+                        _vis_idx_t = _build_vision_indices(_total_len)
+                        _text_idx_t = None
+                        _text_query_mask = None
+                        if _use_prefix_score_attn:
+                            _text_idx_t, _text_query_mask = _build_text_query_selection(_query_len)
+                        else:
+                            _action_len = cfg.chunk_size
+                            _action_end = _query_len
+                            _action_start = max(0, _action_end - _action_len)
+                            # Narrow to user-selected action-step subset
+                            _q_a_start = _action_start + _a_lo
+                            _q_a_end = _action_start + _a_hi
+                            _sel_alen = _a_hi - _a_lo
 
                         if cfg.interp_use_residual:
                             # ── Residual propagation: R^l = R^{l-1} @ Â^l ──
-                            _num_expert_layers = len(_attn_list)
-                            _diag = torch.arange(_suffix_len, device=device)
-                            # R: [B, suffix_len, total_len] — identity init
-                            _R = torch.zeros(bsize, _suffix_len, _total_len,
+                            _num_score_layers = len(_score_attn_list)
+                            _diag = torch.arange(_query_len, device=device)
+                            # R: [B, query_len, total_len] — identity init
+                            _R = torch.zeros(bsize, _query_len, _total_len,
                                              device=device, dtype=torch.float32)
-                            _R[:, _diag, _prefix_len + _diag] = 1.0
+                            _R[:, _diag, _query_key_offset + _diag] = 1.0
 
-                            for _ell in range(_num_expert_layers):
+                            for _ell in range(_num_score_layers):
                                 if cfg.interp_variant == "dimension_independent":
                                     _A_bar = _dim_A_bars[_ell]
-                                elif cfg.interp_variant == "abs_heads":
-                                    _A_ell = _attn_list[_ell].detach().float()
-                                    _g_ell = _grads[_ell].float()
-                                    _A_bar = (_g_ell * _A_ell).abs().mean(dim=1)  # [B, Qs, K]
-                                else:  # "original"
-                                    _A_ell = _attn_list[_ell].detach().float()
-                                    _g_ell = _grads[_ell].float()
-                                    _ga = (_g_ell * _A_ell).mean(dim=1)  # [B, Qs, K]
-                                    _A_bar = torch.relu(_ga)
+                                else:
+                                    _A_bar = _combine_attn_and_grad(_score_attn_list[_ell], _grads[_ell])
                                 _A_hat = _A_bar.clone()
-                                _A_hat[:, _diag, _prefix_len + _diag] += 1.0
-                                # Row-normalize
-                                _row_sum = _A_hat.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-                                _A_hat = _A_hat / _row_sum
-                                # R_new = R @ Â_full  (prefix rows = identity)
-                                _R_s = _R[:, :, _prefix_len:]   # [B, Qs, Qs]
-                                _R_p = _R[:, :, :_prefix_len] + torch.bmm(_R_s, _A_hat[:, :, :_prefix_len])
-                                _R_sf = torch.bmm(_R_s, _A_hat[:, :, _prefix_len:])
+                                _A_hat[:, _diag, _query_key_offset + _diag] += 1.0
+                                _A_hat = _safe_row_normalize(_A_hat)
+                                # R_new = R @ Â_full
+                                _R_s = _R[:, :, _query_key_offset:]
+                                _R_p = _R[:, :, :_query_key_offset] + torch.bmm(
+                                    _R_s, _A_hat[:, :, :_query_key_offset]
+                                )
+                                _R_sf = torch.bmm(_R_s, _A_hat[:, :, _query_key_offset:])
                                 _R = torch.cat([_R_p, _R_sf], dim=-1)
 
-                            # Extract action→vision relevance (selected action subset)
-                            if _vis_idx_t.numel() > 0 and _sel_alen > 0:
-                                _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
-                                _step_score = _step_score.mean(dim=1)   # [B, num_vis]
-                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
+                            if _use_prefix_score_attn:
+                                if _vis_idx_t.numel() > 0 and _text_idx_t is not None and _text_idx_t.numel() > 0:
+                                    _step_score = _R[:, _text_idx_t, :][:, :, _vis_idx_t]
+                                    _step_score = _masked_query_mean(_step_score, _text_query_mask)
+                                    _step_score = _apply_interp_variant(_step_score)
+                                else:
+                                    _step_score = None
                             else:
-                                _step_score = None
+                                # Extract action→vision relevance (selected action subset)
+                                if _vis_idx_t.numel() > 0 and _sel_alen > 0:
+                                    _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                    _step_score = _step_score.mean(dim=1)
+                                    _step_score = _apply_interp_variant(_step_score)
+                                else:
+                                    _step_score = None
                         else:
                             # -- Last-layer scoring --
                             if cfg.interp_variant == "dimension_independent":
                                 _A_bar = _dim_A_bar
-                            elif cfg.interp_variant == "abs_heads":
-                                _A_last = _last_attn.detach().float()
-                                _A_bar = (_grad_last.float() * _A_last).abs().mean(dim=1)
-                            else:  # "original"
-                                _A_last = _last_attn.detach().float()
-                                _ga = (_grad_last.float() * _A_last).mean(dim=1)
-                                _A_bar = torch.relu(_ga)
-
-                            if _vis_idx_t.numel() > 0 and _sel_alen > 0:
-                                _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
-                                _step_score = _step_score.mean(dim=1)  # [B, num_vis]
-                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
                             else:
-                                _step_score = None
+                                _A_bar = _combine_attn_and_grad(_last_attn, _grad_last)
+
+                            if _use_prefix_score_attn:
+                                if _vis_idx_t.numel() > 0 and _text_idx_t is not None and _text_idx_t.numel() > 0:
+                                    _step_score = _A_bar[:, _text_idx_t, :][:, :, _vis_idx_t]
+                                    _step_score = _masked_query_mean(_step_score, _text_query_mask)
+                                    _step_score = _apply_interp_variant(_step_score)
+                                else:
+                                    _step_score = None
+                            else:
+                                if _vis_idx_t.numel() > 0 and _sel_alen > 0:
+                                    _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                    _step_score = _step_score.mean(dim=1)
+                                    _step_score = _apply_interp_variant(_step_score)
+                                else:
+                                    _step_score = None
 
                         if _step_score is not None:
                             if _score_accum is None:
@@ -1294,6 +1487,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     _score_accum = _score_accum / _score_count
 
                 if _score_accum is None:
+                    if token_norms is None:
+                        raise ValueError("Token norms are unavailable during eval_frame scoring.")
                     score_tokens = token_norms
                 else:
                     score_tokens = []
@@ -1307,52 +1502,81 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             elif cfg.grad_score_method == "attn_only":
                 prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
-                past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+                _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
+                past_key_values, prefix_score_attns = compute_prefix_cache(
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    capture_attn=_use_prefix_score_attn,
+                )
                 x_t, _, last_attn = run_diffusion(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
-                    capture_attn=True,
+                    capture_attn=not _use_prefix_score_attn,
                 )
-                if last_attn is None:
+                score_attns = prefix_score_attns if _use_prefix_score_attn else last_attn
+                if score_attns is None:
                     raise ValueError("Missing attention output for attention-based scoring.")
-                # Aggregate attention over last N Expert layers (mean pooling)
-                _n_layers = max(1, min(cfg.attn_num_layers, len(last_attn)))
+                # Aggregate attention over the selected scoring layers (mean pooling)
+                _n_layers = max(1, min(cfg.attn_num_layers, len(score_attns)))
                 if _n_layers == 1:
-                    attn_weights = last_attn[-1]
+                    attn_weights = score_attns[-1]
                 else:
-                    attn_weights = torch.stack(last_attn[-_n_layers:], dim=0).mean(dim=0)
-                action_len = cfg.chunk_size
-                query_len = attn_weights.shape[2]
-                action_end = query_len
-                action_start = max(0, action_end - action_len)
-                vision_indices = []
-                offset = 0
-                for meta in metas:
-                    offset += meta.num_extra_tokens
-                    vision_indices.extend(range(offset, offset + meta.num_patches))
-                    offset += meta.num_patches
-                vision_indices = torch.tensor(vision_indices, device=attn_weights.device)
+                    attn_weights = torch.stack(score_attns[-_n_layers:], dim=0).mean(dim=0)
                 key_len = attn_weights.shape[3]
-                if vision_indices.numel() > 0 and key_len > 0:
-                    vision_indices = vision_indices[vision_indices < key_len]
-                if vision_indices.numel() == 0 or action_start >= action_end:
-                    score_tokens = token_norms
-                else:
-                    action_attn = attn_weights[:, :, action_start:action_end, vision_indices]
-                    if action_attn.shape[2] == 0:
+                vision_indices = _build_vision_indices(key_len)
+                if _use_prefix_score_attn:
+                    text_indices, text_query_mask = _build_text_query_selection(attn_weights.shape[2])
+                    if vision_indices.numel() == 0 or text_indices.numel() == 0:
+                        if token_norms is None:
+                            raise ValueError("Token norms are unavailable for attention fallback scoring.")
                         score_tokens = token_norms
                     else:
-                        alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
-                        if cfg.grad_action_agg == "max":
-                            score = alpha.max(dim=2).values.sum(dim=1)
+                        text_attn = attn_weights[:, :, text_indices, :][:, :, :, vision_indices]
+                        alpha = text_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
+                        alpha = alpha * text_query_mask[:, None, :, None].to(dtype=alpha.dtype)
+                        if alpha.shape[2] == 0:
+                            if token_norms is None:
+                                raise ValueError("Token norms are unavailable for attention fallback scoring.")
+                            score_tokens = token_norms
                         else:
-                            score = alpha.sum(dim=(1, 2))
-                        score_tokens = []
-                        start = 0
-                        for meta in metas:
-                            end = start + meta.num_patches
-                            score_tokens.append(score[:, start:end])
-                            start = end
+                            if cfg.grad_action_agg == "max":
+                                score = alpha.max(dim=2).values.sum(dim=1)
+                            else:
+                                score = alpha.sum(dim=(1, 2))
+                            score_tokens = []
+                            start = 0
+                            for meta in metas:
+                                end = start + meta.num_patches
+                                score_tokens.append(score[:, start:end])
+                                start = end
+                else:
+                    action_len = cfg.chunk_size
+                    query_len = attn_weights.shape[2]
+                    action_end = query_len
+                    action_start = max(0, action_end - action_len)
+                    if vision_indices.numel() == 0 or action_start >= action_end:
+                        if token_norms is None:
+                            raise ValueError("Token norms are unavailable for attention fallback scoring.")
+                        score_tokens = token_norms
+                    else:
+                        action_attn = attn_weights[:, :, action_start:action_end, vision_indices]
+                        if action_attn.shape[2] == 0:
+                            if token_norms is None:
+                                raise ValueError("Token norms are unavailable for attention fallback scoring.")
+                            score_tokens = token_norms
+                        else:
+                            alpha = action_attn.float().clamp_min(1e-8).pow(cfg.attn_score_beta)
+                            if cfg.grad_action_agg == "max":
+                                score = alpha.max(dim=2).values.sum(dim=1)
+                            else:
+                                score = alpha.sum(dim=(1, 2))
+                            score_tokens = []
+                            start = 0
+                            for meta in metas:
+                                end = start + meta.num_patches
+                                score_tokens.append(score[:, start:end])
+                                start = end
                 actions = x_t.detach()
             else:
                 raise ValueError(f"Unsupported grad_score_method: {cfg.grad_score_method}")
@@ -1360,6 +1584,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if token_state.last_score_token is not None:
                 score_tokens = token_state.last_score_token
             else:
+                if token_norms is None:
+                    raise ValueError("Token norms are unavailable for fallback token selection scoring.")
                 score_tokens = token_norms
 
         score_regions = []
@@ -1503,13 +1729,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 else:
                     _eff_min = cfg.max_kept_tokens
                     _eff_max = cfg.max_kept_tokens
-            elif cfg.dynamic_prune_mode == "accel":
-                # Acceleration-based: map xyz / rotation independently into half
-                # of the token span so translation and rotation have equal weight.
-                _ema_xyz = token_state.ema_accel_xyz
-                _raw_xyz = token_state.last_accel_xyz
-                _ema_rot = token_state.ema_accel_rot
-                _raw_rot = token_state.last_accel_rot
+            elif cfg.dynamic_prune_mode in ("accel", "velocity"):
+                # Motion-based: use either chunk-internal acceleration or
+                # chunk-integrated action magnitude, then map xyz / rotation
+                # independently into half of the token span.
+                if cfg.dynamic_prune_mode == "accel":
+                    _ema_xyz = token_state.ema_accel_xyz
+                    _raw_xyz = token_state.last_accel_xyz
+                    _ema_rot = token_state.ema_accel_rot
+                    _raw_rot = token_state.last_accel_rot
+                else:
+                    _ema_xyz = token_state.ema_velocity_xyz
+                    _raw_xyz = token_state.last_velocity_xyz
+                    _ema_rot = token_state.ema_velocity_rot
+                    _raw_rot = token_state.last_velocity_rot
                 if (
                     _ema_xyz is not None
                     and _raw_xyz is not None
@@ -1616,13 +1849,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         image_pad_masks = None
         if not cfg.score_debug_heatmap and not eval_frame and cfg.token_prune_enabled:
-            image_embs, image_pad_masks = prune_image_embeddings(
-                image_embs, keep_token_masks, img_masks, metas
-            )
+            image_embs = []
+            image_pad_masks = []
+            with torch.no_grad():
+                for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
+                    pruned_embs, pruned_pad_mask = self.paligemma_with_expert.embed_image_pruned(
+                        img, keep_mask, img_mask
+                    )
+                    image_embs.append(pruned_embs)
+                    image_pad_masks.append(pruned_pad_mask)
 
         if actions is None:
             prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
-            past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+            past_key_values, _ = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
             with torch.no_grad():
                 actions, _, _ = run_diffusion(
                     prefix_pad_masks=prefix_pad_masks,
@@ -1675,7 +1914,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             }
 
         _need_l1 = (cfg.interp_plot_actions_l1
-                     or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel"))
+                     or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel", "velocity"))
         if _need_l1 and actions is not None:
             _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
             token_state.last_actions_l1 = _l1
@@ -1683,8 +1922,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 token_state.actions_l1_history.append(
                     (token_state.frame_idx, _l1)
                 )
-            if cfg.dynamic_prune_mode in ("ema", "accel"):
-                # Update L1 EMA (used by both ema and accel modes for reference)
+            if cfg.dynamic_prune_mode in ("ema", "accel", "velocity"):
+                # Update L1 EMA (used by ema and motion-based modes for reference)
                 if token_state.ema_l1 is None:
                     token_state.ema_l1 = _l1
                 else:
@@ -1750,11 +1989,67 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     token_state.ema_accel_rot_var,
                     cfg.l1_ema_alpha,
                 )
+            elif cfg.dynamic_prune_mode == "velocity":
+                # Compute chunk-integrated action magnitude:
+                # V_xyz / V_rot = sum_i( |a_i| ) over the corresponding dims.
+                _act = actions.detach().float()  # [B, ChunkSize, ActionDim]
+                if _act.dim() == 3 and _act.shape[1] > 0:
+                    _xyz_dims = min(3, _act.shape[-1])
+                    _xyz = _act[:, :, :_xyz_dims].abs()
+                    _vel_xyz = _xyz.sum().item() / _act.shape[0]
+                    _rot_start = min(3, _act.shape[-1])
+                    _rot_end = min(6, _act.shape[-1])
+                    if _rot_end > _rot_start:
+                        _rot = _act[:, :, _rot_start:_rot_end].abs()
+                        _vel_rot = _rot.sum().item() / _act.shape[0]
+                    else:
+                        _vel_rot = 0.0
+                else:
+                    _vel_xyz = 0.0
+                    _vel_rot = 0.0
+                token_state.last_velocity_xyz = _vel_xyz
+                token_state.last_velocity_rot = _vel_rot
+                token_state.last_velocity = 0.5 * (_vel_xyz + _vel_rot)
+                _prev_ema_xyz = token_state.ema_velocity_xyz
+                _prev_ema_rot = token_state.ema_velocity_rot
+                if token_state.ema_velocity_xyz is None:
+                    token_state.ema_velocity_xyz = _vel_xyz
+                else:
+                    token_state.ema_velocity_xyz = (
+                        cfg.l1_ema_alpha * token_state.ema_velocity_xyz
+                        + (1.0 - cfg.l1_ema_alpha) * _vel_xyz
+                    )
+                if token_state.ema_velocity_rot is None:
+                    token_state.ema_velocity_rot = _vel_rot
+                else:
+                    token_state.ema_velocity_rot = (
+                        cfg.l1_ema_alpha * token_state.ema_velocity_rot
+                        + (1.0 - cfg.l1_ema_alpha) * _vel_rot
+                    )
+                token_state.ema_velocity = 0.5 * (
+                    token_state.ema_velocity_xyz + token_state.ema_velocity_rot
+                )
+                _, token_state.ema_velocity_xyz_var = update_ema_mean_and_var(
+                    _vel_xyz,
+                    _prev_ema_xyz,
+                    token_state.ema_velocity_xyz_var,
+                    cfg.l1_ema_alpha,
+                )
+                _, token_state.ema_velocity_rot_var = update_ema_mean_and_var(
+                    _vel_rot,
+                    _prev_ema_rot,
+                    token_state.ema_velocity_rot_var,
+                    cfg.l1_ema_alpha,
+                )
         if cfg.reset_discard_pool_on_gripper_close and actions is not None:
             _act = actions.detach().float()
             if _act.numel() > 0 and (_act[..., -1] > cfg.gripper_close_threshold).any().item():
                 token_state.pending_global_pool_restore = True
 
+        latency_bucket = "scoring_frame" if eval_frame else (
+            "pruned_frame" if cfg.token_prune_enabled else "token_selection_unpruned"
+        )
+        self._record_cuda_latency(latency_timer, latency_bucket)
         token_state.frame_idx += 1
 
         return actions
@@ -2053,6 +2348,15 @@ class PI05Policy(PreTrainedPolicy):
         }
         if hasattr(self, "model"):
             self.model.reset_token_selection_state()
+
+    def reset_cuda_latency_stats(self):
+        if hasattr(self, "model") and hasattr(self.model, "reset_cuda_latency_stats"):
+            self.model.reset_cuda_latency_stats()
+
+    def get_cuda_latency_samples(self) -> dict[str, list[float]] | None:
+        if not hasattr(self, "model") or not hasattr(self.model, "get_cuda_latency_samples"):
+            return None
+        return self.model.get_cuda_latency_samples()
 
     def get_token_selection_state(self) -> dict[str, Tensor] | None:
         if not hasattr(self, "model") or not hasattr(self.model, "_token_selection_state"):

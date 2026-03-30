@@ -189,6 +189,33 @@ def _extract_overlay_state(policy: PreTrainedPolicy):
     return overlay_grid.astype(np.uint8), region_scores, heatmap_grid_out, keep_grid_out
 
 
+def _summarize_latency_samples(samples: dict[str, list[float]] | None) -> dict[str, dict[str, float | int]]:
+    if not samples:
+        return {}
+
+    summary = {}
+    for bucket, values in samples.items():
+        if not values:
+            continue
+        arr = np.asarray(values, dtype=float)
+        summary[bucket] = {
+            "count": int(arr.size),
+            "mean": float(arr.mean()),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+            "max": float(arr.max()),
+        }
+    return summary
+
+
+def _merge_latency_samples(acc: dict[str, list[float]], samples: dict[str, list[float]] | None) -> None:
+    if not samples:
+        return
+    for bucket, values in samples.items():
+        if values:
+            acc[bucket].extend(float(v) for v in values)
+
+
 def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
                           keep_grid=None, prune_darken=0.5, prune_stripe_gap=4):
     """Overlay a continuous heatmap (blue→red) on *img* based on *heatmap_grid*.
@@ -567,6 +594,8 @@ def eval_policy(
 
     start = time.time()
     policy.eval()
+    if hasattr(policy, "reset_cuda_latency_stats"):
+        policy.reset_cuda_latency_stats()
 
     overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
     heatmap_debug = bool(getattr(getattr(policy, "config", None), "score_debug_heatmap", False))
@@ -793,6 +822,12 @@ def eval_policy(
             _token_sel_stats["total_kept"] = _ts_final.total_kept
             _token_sel_stats["total_possible"] = _ts_final.total_possible
 
+    _cuda_latency_samples = None
+    _cuda_latency_stats = {}
+    if hasattr(policy, "get_cuda_latency_samples"):
+        _cuda_latency_samples = policy.get_cuda_latency_samples()
+        _cuda_latency_stats = _summarize_latency_samples(_cuda_latency_samples)
+
     # Compile eval info.
     info = {
         "per_episode": [
@@ -824,6 +859,10 @@ def eval_policy(
 
     if _token_sel_stats:
         info["token_selection_stats"] = _token_sel_stats
+    if _cuda_latency_stats:
+        info["cuda_latency_ms"] = _cuda_latency_stats
+    if _cuda_latency_samples:
+        info["_cuda_latency_samples_ms"] = _cuda_latency_samples
 
     if return_episode_data:
         info["episodes"] = episode_data
@@ -964,6 +1003,8 @@ class TaskMetrics(TypedDict, total=False):
     successes: list[bool]
     video_paths: list[str]
     token_selection_stats: dict
+    cuda_latency_ms: dict
+    _cuda_latency_samples_ms: dict[str, list[float]]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -1010,6 +1051,10 @@ def eval_one(
     )
     if "token_selection_stats" in task_result:
         result["token_selection_stats"] = task_result["token_selection_stats"]
+    if "cuda_latency_ms" in task_result:
+        result["cuda_latency_ms"] = task_result["cuda_latency_ms"]
+    if "_cuda_latency_samples_ms" in task_result:
+        result["_cuda_latency_samples_ms"] = task_result["_cuda_latency_samples_ms"]
     return result
 
 
@@ -1149,6 +1194,14 @@ def eval_policy_all(
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
 
+    group_cuda_samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    overall_cuda_samples: dict[str, list[float]] = defaultdict(list)
+    for ti in per_task_infos:
+        raw_samples = ti["metrics"].pop("_cuda_latency_samples_ms", None)
+        if raw_samples:
+            _merge_latency_samples(group_cuda_samples[ti["task_group"]], raw_samples)
+            _merge_latency_samples(overall_cuda_samples, raw_samples)
+
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
         if not xs:
@@ -1207,6 +1260,9 @@ def eval_policy_all(
                 f"avg_prune={group_ts.get('avg_prune_ratio', 'N/A')}%, "
                 f"success_rate={_sr_str}"
             )
+        group_cuda = _summarize_latency_samples(group_cuda_samples.get(group))
+        if group_cuda:
+            group_agg["cuda_latency_ms"] = group_cuda
         groups_aggregated[group] = group_agg
 
     # overall aggregates
@@ -1219,6 +1275,9 @@ def eval_policy_all(
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
+    overall_cuda = _summarize_latency_samples(overall_cuda_samples)
+    if overall_cuda:
+        overall_agg["cuda_latency_ms"] = overall_cuda
 
     return {
         "per_task": per_task_infos,

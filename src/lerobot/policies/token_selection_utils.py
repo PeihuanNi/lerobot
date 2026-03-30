@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 
 @dataclass
@@ -73,6 +73,15 @@ class TokenSelectionState:
     last_accel_rot: float | None = None
     ema_accel_rot: float | None = None
     ema_accel_rot_var: float = 0.0
+    # Velocity-based pruning: chunk-integrated action magnitude
+    last_velocity: float | None = None
+    ema_velocity: float | None = None
+    last_velocity_xyz: float | None = None
+    ema_velocity_xyz: float | None = None
+    ema_velocity_xyz_var: float = 0.0
+    last_velocity_rot: float | None = None
+    ema_velocity_rot: float | None = None
+    ema_velocity_rot_var: float = 0.0
 
     def __post_init__(self):
         if self.last_stats is None:
@@ -108,6 +117,14 @@ class TokenSelectionState:
         self.last_accel_rot = None
         self.ema_accel_rot = None
         self.ema_accel_rot_var = 0.0
+        self.last_velocity = None
+        self.ema_velocity = None
+        self.last_velocity_xyz = None
+        self.ema_velocity_xyz = None
+        self.ema_velocity_xyz_var = 0.0
+        self.last_velocity_rot = None
+        self.ema_velocity_rot = None
+        self.ema_velocity_rot_var = 0.0
 
 
 def infer_patch_grid(num_tokens: int) -> PatchGridMeta:
@@ -245,7 +262,8 @@ def discard_top_scoring_regions(
                      to avoid depleting the global token pool.
         mode: "top"    = discard highest-scoring (old center, trajectory remnants);
               "bottom" = discard lowest-scoring (least relevant background);
-              "middle" = discard mid-scoring (ambiguous/uncertain tokens).
+              "middle" = discard mid-scoring (ambiguous/uncertain tokens);
+              "random" = randomly discard from previous kept regions.
                      
     Returns:
         Boolean mask [B, R] with True for regions scheduled to be permanently discarded.
@@ -254,6 +272,9 @@ def discard_top_scoring_regions(
     discard_mask = torch.zeros_like(keep_region, dtype=torch.bool)
     if discard_ratio <= 0.0:
         return discard_mask
+    valid_modes = {"top", "bottom", "middle", "random"}
+    if mode not in valid_modes:
+        raise ValueError(f"Invalid discard mode: {mode}")
         
     for batch_idx in range(batch_size):
         kept_indices = keep_region[batch_idx].nonzero(as_tuple=True)[0]
@@ -276,6 +297,8 @@ def discard_top_scoring_regions(
             mid_start = (n - num_to_discard) // 2
             mid_end = mid_start + num_to_discard
             selected_idx = sorted_idx[mid_start:mid_end]
+        elif mode == "random":
+            selected_idx = torch.randperm(len(kept_indices), device=kept_indices.device)[:num_to_discard]
         else:
             # "top" → sort descending (highest first); "bottom" → sort ascending
             _descending = (mode == "top")
@@ -407,3 +430,90 @@ def prune_image_embeddings(
         pruned_embs.append(padded)
         pruned_pad_masks.append(pad_mask)
     return pruned_embs, pruned_pad_masks
+
+
+def embed_pruned_vision_tokens(
+    pixel_values: Tensor,
+    keep_masks: Tensor,
+    img_masks: Tensor,
+    patch_embedding: nn.Module,
+    position_embedding: nn.Module,
+    encoder: nn.Module,
+    post_layernorm: nn.Module,
+    projector: nn.Module,
+) -> tuple[Tensor, Tensor]:
+    if keep_masks.dim() != 2:
+        raise ValueError(f"keep_masks must have shape [B, N], got {tuple(keep_masks.shape)}")
+
+    patch_dtype = patch_embedding.weight.dtype
+    pos_dtype = position_embedding.weight.dtype
+    patch_embeds = patch_embedding(pixel_values.to(dtype=patch_dtype))
+    patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+
+    batch_size, num_patches, _ = patch_embeds.shape
+    if keep_masks.shape != (batch_size, num_patches):
+        raise ValueError(
+            f"keep_masks shape {tuple(keep_masks.shape)} does not match patch sequence {(batch_size, num_patches)}"
+        )
+
+    position_ids = torch.arange(num_patches, device=patch_embeds.device)
+    patch_embeds = patch_embeds.to(dtype=pos_dtype)
+    patch_embeds = patch_embeds + position_embedding(position_ids).unsqueeze(0).to(dtype=pos_dtype)
+
+    encoder_dtype = None
+    encoder_layers = getattr(encoder, "layers", None)
+    if encoder_layers is not None and len(encoder_layers) > 0:
+        encoder_dtype = encoder_layers[0].layer_norm1.weight.dtype
+    elif hasattr(encoder, "layer_norm1"):
+        encoder_dtype = encoder.layer_norm1.weight.dtype
+
+    projected_dim = getattr(getattr(projector, "linear", None), "out_features", patch_embeds.shape[-1])
+    projector_dtype = None
+    projector_param = next(projector.parameters(), None)
+    if projector_param is not None:
+        projector_dtype = projector_param.dtype
+    post_layernorm_dtype = getattr(post_layernorm, "weight", None)
+    if post_layernorm_dtype is not None:
+        post_layernorm_dtype = post_layernorm_dtype.dtype
+    projected_samples: list[Tensor] = []
+    lengths: list[int] = []
+
+    for batch_idx in range(batch_size):
+        if not bool(img_masks[batch_idx].item()):
+            projected_samples.append(patch_embeds.new_zeros((0, projected_dim)))
+            lengths.append(0)
+            continue
+
+        keep_idx = torch.nonzero(keep_masks[batch_idx], as_tuple=False).squeeze(-1)
+        if keep_idx.numel() == 0:
+            projected_samples.append(patch_embeds.new_zeros((0, projected_dim)))
+            lengths.append(0)
+            continue
+
+        hidden_states = patch_embeds[batch_idx : batch_idx + 1].index_select(1, keep_idx)
+        if encoder_dtype is not None:
+            hidden_states = hidden_states.to(dtype=encoder_dtype)
+        encoder_outputs = encoder(inputs_embeds=hidden_states)
+        if isinstance(encoder_outputs, tuple):
+            hidden_states = encoder_outputs[0]
+        else:
+            hidden_states = encoder_outputs.last_hidden_state
+        if post_layernorm_dtype is not None:
+            hidden_states = hidden_states.to(dtype=post_layernorm_dtype)
+        hidden_states = post_layernorm(hidden_states)
+        if projector_dtype is not None:
+            hidden_states = hidden_states.to(dtype=projector_dtype)
+        hidden_states = projector(hidden_states).squeeze(0)
+        projected_samples.append(hidden_states)
+        lengths.append(hidden_states.shape[0])
+
+    max_len = max(lengths) if lengths else 0
+    out_dtype = next((sample.dtype for sample in projected_samples if sample.numel() > 0), patch_embeds.dtype)
+    padded = torch.zeros((batch_size, max_len, projected_dim), dtype=out_dtype, device=patch_embeds.device)
+    pad_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=patch_embeds.device)
+    for batch_idx, length in enumerate(lengths):
+        if length > 0:
+            padded[batch_idx, :length] = projected_samples[batch_idx]
+            pad_mask[batch_idx, :length] = True
+
+    return padded, pad_mask

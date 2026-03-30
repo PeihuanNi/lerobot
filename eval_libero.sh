@@ -1,8 +1,9 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR="./outputs/eval/gt-pi0_object"   # e.g. "./outputs/eval/my_eval"; empty = lerobot-eval auto-generates one
+SCORING_STRATEGY="${2:-normal}"  # normal | gradxattn_abs | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision
+OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from strategy
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
-POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
-POLICY_TYPE="pi0"
+POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
+POLICY_TYPE="pi05"
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -16,29 +17,67 @@ ENV_TYPE="libero"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 ENV_TASK="libero_object"
 ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
-EVAL_BATCH_SIZE=2
+EVAL_BATCH_SIZE=1
 EVAL_N_EPISODES=50
-MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s
+MAX_EPISODES_RENDERED=10             # 0 = no video; >0 = save that many mp4s
 
 USE_L1_REGRESSION=false
 USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
 TOKEN_SELECTION_ENABLED=true
-TOKEN_PRUNE_ENABLED=false
+TOKEN_PRUNE_ENABLED=true
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
-GRAD_SCORE_METHOD="transformer_interpretability"
-# transformer_interpretability | attn_only
+GRAD_SCORE_METHOD="transformer_interpretability" # transformer_interpretability | grad_only | action_vision(attn_only alias)
+SCORE_ATTN_SOURCE="action_vision"  # "action_vision" | "vision_text"
+
+
+INTERP_VARIANT="abs_heads"
+case "${SCORING_STRATEGY}" in
+  normal|default|manual|gradxattn_abs|gradxattn_abs_heads)
+    GRAD_SCORE_METHOD="transformer_interpretability"
+    INTERP_VARIANT="abs_heads"
+    ;;
+  gradxattn_dim|gradxattn_dimension_independent)
+    GRAD_SCORE_METHOD="transformer_interpretability"
+    INTERP_VARIANT="dimension_independent"
+    ;;
+  gradxattn_relu)
+    GRAD_SCORE_METHOD="transformer_interpretability"
+    INTERP_VARIANT="original"
+    ;;
+  gradxattn_direct)
+    GRAD_SCORE_METHOD="transformer_interpretability"
+    INTERP_VARIANT="direct"
+    ;;
+  grad_only_relu)
+    GRAD_SCORE_METHOD="grad_only"
+    INTERP_VARIANT="original"
+    ;;
+  grad_only_direct)
+    GRAD_SCORE_METHOD="grad_only"
+    INTERP_VARIANT="direct"
+    ;;
+  action_vision|action_vision_direct|attn_only)
+    GRAD_SCORE_METHOD="action_vision"
+    INTERP_VARIANT="direct"
+    ;;
+  *)
+    echo "Unknown SCORING_STRATEGY: ${SCORING_STRATEGY}" >&2
+    echo "Valid options: normal | gradxattn_abs | gradxattn_abs_heads | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision | attn_only" >&2
+    exit 1
+    ;;
+esac
 
 # -- transformer_interpretability --
 INTERP_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
 INTERP_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
 INTERP_ACTION_START=5              # first action step for objective (0-indexed)
 INTERP_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
-INTERP_VARIANT="dimension_independent"     # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-action-dim backprop
+INTERP_VARIANT="${INTERP_VARIANT}"     # original = ReLU | abs_heads = mean_h(|g*A|) | direct = signed mean_h(g*A) | dimension_independent = per-action-dim backprop
 INTERP_OBJECTIVE="action_sample_L1"    # action_sample_L1 | vector_field_L2
 INTERP_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 
@@ -59,16 +98,17 @@ GRAD_KEEP_PREV=false
 #      "none"          — fixed PRUNE_RATIO
 #      "l1_threshold"  — binary: L1 > threshold → MIN, else → MAX
 #      "ema"           — continuous: EMA-smoothed L1 → sigmoid → [MAX, MIN]
+#      "velocity"      — action chunk magnitude based dynamic pruning
 # ══════════════════════════════════════════════════════════════════════════════
 # -- Shared: min/max guardrails (always applied) --
-DYNAMIC_PRUNE_MODE="accel"  # "none" | "l1_threshold" | "ema" | "accel"
-PRUNE_RATIO=32                     # fixed kept-token count (when mode="none")
+DYNAMIC_PRUNE_MODE="accel"  # "none" | "l1_threshold" | "ema" | "accel" | "velocity"
+PRUNE_RATIO=96                     # fixed kept-token count (when mode="none")
 MIN_KEPT_TOKENS=64                 # aggressive (fewer kept)
 MAX_KEPT_TOKENS=128                # conservative (more kept)
 
 # -- Global Active Token Pool --
 DISCARD_PREV_KEPT_RATIO=0.1        # discard highest-scoring 10% from previous frame
-DISCARD_MODE="middle"              # "top" | "bottom" | "middle"
+DISCARD_MODE="middle"              # "top" | "bottom" | "middle" | "random"
 RESET_DISCARD_POOL_ON_GRIPPER_CLOSE=true
 GRIPPER_CLOSE_THRESHOLD=0.0        # action[..., -1] > threshold => schedule full-pool restore
 
@@ -107,6 +147,13 @@ WANDB_ENTITY=""
 WANDB_PROJECT=""
 SEED=7
 
+if [ -z "${RUN_ID_NOTE}" ]; then
+  RUN_ID_NOTE="${SCORING_STRATEGY}"
+fi
+if [ -z "${OUTPUT_DIR}" ]; then
+  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}"
+fi
+
 ARGS=(
   "--policy.n_action_steps=${N_ACTION_STEPS}"
   "--policy.use_l1_regression=${USE_L1_REGRESSION}"
@@ -115,6 +162,7 @@ ARGS=(
   "--policy.token_selection_enabled=${TOKEN_SELECTION_ENABLED}"
   # 1. Scoring
   "--policy.grad_score_method=${GRAD_SCORE_METHOD}"
+  "--policy.score_attn_source=${SCORE_ATTN_SOURCE}"
   "--policy.interp_denoise_step=${INTERP_DENOISE_STEP}"
   "--policy.interp_use_residual=${INTERP_USE_RESIDUAL}"
   "--policy.interp_action_start=${INTERP_ACTION_START}"
