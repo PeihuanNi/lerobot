@@ -58,6 +58,11 @@ class EvalConfig:
     use_async_envs: bool = False
     # Maximum number of episodes to render as mp4 videos. 0 = no video.
     max_episodes_rendered: int = 10
+    # Measure GPU inference latency for policy.select_action using CUDA events.
+    # For action-chunking policies, only calls that trigger a real model inference are timed.
+    measure_cuda_latency: bool = False
+    # Skip the first N real model inference calls from latency statistics to reduce warmup noise.
+    cuda_latency_warmup_steps: int = 5
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
@@ -68,4 +73,9 @@ class EvalConfig:
                 "This might significantly slow down evaluation. To fix this, you should update your command "
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
+            )
+        if self.cuda_latency_warmup_steps < 0:
+            raise ValueError(
+                "eval.cuda_latency_warmup_steps must be non-negative, "
+                f"got {self.cuda_latency_warmup_steps}."
             )

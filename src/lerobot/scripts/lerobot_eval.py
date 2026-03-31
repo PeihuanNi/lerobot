@@ -93,6 +93,116 @@ from lerobot.utils.utils import (
 )
 
 
+def _policy_will_run_inference(policy: PreTrainedPolicy) -> bool:
+    """Best-effort check for whether select_action will trigger a real model inference."""
+    action_queue = getattr(policy, "_action_queue", None)
+    if action_queue is None:
+        return True
+    try:
+        return len(action_queue) == 0
+    except TypeError:
+        return True
+
+
+def _build_cuda_latency_stats(
+    *,
+    device: torch.device,
+    samples_ms: list[float],
+    select_action_calls: int,
+    model_inference_calls: int,
+    action_queue_pop_calls: int,
+    warmup_skipped_inference_calls: int,
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "device": str(device),
+        "unit": "ms",
+        "scope": (
+            "policy.select_action actual CUDA inference only; excludes preprocessing, "
+            "postprocessing, environment stepping, and queue-only action pops"
+        ),
+        "select_action_calls": int(select_action_calls),
+        "model_inference_calls": int(model_inference_calls),
+        "action_queue_pop_calls": int(action_queue_pop_calls),
+        "warmup_skipped_inference_calls": int(warmup_skipped_inference_calls),
+        "measured_inference_calls": len(samples_ms),
+    }
+    if samples_ms:
+        samples_arr = np.asarray(samples_ms, dtype=np.float64)
+        stats.update(
+            {
+                "mean_ms": round(float(samples_arr.mean()), 3),
+                "p50_ms": round(float(np.quantile(samples_arr, 0.50)), 3),
+                "p95_ms": round(float(np.quantile(samples_arr, 0.95)), 3),
+                "min_ms": round(float(samples_arr.min()), 3),
+                "max_ms": round(float(samples_arr.max()), 3),
+            }
+        )
+    return stats
+
+
+class CUDAPolicyLatencyTracker:
+    """Tracks policy CUDA latency across multiple rollouts and tasks."""
+
+    def __init__(self, device: torch.device, warmup_steps: int = 5):
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"CUDAPolicyLatencyTracker requires a CUDA device, got {device}.")
+
+        self.device = device
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.samples_ms: list[float] = []
+        self.select_action_calls = 0
+        self.model_inference_calls = 0
+        self.action_queue_pop_calls = 0
+        self.warmup_skipped_inference_calls = 0
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "sample_count": len(self.samples_ms),
+            "select_action_calls": self.select_action_calls,
+            "model_inference_calls": self.model_inference_calls,
+            "action_queue_pop_calls": self.action_queue_pop_calls,
+            "warmup_skipped_inference_calls": self.warmup_skipped_inference_calls,
+        }
+
+    def record_queue_pop(self) -> None:
+        self.select_action_calls += 1
+        self.action_queue_pop_calls += 1
+
+    def record_inference(self, latency_ms: float) -> None:
+        self.select_action_calls += 1
+        self.model_inference_calls += 1
+        if self.warmup_skipped_inference_calls < self.warmup_steps:
+            self.warmup_skipped_inference_calls += 1
+            return
+        self.samples_ms.append(float(latency_ms))
+
+    def stats_since(self, snapshot: dict[str, int]) -> tuple[dict[str, Any], list[float]]:
+        samples_ms = self.samples_ms[snapshot["sample_count"] :]
+        stats = _build_cuda_latency_stats(
+            device=self.device,
+            samples_ms=samples_ms,
+            select_action_calls=self.select_action_calls - snapshot["select_action_calls"],
+            model_inference_calls=self.model_inference_calls - snapshot["model_inference_calls"],
+            action_queue_pop_calls=self.action_queue_pop_calls - snapshot["action_queue_pop_calls"],
+            warmup_skipped_inference_calls=(
+                self.warmup_skipped_inference_calls - snapshot["warmup_skipped_inference_calls"]
+            ),
+        )
+        return stats, list(samples_ms)
+
+
+def _new_cuda_latency_accumulator() -> dict[str, Any]:
+    return {
+        "device": None,
+        "samples_ms": [],
+        "select_action_calls": 0,
+        "model_inference_calls": 0,
+        "action_queue_pop_calls": 0,
+        "warmup_skipped_inference_calls": 0,
+    }
+
+
 def _to_numpy(value):
     if value is None:
         return None
@@ -375,6 +485,7 @@ def rollout(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    latency_tracker: CUDAPolicyLatencyTracker | None = None,
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
@@ -450,7 +561,23 @@ def rollout(
 
         observation = preprocessor(observation)
         with torch.no_grad():
-            action = policy.select_action(observation)
+            if latency_tracker is None:
+                action = policy.select_action(observation)
+            else:
+                did_infer = _policy_will_run_inference(policy)
+                if did_infer:
+                    with torch.cuda.device(latency_tracker.device):
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        stream = torch.cuda.current_stream(device=latency_tracker.device)
+                        start_event.record(stream)
+                        action = policy.select_action(observation)
+                        end_event.record(stream)
+                        end_event.synchronize()
+                        latency_tracker.record_inference(start_event.elapsed_time(end_event))
+                else:
+                    action = policy.select_action(observation)
+                    latency_tracker.record_queue_pop()
         action = postprocessor(action)
 
         action_transition = {"action": action}
@@ -538,6 +665,7 @@ def eval_policy(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    latency_tracker: CUDAPolicyLatencyTracker | None = None,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
@@ -575,6 +703,7 @@ def eval_policy(
     show_ids = bool(getattr(getattr(policy, "config", None), "overlay_show_ids", False))
     last_overlay_grid = None
     last_region_scores = None
+    latency_snapshot = latency_tracker.snapshot() if latency_tracker is not None else None
 
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
@@ -684,6 +813,7 @@ def eval_policy(
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
+            latency_tracker=latency_tracker,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
@@ -833,6 +963,11 @@ def eval_policy(
     if _sched_stats:
         info["model_scheduling_stats"] = _sched_stats
 
+    if latency_tracker is not None and latency_snapshot is not None:
+        latency_stats, latency_samples_ms = latency_tracker.stats_since(latency_snapshot)
+        info["cuda_latency_stats"] = latency_stats
+        info["_cuda_latency_samples_ms"] = latency_samples_ms
+
     if return_episode_data:
         info["episodes"] = episode_data
 
@@ -934,6 +1069,28 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    latency_tracker = None
+    effective_max_parallel_tasks = cfg.env.max_parallel_tasks
+    if cfg.eval.measure_cuda_latency:
+        if device.type != "cuda":
+            logging.warning(
+                "eval.measure_cuda_latency=true was requested, but policy device is %s. "
+                "CUDA latency measurement will be skipped.",
+                device,
+            )
+        else:
+            latency_tracker = CUDAPolicyLatencyTracker(
+                device=device,
+                warmup_steps=cfg.eval.cuda_latency_warmup_steps,
+            )
+            if effective_max_parallel_tasks > 1:
+                logging.warning(
+                    "CUDA latency measurement requires serialized task execution for stable timing. "
+                    "Overriding env.max_parallel_tasks from %s to 1.",
+                    effective_max_parallel_tasks,
+                )
+                effective_max_parallel_tasks = 1
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -946,7 +1103,8 @@ def eval_main(cfg: EvalPipelineConfig):
             max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
+            max_parallel_tasks=effective_max_parallel_tasks,
+            latency_tracker=latency_tracker,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -973,6 +1131,8 @@ class TaskMetrics(TypedDict, total=False):
     video_paths: list[str]
     token_selection_stats: dict
     model_scheduling_stats: dict
+    cuda_latency_stats: dict
+    _cuda_latency_samples_ms: list[float]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -986,6 +1146,7 @@ def eval_one(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    latency_tracker: CUDAPolicyLatencyTracker | None,
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
@@ -1003,6 +1164,7 @@ def eval_one(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        latency_tracker=latency_tracker,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
@@ -1021,6 +1183,10 @@ def eval_one(
         result["token_selection_stats"] = task_result["token_selection_stats"]
     if "model_scheduling_stats" in task_result:
         result["model_scheduling_stats"] = task_result["model_scheduling_stats"]
+    if "cuda_latency_stats" in task_result:
+        result["cuda_latency_stats"] = task_result["cuda_latency_stats"]
+    if "_cuda_latency_samples_ms" in task_result:
+        result["_cuda_latency_samples_ms"] = task_result["_cuda_latency_samples_ms"]
     return result
 
 
@@ -1034,6 +1200,7 @@ def run_one(
     env_postprocessor,
     preprocessor,
     postprocessor,
+    latency_tracker,
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
@@ -1058,6 +1225,7 @@ def run_one(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        latency_tracker=latency_tracker,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
@@ -1084,6 +1252,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    latency_tracker: CUDAPolicyLatencyTracker | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1094,12 +1263,20 @@ def eval_policy_all(
     """
     start_t = time.time()
 
+    if latency_tracker is not None and max_parallel_tasks > 1:
+        raise ValueError(
+            "CUDA latency measurement cannot be combined with max_parallel_tasks > 1 because "
+            "concurrent task execution would corrupt timing statistics."
+        )
+
     # Flatten envs into list of (task_group, task_id, env)
     tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
 
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
+    group_latency_acc: dict[str, dict[str, Any]] = defaultdict(_new_cuda_latency_accumulator)
+    overall_latency_acc = _new_cuda_latency_accumulator()
     per_task_infos: list[dict] = []
 
     # small inline helper to accumulate one task's metrics into accumulators
@@ -1126,6 +1303,24 @@ def eval_policy_all(
             group_acc[group]["video_paths"].extend(paths)
             overall["video_paths"].extend(paths)
 
+        latency_stats = metrics.get("cuda_latency_stats")
+        if latency_stats:
+            latency_samples_ms = metrics.get("_cuda_latency_samples_ms", [])
+
+            def _merge_latency(dest: dict[str, Any]):
+                if dest["device"] is None:
+                    dest["device"] = latency_stats.get("device")
+                dest["samples_ms"].extend(latency_samples_ms)
+                dest["select_action_calls"] += int(latency_stats.get("select_action_calls", 0))
+                dest["model_inference_calls"] += int(latency_stats.get("model_inference_calls", 0))
+                dest["action_queue_pop_calls"] += int(latency_stats.get("action_queue_pop_calls", 0))
+                dest["warmup_skipped_inference_calls"] += int(
+                    latency_stats.get("warmup_skipped_inference_calls", 0)
+                )
+
+            _merge_latency(group_latency_acc[group])
+            _merge_latency(overall_latency_acc)
+
     # Choose runner (sequential vs threaded)
     task_runner = partial(
         run_one,
@@ -1134,6 +1329,7 @@ def eval_policy_all(
         env_postprocessor=env_postprocessor,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        latency_tracker=latency_tracker,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
@@ -1147,7 +1343,9 @@ def eval_policy_all(
         for task_group, task_id, env in tasks:
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
-            per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+            metrics_for_output = dict(metrics)
+            metrics_for_output.pop("_cuda_latency_samples_ms", None)
+            per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics_for_output})
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
@@ -1158,7 +1356,9 @@ def eval_policy_all(
             for fut in cf.as_completed(fut2meta):
                 tg, tid, metrics = fut.result()
                 _accumulate_to(tg, metrics)
-                per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                metrics_for_output = dict(metrics)
+                metrics_for_output.pop("_cuda_latency_samples_ms", None)
+                per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics_for_output})
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
@@ -1241,6 +1441,23 @@ def eval_policy_all(
                     group_sched_agg["vla_actions"] / _total_actions, 4
                 )
             group_agg["model_scheduling_stats"] = group_sched_agg
+        latency_acc = group_latency_acc.get(group)
+        if latency_acc and latency_acc["device"] is not None:
+            group_latency_stats = _build_cuda_latency_stats(
+                device=torch.device(latency_acc["device"]),
+                samples_ms=latency_acc["samples_ms"],
+                select_action_calls=latency_acc["select_action_calls"],
+                model_inference_calls=latency_acc["model_inference_calls"],
+                action_queue_pop_calls=latency_acc["action_queue_pop_calls"],
+                warmup_skipped_inference_calls=latency_acc["warmup_skipped_inference_calls"],
+            )
+            group_agg["cuda_latency_stats"] = group_latency_stats
+            logging.info(
+                f"[{group}] CUDA latency: mean={group_latency_stats.get('mean_ms', 'N/A')}ms, "
+                f"p95={group_latency_stats.get('p95_ms', 'N/A')}ms, "
+                f"max={group_latency_stats.get('max_ms', 'N/A')}ms, "
+                f"measured_inference_calls={group_latency_stats.get('measured_inference_calls', 0)}"
+            )
         groups_aggregated[group] = group_agg
 
     # overall aggregates
@@ -1253,6 +1470,15 @@ def eval_policy_all(
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
+    if overall_latency_acc["device"] is not None:
+        overall_agg["cuda_latency_stats"] = _build_cuda_latency_stats(
+            device=torch.device(overall_latency_acc["device"]),
+            samples_ms=overall_latency_acc["samples_ms"],
+            select_action_calls=overall_latency_acc["select_action_calls"],
+            model_inference_calls=overall_latency_acc["model_inference_calls"],
+            action_queue_pop_calls=overall_latency_acc["action_queue_pop_calls"],
+            warmup_skipped_inference_calls=overall_latency_acc["warmup_skipped_inference_calls"],
+        )
 
     return {
         "per_task": per_task_infos,

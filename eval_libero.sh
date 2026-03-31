@@ -7,14 +7,16 @@ GPU_IDS="${1:-${CUDA_VISIBLE_DEVICES:-0}}"
 # -----------------------------------------------------------------------------
 # Basic experiment settings
 # -----------------------------------------------------------------------------
-POLICY_TYPE="${POLICY_TYPE:-pi0}"           # pi0 | pi05
-SPVLA_PRESET="${SPVLA_PRESET:-reference}"   # baseline | schedule_only | token_only | reference | paper_acc | paper_speed
+POLICY_TYPE="${POLICY_TYPE:-pi05}"           # pi0 | pi05
+SPVLA_PRESET="${SPVLA_PRESET:-paper_acc}"   # baseline | schedule_only | token_only | reference | paper_acc | paper_speed
 ENV_TYPE="${ENV_TYPE:-libero}"
-ENV_TASK="${ENV_TASK:-libero_10}"
-ENV_TASK_ID="${ENV_TASK_ID:-[0,1,2,3,4,5,6,7,8,9]}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
-EVAL_N_EPISODES="${EVAL_N_EPISODES:-50}"
+ENV_TASK="${ENV_TASK:-libero_object}"
+ENV_TASK_ID="${ENV_TASK_ID:-[0]}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+EVAL_N_EPISODES="${EVAL_N_EPISODES:-10}"
 MAX_EPISODES_RENDERED="${MAX_EPISODES_RENDERED:-20}"
+MEASURE_CUDA_LATENCY="${MEASURE_CUDA_LATENCY:-true}"
+CUDA_LATENCY_WARMUP_STEPS="${CUDA_LATENCY_WARMUP_STEPS:-5}"
 SEED="${SEED:-7}"
 
 MODEL_ROOT="${MODEL_ROOT:-/home/nipeihuan/models}"
@@ -240,7 +242,7 @@ USE_WANDB="${USE_WANDB:-false}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-}"
 
-RUN_NAME="${RUN_NAME:-${POLICY_TYPE}_${ENV_TASK#libero_}_${SPVLA_PRESET}}"
+RUN_NAME="${RUN_NAME:-${POLICY_TYPE}_${ENV_TASK#libero_}_${SPVLA_PRESET}_cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs/eval/${RUN_NAME}}"
 ROLLOUT_DIR="${ROLLOUT_DIR:-${OUTPUT_DIR}/rollout_artifacts}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${OUTPUT_DIR}/debug_artifacts}"
@@ -328,6 +330,8 @@ ARGS=(
   "--eval.batch_size=${EVAL_BATCH_SIZE}"
   "--eval.n_episodes=${EVAL_N_EPISODES}"
   "--eval.max_episodes_rendered=${MAX_EPISODES_RENDERED}"
+  "--eval.measure_cuda_latency=${MEASURE_CUDA_LATENCY}"
+  "--eval.cuda_latency_warmup_steps=${CUDA_LATENCY_WARMUP_STEPS}"
   "--policy.compile_model=false"
 )
 
