@@ -2,8 +2,8 @@ CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
 SCORING_STRATEGY="${2:-normal}"  # normal | gradxattn_abs | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision
 OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from strategy
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
-POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
-POLICY_TYPE="pi05"
+POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
+POLICY_TYPE="pi0"
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -19,7 +19,7 @@ ENV_TASK="libero_object"
 ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 EVAL_BATCH_SIZE=1
 EVAL_N_EPISODES=50
-MAX_EPISODES_RENDERED=10             # 0 = no video; >0 = save that many mp4s
+MAX_EPISODES_RENDERED=0             # 0 = no video; >0 = save that many mp4s
 
 USE_L1_REGRESSION=false
 USE_DIFFUSION=true
@@ -107,7 +107,7 @@ MIN_KEPT_TOKENS=64                 # aggressive (fewer kept)
 MAX_KEPT_TOKENS=128                # conservative (more kept)
 
 # -- Global Active Token Pool --
-DISCARD_PREV_KEPT_RATIO=0.1        # discard highest-scoring 10% from previous frame
+DISCARD_PREV_KEPT_RATIO=0.1       # discard highest-scoring 10% from previous frame
 DISCARD_MODE="middle"              # "top" | "bottom" | "middle" | "random"
 RESET_DISCARD_POOL_ON_GRIPPER_CLOSE=true
 GRIPPER_CLOSE_THRESHOLD=0.0        # action[..., -1] > threshold => schedule full-pool restore
@@ -151,7 +151,7 @@ if [ -z "${RUN_ID_NOTE}" ]; then
   RUN_ID_NOTE="${SCORING_STRATEGY}"
 fi
 if [ -z "${OUTPUT_DIR}" ]; then
-  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}"
+  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_DISCARD_${DISCARD_PREV_KEPT_RATIO}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}"
 fi
 
 ARGS=(
