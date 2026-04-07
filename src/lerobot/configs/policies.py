@@ -191,24 +191,34 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
 
-        config.pop("type")
+        target_cls: builtins.type[T] = cls
+        config_type = config.get("type")
+        if isinstance(config_type, str):
+            try:
+                choice_cls = PreTrainedConfig.get_choice_class(config_type)
+            except Exception:
+                choice_cls = None
+            if choice_cls is not None and issubclass(choice_cls, cls):
+                target_cls = choice_cls
+
+        migrate_config = getattr(target_cls, "_migrate_pretrained_config_dict", None)
+        if callable(migrate_config):
+            config = migrate_config(config)
+
+        config.pop("type", None)
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        translate_cli_overrides = getattr(target_cls, "_translate_cli_overrides", None)
+        if callable(translate_cli_overrides):
+            cli_overrides = translate_cli_overrides(cli_overrides)
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(target_cls, config_file, args=cli_overrides)

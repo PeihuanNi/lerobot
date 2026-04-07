@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -24,6 +25,16 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 DEFAULT_IMAGE_SIZE = 224
+
+ACE_CONFIG_FIELD_ALIASES = {
+    "interp_denoise_step": "ace_denoise_step",
+    "interp_use_residual": "ace_use_residual",
+    "interp_action_start": "ace_action_start",
+    "interp_action_end": "ace_action_end",
+    "interp_variant": "ace_variant",
+    "interp_objective": "ace_objective",
+    "interp_plot_actions_l1": "ace_plot_actions_l1",
+}
 
 
 @PreTrainedConfig.register_subclass("pi0")
@@ -60,22 +71,22 @@ class PI0Config(PreTrainedConfig):
     #    Determines how vision-token importance is computed.
     #    Each method outputs per-token scores; downstream modules are unaffected.
     # ═══════════════════════════════════════════════════════════════════════
-    grad_score_method: str = "transformer_interpretability"
-    # Supported: transformer_interpretability | grad_only | attn_only
+    grad_score_method: str = "ace"
+    # Supported: ace | grad_only | attn_only
     # Aliases: action_vision -> attn_only
     # Legacy values are still accepted during config loading for compatibility.
     score_attn_source: str = "action_vision"
     # "action_vision" = diffusion expert action queries -> vision keys
     # "vision_text"   = prefix language queries -> vision keys
 
-    # -- transformer_interpretability params --
-    interp_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
-    interp_use_residual: bool = False  # True = full Chefer residual propagation across all layers
-    interp_action_start: int = 0       # first action step for objective (0-indexed)
-    interp_action_end: int = -1        # last action step (exclusive); -1 = chunk_size (all)
-    interp_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "direct" = signed mean_h(g*A) | "dimension_independent" = per-dim backprop
-    interp_objective: str = "vector_field_L2"
-    interp_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
+    # -- ACE params --
+    ace_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
+    ace_use_residual: bool = False  # True = full Chefer residual propagation across all layers
+    ace_action_start: int = 5       # first action step for objective (0-indexed)
+    ace_action_end: int = 9        # last action step (exclusive); -1 = chunk_size (all)
+    ace_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "direct" = signed mean_h(g*A) | "dimension_independent" = per-dim backprop
+    ace_objective: str = "vector_field_L2"  # "action_sample_L1" | "action_sample_L2" | "vector_field_L2"
+    ace_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
 
     # -- Shared attention params --
     attn_num_layers: int = 1       # avg attention over last N Expert layers (1=last only, 18=all)
@@ -248,16 +259,42 @@ class PI0Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
 
+    @classmethod
+    def _migrate_pretrained_config_dict(cls, config: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(config)
+        if migrated.get("grad_score_method") == "transformer_interpretability":
+            migrated["grad_score_method"] = "ace"
+        for old_key, new_key in ACE_CONFIG_FIELD_ALIASES.items():
+            if old_key in migrated and new_key not in migrated:
+                migrated[new_key] = migrated[old_key]
+            migrated.pop(old_key, None)
+        return migrated
+
+    @classmethod
+    def _translate_cli_overrides(cls, cli_overrides: list[str]) -> list[str]:
+        translated = []
+        for arg in cli_overrides:
+            new_arg = arg
+            for old_key, new_key in ACE_CONFIG_FIELD_ALIASES.items():
+                new_arg = new_arg.replace(f"--{old_key}=", f"--{new_key}=")
+                new_arg = new_arg.replace(f".{old_key}=", f".{new_key}=")
+            if "grad_score_method" in new_arg and "transformer_interpretability" in new_arg:
+                new_arg = new_arg.replace("transformer_interpretability", "ace")
+            translated.append(new_arg)
+        return translated
+
     def __post_init__(self):
         super().__post_init__()
 
         grad_method_aliases = {
+            "transformer_interpretability": "ace",
+            "transformer-interpretability": "ace",
             "action-vision": "attn_only",
             "action_vision": "attn_only",
             "attn-only": "attn_only",
             "grad-only": "grad_only",
         }
-        interp_variant_aliases = {
+        ace_variant_aliases = {
             "relu": "original",
             "ReLU": "original",
             "abs": "abs_heads",
@@ -265,7 +302,7 @@ class PI0Config(PreTrainedConfig):
             "none": "direct",
         }
         self.grad_score_method = grad_method_aliases.get(self.grad_score_method, self.grad_score_method)
-        self.interp_variant = interp_variant_aliases.get(self.interp_variant, self.interp_variant)
+        self.ace_variant = ace_variant_aliases.get(self.ace_variant, self.ace_variant)
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:
@@ -288,16 +325,16 @@ class PI0Config(PreTrainedConfig):
                 "partial_grad",
                 "attn_only",
                 "grad_only",
-                "transformer_interpretability",
+                "ace",
             }
             if self.grad_score_method not in valid_grad_methods:
                 raise ValueError(f"Invalid grad_score_method: {self.grad_score_method}")
             valid_score_attn_sources = {"action_vision", "vision_text"}
             if self.score_attn_source not in valid_score_attn_sources:
                 raise ValueError(f"Invalid score_attn_source: {self.score_attn_source}")
-            valid_interp_variants = {"original", "abs_heads", "direct", "dimension_independent"}
-            if self.interp_variant not in valid_interp_variants:
-                raise ValueError(f"Invalid interp_variant: {self.interp_variant}")
+            valid_ace_variants = {"original", "abs_heads", "direct", "dimension_independent"}
+            if self.ace_variant not in valid_ace_variants:
+                raise ValueError(f"Invalid ace_variant: {self.ace_variant}")
             valid_phi = {"l1", "l2"}
             if self.partial_grad_phi not in valid_phi:
                 raise ValueError(f"Invalid partial_grad_phi: {self.partial_grad_phi}")

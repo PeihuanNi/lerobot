@@ -796,7 +796,11 @@ def eval_policy(
         _flush_cfg = getattr(_flush_model, "config", None)
         if (_flush_state is not None
                 and _flush_cfg is not None
-                and getattr(_flush_cfg, "interp_plot_actions_l1", False)
+                and getattr(
+                    _flush_cfg,
+                    "ace_plot_actions_l1",
+                    getattr(_flush_cfg, "interp_plot_actions_l1", False),
+                )
                 and _flush_state.actions_l1_history):
             if not hasattr(_flush_model, '_plot_episode_idx'):
                 _flush_model._plot_episode_idx = 0
@@ -827,6 +831,12 @@ def eval_policy(
     if hasattr(policy, "get_cuda_latency_samples"):
         _cuda_latency_samples = policy.get_cuda_latency_samples()
         _cuda_latency_stats = _summarize_latency_samples(_cuda_latency_samples)
+
+    _cuda_memory_samples = None
+    _cuda_memory_stats = {}
+    if hasattr(policy, "get_cuda_memory_samples"):
+        _cuda_memory_samples = policy.get_cuda_memory_samples()
+        _cuda_memory_stats = _summarize_latency_samples(_cuda_memory_samples)
 
     # Compile eval info.
     info = {
@@ -863,6 +873,10 @@ def eval_policy(
         info["cuda_latency_ms"] = _cuda_latency_stats
     if _cuda_latency_samples:
         info["_cuda_latency_samples_ms"] = _cuda_latency_samples
+    if _cuda_memory_stats:
+        info["cuda_memory_mb"] = _cuda_memory_stats
+    if _cuda_memory_samples:
+        info["_cuda_memory_samples_mb"] = _cuda_memory_samples
 
     if return_episode_data:
         info["episodes"] = episode_data
@@ -1005,6 +1019,8 @@ class TaskMetrics(TypedDict, total=False):
     token_selection_stats: dict
     cuda_latency_ms: dict
     _cuda_latency_samples_ms: dict[str, list[float]]
+    cuda_memory_mb: dict
+    _cuda_memory_samples_mb: dict[str, list[float]]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -1055,6 +1071,10 @@ def eval_one(
         result["cuda_latency_ms"] = task_result["cuda_latency_ms"]
     if "_cuda_latency_samples_ms" in task_result:
         result["_cuda_latency_samples_ms"] = task_result["_cuda_latency_samples_ms"]
+    if "cuda_memory_mb" in task_result:
+        result["cuda_memory_mb"] = task_result["cuda_memory_mb"]
+    if "_cuda_memory_samples_mb" in task_result:
+        result["_cuda_memory_samples_mb"] = task_result["_cuda_memory_samples_mb"]
     return result
 
 
@@ -1196,11 +1216,17 @@ def eval_policy_all(
 
     group_cuda_samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     overall_cuda_samples: dict[str, list[float]] = defaultdict(list)
+    group_cuda_memory_samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    overall_cuda_memory_samples: dict[str, list[float]] = defaultdict(list)
     for ti in per_task_infos:
         raw_samples = ti["metrics"].pop("_cuda_latency_samples_ms", None)
         if raw_samples:
             _merge_latency_samples(group_cuda_samples[ti["task_group"]], raw_samples)
             _merge_latency_samples(overall_cuda_samples, raw_samples)
+        raw_memory_samples = ti["metrics"].pop("_cuda_memory_samples_mb", None)
+        if raw_memory_samples:
+            _merge_latency_samples(group_cuda_memory_samples[ti["task_group"]], raw_memory_samples)
+            _merge_latency_samples(overall_cuda_memory_samples, raw_memory_samples)
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
@@ -1263,6 +1289,9 @@ def eval_policy_all(
         group_cuda = _summarize_latency_samples(group_cuda_samples.get(group))
         if group_cuda:
             group_agg["cuda_latency_ms"] = group_cuda
+        group_cuda_memory = _summarize_latency_samples(group_cuda_memory_samples.get(group))
+        if group_cuda_memory:
+            group_agg["cuda_memory_mb"] = group_cuda_memory
         groups_aggregated[group] = group_agg
 
     # overall aggregates
@@ -1278,6 +1307,9 @@ def eval_policy_all(
     overall_cuda = _summarize_latency_samples(overall_cuda_samples)
     if overall_cuda:
         overall_agg["cuda_latency_ms"] = overall_cuda
+    overall_cuda_memory = _summarize_latency_samples(overall_cuda_memory_samples)
+    if overall_cuda_memory:
+        overall_agg["cuda_memory_mb"] = overall_cuda_memory
 
     return {
         "per_task": per_task_infos,

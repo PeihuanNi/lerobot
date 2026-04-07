@@ -2,8 +2,8 @@ CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
 SCORING_STRATEGY="${2:-normal}"  # normal | gradxattn_abs | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision
 OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from strategy
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
-POLICY_PATH="/home/nipeihuan/models/pi0_libero_finetuned"
-POLICY_TYPE="pi0"
+POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
+POLICY_TYPE="pi05"
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -31,39 +31,39 @@ TOKEN_PRUNE_ENABLED=true
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
-GRAD_SCORE_METHOD="transformer_interpretability" # transformer_interpretability | grad_only | action_vision(attn_only alias)
+GRAD_SCORE_METHOD="ace" # ace | grad_only | action_vision(attn_only alias)
 SCORE_ATTN_SOURCE="action_vision"  # "action_vision" | "vision_text"
 
 
-INTERP_VARIANT="abs_heads"
+ACE_VARIANT="abs_heads"
 case "${SCORING_STRATEGY}" in
   normal|default|manual|gradxattn_abs|gradxattn_abs_heads)
-    GRAD_SCORE_METHOD="transformer_interpretability"
-    INTERP_VARIANT="abs_heads"
+    GRAD_SCORE_METHOD="ace"
+    ACE_VARIANT="abs_heads"
     ;;
   gradxattn_dim|gradxattn_dimension_independent)
-    GRAD_SCORE_METHOD="transformer_interpretability"
-    INTERP_VARIANT="dimension_independent"
+    GRAD_SCORE_METHOD="ace"
+    ACE_VARIANT="dimension_independent"
     ;;
   gradxattn_relu)
-    GRAD_SCORE_METHOD="transformer_interpretability"
-    INTERP_VARIANT="original"
+    GRAD_SCORE_METHOD="ace"
+    ACE_VARIANT="original"
     ;;
   gradxattn_direct)
-    GRAD_SCORE_METHOD="transformer_interpretability"
-    INTERP_VARIANT="direct"
+    GRAD_SCORE_METHOD="ace"
+    ACE_VARIANT="direct"
     ;;
   grad_only_relu)
     GRAD_SCORE_METHOD="grad_only"
-    INTERP_VARIANT="original"
+    ACE_VARIANT="original"
     ;;
   grad_only_direct)
     GRAD_SCORE_METHOD="grad_only"
-    INTERP_VARIANT="direct"
+    ACE_VARIANT="direct"
     ;;
   action_vision|action_vision_direct|attn_only)
     GRAD_SCORE_METHOD="action_vision"
-    INTERP_VARIANT="direct"
+    ACE_VARIANT="direct"
     ;;
   *)
     echo "Unknown SCORING_STRATEGY: ${SCORING_STRATEGY}" >&2
@@ -72,14 +72,14 @@ case "${SCORING_STRATEGY}" in
     ;;
 esac
 
-# -- transformer_interpretability --
-INTERP_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
-INTERP_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
-INTERP_ACTION_START=5              # first action step for objective (0-indexed)
-INTERP_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
-INTERP_VARIANT="${INTERP_VARIANT}"     # original = ReLU | abs_heads = mean_h(|g*A|) | direct = signed mean_h(g*A) | dimension_independent = per-action-dim backprop
-INTERP_OBJECTIVE="action_sample_L1"    # action_sample_L1 | vector_field_L2
-INTERP_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
+# -- ace --
+ACE_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
+ACE_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
+ACE_ACTION_START=5              # first action step for objective (0-indexed)
+ACE_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
+ACE_VARIANT="${ACE_VARIANT}"     # original = ReLU | abs_heads = mean_h(|g*A|) | direct = signed mean_h(g*A) | dimension_independent = per-action-dim backprop
+ACE_OBJECTIVE="action_sample_L2"    # action_sample_L1 | action_sample_L2 | vector_field_L2
+ACE_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 
 # -- Shared attention params --
 ATTN_NUM_LAYERS=6                  # avg over last N Expert layers (1=last, 18=all)
@@ -151,7 +151,7 @@ if [ -z "${RUN_ID_NOTE}" ]; then
   RUN_ID_NOTE="${SCORING_STRATEGY}"
 fi
 if [ -z "${OUTPUT_DIR}" ]; then
-  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_DISCARD_${DISCARD_PREV_KEPT_RATIO}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}"
+  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_DISCARD_${DISCARD_PREV_KEPT_RATIO}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}_cuda"
 fi
 
 ARGS=(
@@ -163,13 +163,13 @@ ARGS=(
   # 1. Scoring
   "--policy.grad_score_method=${GRAD_SCORE_METHOD}"
   "--policy.score_attn_source=${SCORE_ATTN_SOURCE}"
-  "--policy.interp_denoise_step=${INTERP_DENOISE_STEP}"
-  "--policy.interp_use_residual=${INTERP_USE_RESIDUAL}"
-  "--policy.interp_action_start=${INTERP_ACTION_START}"
-  "--policy.interp_action_end=${INTERP_ACTION_END}"
-  "--policy.interp_variant=${INTERP_VARIANT}"
-  "--policy.interp_objective=${INTERP_OBJECTIVE}"
-  "--policy.interp_plot_actions_l1=${INTERP_PLOT_ACTIONS_L1}"
+  "--policy.ace_denoise_step=${ACE_DENOISE_STEP}"
+  "--policy.ace_use_residual=${ACE_USE_RESIDUAL}"
+  "--policy.ace_action_start=${ACE_ACTION_START}"
+  "--policy.ace_action_end=${ACE_ACTION_END}"
+  "--policy.ace_variant=${ACE_VARIANT}"
+  "--policy.ace_objective=${ACE_OBJECTIVE}"
+  "--policy.ace_plot_actions_l1=${ACE_PLOT_ACTIONS_L1}"
   "--policy.attn_num_layers=${ATTN_NUM_LAYERS}"
   "--policy.attn_num_denoise_steps=${ATTN_NUM_DENOISE_STEPS}"
   "--policy.attn_score_beta=${ATTN_SCORE_BETA}"
