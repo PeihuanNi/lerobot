@@ -623,7 +623,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if self._token_selection_state is None:
             self._token_selection_state = TokenSelectionState()
         else:
-            if (self.config.interp_plot_actions_l1
+            if (self.config.ace_plot_actions_l1
                     and self._token_selection_state.actions_l1_history):
                 if not hasattr(self, '_plot_episode_idx'):
                     self._plot_episode_idx = 0
@@ -1206,7 +1206,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if eval_frame:
             if cfg.spvla_reference_enabled or cfg.grad_score_method == "spvla_reference":
                 score_tokens = reference_score_tokens if reference_score_tokens is not None else token_norms
-            elif cfg.grad_score_method == "transformer_interpretability":
+            elif cfg.grad_score_method == "ace":
                 # ── Gradient-Weighted Attention (GradxAttn) ───────────────
                 # For each scored denoise step:
                 #   1. Forward with x_t.requires_grad_(True).
@@ -1218,7 +1218,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
                 past_key_values = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
 
-                _interp_step = cfg.interp_denoise_step  # -1 = all steps, >=0 = specific
+                _interp_step = cfg.ace_denoise_step  # -1 = all steps, >=0 = specific
                 _dt = -1.0 / num_steps
                 x_t = noise.clone()
                 _score_accum = None  # [B, total_vis_tokens]
@@ -1246,24 +1246,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                 return_suffix_out=True,
                             )
                             # ── Action-step subset for objective ──
-                            _a_lo = max(0, cfg.interp_action_start)
-                            _a_hi = cfg.chunk_size if cfg.interp_action_end < 0 else min(cfg.interp_action_end, cfg.chunk_size)
+                            _a_lo = max(0, cfg.ace_action_start)
+                            _a_hi = cfg.chunk_size if cfg.ace_action_end < 0 else min(cfg.ace_action_end, cfg.chunk_size)
                             _attn_list = list(_step_attns)
 
                             # ── Compute objective target ──
-                            if cfg.interp_objective == "action_sample_L1":
+                            if cfg.ace_objective == "action_sample_L1":
                                 # x_0_hat = x_t - t * v_theta
                                 _obj_target = (_x_in[:, _a_lo:_a_hi, :] - _time * _v_raw[:, _a_lo:_a_hi, :]).float()
                             else:
                                 # vector_field_L2 (default): use v_raw directly
                                 _obj_target = _v_raw[:, _a_lo:_a_hi, :].float()
 
-                            if cfg.interp_variant == "dimension_independent":
+                            if cfg.ace_variant == "dimension_independent":
                                 # Per-dimension backprop: A_bar = (1/D) sum_d mean_h(A * |dv_d/dA|)
                                 _v_sel = _obj_target
                                 # 只对前7个action维度进行循环（LIBERO实际action_dim）
                                 _action_dim = min(_v_sel.shape[-1], 7)
-                                if cfg.interp_use_residual:
+                                if cfg.ace_use_residual:
                                     _dim_A_bars = None
                                     for _d in range(_action_dim):
                                         _obj_d = _v_sel[:, :, _d].sum()
@@ -1297,11 +1297,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                         _dim_A_bar = _c if _dim_A_bar is None else _dim_A_bar + _c
                                     _dim_A_bar = _dim_A_bar / _action_dim
                             else:
-                                if cfg.interp_objective == "action_sample_L1":
+                                if cfg.ace_objective == "action_sample_L1":
                                     _obj = _obj_target.abs().sum()
                                 else:
                                     _obj = (_obj_target ** 2).sum()
-                                if cfg.interp_use_residual:
+                                if cfg.ace_use_residual:
                                     _grads = torch.autograd.grad(
                                         _obj, _attn_list, retain_graph=False,
                                     )
@@ -1334,7 +1334,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         if _vis_idx_t.numel() > 0 and _total_len > 0:
                             _vis_idx_t = _vis_idx_t[_vis_idx_t < _total_len]
 
-                        if cfg.interp_use_residual:
+                        if cfg.ace_use_residual:
                             # ── Residual propagation: R^l = R^{l-1} @ Â^l ──
                             _num_expert_layers = len(_attn_list)
                             _diag = torch.arange(_suffix_len, device=device)
@@ -1344,9 +1344,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             _R[:, _diag, _prefix_len + _diag] = 1.0
 
                             for _ell in range(_num_expert_layers):
-                                if cfg.interp_variant == "dimension_independent":
+                                if cfg.ace_variant == "dimension_independent":
                                     _A_bar = _dim_A_bars[_ell]
-                                elif cfg.interp_variant == "abs_heads":
+                                elif cfg.ace_variant == "abs_heads":
                                     _A_ell = _attn_list[_ell].detach().float()
                                     _g_ell = _grads[_ell].float()
                                     _A_bar = (_g_ell * _A_ell).abs().mean(dim=1)  # [B, Qs, K]
@@ -1370,14 +1370,14 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             if _vis_idx_t.numel() > 0 and _sel_alen > 0:
                                 _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
                                 _step_score = _step_score.mean(dim=1)   # [B, num_vis]
-                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
+                                _step_score = torch.relu(_step_score) if cfg.ace_variant == "original" else torch.abs(_step_score)
                             else:
                                 _step_score = None
                         else:
                             # -- Last-layer scoring --
-                            if cfg.interp_variant == "dimension_independent":
+                            if cfg.ace_variant == "dimension_independent":
                                 _A_bar = _dim_A_bar
-                            elif cfg.interp_variant == "abs_heads":
+                            elif cfg.ace_variant == "abs_heads":
                                 _A_last = _last_attn.detach().float()
                                 _A_bar = (_grad_last.float() * _A_last).abs().mean(dim=1)
                             else:  # "original"
@@ -1388,7 +1388,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             if _vis_idx_t.numel() > 0 and _sel_alen > 0:
                                 _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
                                 _step_score = _step_score.mean(dim=1)  # [B, num_vis]
-                                _step_score = torch.relu(_step_score) if cfg.interp_variant == "original" else torch.abs(_step_score)
+                                _step_score = torch.relu(_step_score) if cfg.ace_variant == "original" else torch.abs(_step_score)
                             else:
                                 _step_score = None
 
@@ -1843,36 +1843,56 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         if cfg.token_selection_enabled and token_state.frame_idx > 0:
             # Store stats in token_state so the eval loop can show them in tqdm postfix
-            # Only count tokens from *valid* images (img_masks=True); placeholder
-            # images (missing cameras) have img_mask=False and should not inflate
-            # the total count or appear as "pruned" tokens.
-            _valid_masks = [
-                m for m, im in zip(keep_token_masks, img_masks)
-                if im.any()
-            ] if keep_token_masks else []
-            _marked_n = sum(int(m.sum().item()) for m in _valid_masks)
-            _total_n = sum(m.shape[-1] for m in _valid_masks)
-            if cfg.token_prune_enabled and not eval_frame:
-                _actual_kept = _marked_n
-            else:
-                _actual_kept = _total_n
-            _prune_pct = (1.0 - _actual_kept / _total_n) * 100.0 if _total_n > 0 else 0.0
+            # Report pruning against a fixed total token budget. Tokens removed
+            # from the global active pool are counted as pruned savings too.
+            _available_token_masks = []
+            _kept_token_masks = []
+            _active_meta_num_patches = []
+            for keep_token, valid_region_mask, img_mask, meta in zip(
+                keep_token_masks, valid_masks, img_masks, metas, strict=True
+            ):
+                if not img_mask.any():
+                    continue
+                _kept_token_masks.append(keep_token)
+                _active_meta_num_patches.append(int(meta.num_patches))
+                _available_token_masks.append(
+                    expand_region_mask(valid_region_mask, meta.patches_per_side, cfg.region_patch_size)
+                )
+
+            _selected_per_camera = [int(mask.sum().item()) for mask in _kept_token_masks]
+            _active_per_camera = [int(mask.sum().item()) for mask in _available_token_masks]
+            _total_possible_per_camera = [
+                int(mask.shape[0]) * num_patches
+                for mask, num_patches in zip(_available_token_masks, _active_meta_num_patches, strict=True)
+            ]
+            _selected_n = sum(int(mask.sum().item()) for mask in _kept_token_masks)
+            _active_n = sum(_active_per_camera)
+            _total_possible_n = sum(_total_possible_per_camera)
+            _inactive_n = max(_total_possible_n - _active_n, 0)
+            _actual_kept = _selected_n if cfg.token_prune_enabled else _active_n
+            _prune_pct = (1.0 - _actual_kept / _total_possible_n) * 100.0 if _total_possible_n > 0 else 0.0
             # Accumulate for per-episode average pruning ratio
             token_state.total_kept += _actual_kept
-            token_state.total_possible += _total_n
+            token_state.total_possible += _total_possible_n
             token_state.last_stats = {
                 "interval": f"{eval_interval}f",
-                "kept": f"{_actual_kept}/{_total_n}",
+                "kept": f"{_actual_kept}/{_total_possible_n}",
+                "selected": f"{_selected_n}/{_total_possible_n}",
+                "selected_per_camera": _selected_per_camera,
+                "available_per_camera": _active_per_camera,
+                "total_possible_per_camera": _total_possible_per_camera,
+                "active": f"{_active_n}/{_total_possible_n}",
+                "inactive_pruned": f"{_inactive_n}/{_total_possible_n}",
                 "prune": f"{_prune_pct:.1f}%",
                 "eval": "Y" if eval_frame else "N",
             }
 
-        _need_l1 = (cfg.interp_plot_actions_l1
+        _need_l1 = (cfg.ace_plot_actions_l1
                      or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel"))
         if _need_l1 and actions is not None:
             _l1 = actions.detach().float().abs().sum(dim=-1).mean().item()
             token_state.last_actions_l1 = _l1
-            if cfg.interp_plot_actions_l1:
+            if cfg.ace_plot_actions_l1:
                 token_state.actions_l1_history.append(
                     (token_state.frame_idx, _l1)
                 )

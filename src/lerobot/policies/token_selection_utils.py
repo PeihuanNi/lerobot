@@ -246,18 +246,25 @@ def apply_min_max_constraints(
     clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
     order = torch.argsort(score_region, dim=-1, descending=True)
     for batch_idx in range(batch_size):
+        valid_candidates = torch.isfinite(score_region[batch_idx])
+        valid_count = int(valid_candidates.sum().item())
         min_r = max(int(min_regions_t[batch_idx].item()), 0)
         max_r = int(max_regions_t[batch_idx].item())
-        max_r = min(max_r, num_regions) if max_r > 0 else num_regions
+        min_r = min(min_r, valid_count)
+        max_r = min(max_r, valid_count) if max_r > 0 else valid_count
         keep_count = int(keep_mask[batch_idx].sum().item())
         if keep_count < min_r:
             needed = min_r - keep_count
-            add_indices = [idx for idx in order[batch_idx].tolist() if not keep_mask[batch_idx, idx]][:needed]
+            add_indices = [
+                idx
+                for idx in order[batch_idx].tolist()
+                if valid_candidates[idx] and not keep_mask[batch_idx, idx]
+            ][:needed]
             if add_indices:
                 keep_mask[batch_idx, add_indices] = True
         keep_count = int(keep_mask[batch_idx].sum().item())
         if keep_count > max_r:
-            top = order[batch_idx, :max_r]
+            top = order[batch_idx][valid_candidates[order[batch_idx]]][:max_r]
             new_keep = torch.zeros_like(keep_mask[batch_idx])
             new_keep[top] = True
             clipped = keep_mask[batch_idx] & ~new_keep
@@ -289,14 +296,21 @@ def apply_min_max_constraints_with_locked(
     order = torch.argsort(score_region, dim=-1, descending=True)
 
     for batch_idx in range(batch_size):
+        valid_candidates = torch.isfinite(score_region[batch_idx])
+        valid_count = int(valid_candidates.sum().item())
         min_r = max(int(min_regions_t[batch_idx].item()), 0)
         max_r = int(max_regions_t[batch_idx].item())
-        max_r = min(max_r, num_regions) if max_r > 0 else num_regions
+        min_r = min(min_r, valid_count)
+        max_r = min(max_r, valid_count) if max_r > 0 else valid_count
 
         keep_count = int(keep_mask[batch_idx].sum().item())
         if keep_count < min_r:
             needed = min_r - keep_count
-            add_indices = [idx for idx in order[batch_idx].tolist() if not keep_mask[batch_idx, idx]][:needed]
+            add_indices = [
+                idx
+                for idx in order[batch_idx].tolist()
+                if valid_candidates[idx] and not keep_mask[batch_idx, idx]
+            ][:needed]
             if add_indices:
                 keep_mask[batch_idx, add_indices] = True
 
@@ -304,13 +318,15 @@ def apply_min_max_constraints_with_locked(
         if keep_count <= max_r:
             continue
 
-        locked = locked_keep[batch_idx] & keep_mask[batch_idx]
+        locked = locked_keep[batch_idx] & keep_mask[batch_idx] & valid_candidates
         locked_count = int(locked.sum().item())
         if locked_count >= max_r:
-            new_keep = locked
+            locked_order = order[batch_idx][locked[order[batch_idx]]][:max_r]
+            new_keep = torch.zeros_like(keep_mask[batch_idx])
+            new_keep[locked_order] = True
         else:
             budget = max_r - locked_count
-            candidates = keep_mask[batch_idx] & ~locked
+            candidates = keep_mask[batch_idx] & ~locked & valid_candidates
             candidate_indices = [idx for idx in order[batch_idx].tolist() if candidates[idx]][:budget]
             new_keep = locked.clone()
             if candidate_indices:

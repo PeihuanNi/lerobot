@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -24,6 +25,15 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 DEFAULT_IMAGE_SIZE = 224
+LEGACY_ACE_FIELD_NAMES = {
+    "interp_denoise_step": "ace_denoise_step",
+    "interp_use_residual": "ace_use_residual",
+    "interp_action_start": "ace_action_start",
+    "interp_action_end": "ace_action_end",
+    "interp_variant": "ace_variant",
+    "interp_objective": "ace_objective",
+    "interp_plot_actions_l1": "ace_plot_actions_l1",
+}
 
 
 @PreTrainedConfig.register_subclass("pi0")
@@ -77,18 +87,18 @@ class PI0Config(PreTrainedConfig):
     #    Determines how vision-token importance is computed.
     #    Each method outputs per-token scores; downstream modules are unaffected.
     # ═══════════════════════════════════════════════════════════════════════
-    grad_score_method: str = "transformer_interpretability"
-    # Supported: attn_only | transformer_interpretability
+    grad_score_method: str = "ace"
+    # Supported: ace | attn_only | spvla_reference
     # Legacy values are still accepted during config loading for compatibility.
 
-    # -- transformer_interpretability params --
-    interp_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
-    interp_use_residual: bool = False  # True = full Chefer residual propagation across all layers
-    interp_action_start: int = 0       # first action step for objective (0-indexed)
-    interp_action_end: int = -1        # last action step (exclusive); -1 = chunk_size (all)
-    interp_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-dim backprop
-    interp_objective: str = "vector_field_L2"
-    interp_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
+    # -- ACE params --
+    ace_denoise_step: int = -1  # -1 = avg all denoise steps; >=0 = specific step
+    ace_use_residual: bool = False  # True = full Chefer residual propagation across all layers
+    ace_action_start: int = 0       # first action step for objective (0-indexed)
+    ace_action_end: int = -1        # last action step (exclusive); -1 = chunk_size (all)
+    ace_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "dimension_independent" = per-dim backprop
+    ace_objective: str = "vector_field_L2"
+    ace_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
 
     # -- Shared attention params --
     attn_num_layers: int = 1       # avg attention over last N Expert layers (1=last only, 18=all)
@@ -268,8 +278,35 @@ class PI0Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
 
+    @classmethod
+    def _migrate_pretrained_config_dict(cls, config: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(config)
+        if migrated.get("grad_score_method") == "transformer_interpretability":
+            migrated["grad_score_method"] = "ace"
+        for legacy_name, ace_name in LEGACY_ACE_FIELD_NAMES.items():
+            if legacy_name in migrated and ace_name not in migrated:
+                migrated[ace_name] = migrated.pop(legacy_name)
+        return migrated
+
+    @classmethod
+    def _translate_cli_overrides(cls, cli_overrides: list[str]) -> list[str]:
+        translated: list[str] = []
+        for override in cli_overrides:
+            translated_override = override
+            if translated_override.endswith("=transformer_interpretability"):
+                translated_override = translated_override[: -len("transformer_interpretability")] + "ace"
+            for legacy_name, ace_name in LEGACY_ACE_FIELD_NAMES.items():
+                translated_override = translated_override.replace(f".{legacy_name}=", f".{ace_name}=")
+                if translated_override.startswith(f"--{legacy_name}="):
+                    translated_override = translated_override.replace(f"--{legacy_name}=", f"--{ace_name}=", 1)
+            translated.append(translated_override)
+        return translated
+
     def __post_init__(self):
         super().__post_init__()
+
+        if self.grad_score_method == "transformer_interpretability":
+            self.grad_score_method = "ace"
 
         # Validate configuration
         if self.n_action_steps > self.chunk_size:
@@ -307,7 +344,7 @@ class PI0Config(PreTrainedConfig):
                 "full_grad",
                 "partial_grad",
                 "attn_only",
-                "transformer_interpretability",
+                "ace",
                 "spvla_reference",
             }
             if self.grad_score_method not in valid_grad_methods:

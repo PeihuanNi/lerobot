@@ -897,7 +897,10 @@ def eval_policy(
         _flush_cfg = getattr(_flush_model, "config", None)
         if (_flush_state is not None
                 and _flush_cfg is not None
-                and getattr(_flush_cfg, "interp_plot_actions_l1", False)
+                and (
+                    getattr(_flush_cfg, "ace_plot_actions_l1", False)
+                    or getattr(_flush_cfg, "interp_plot_actions_l1", False)
+                )
                 and _flush_state.actions_l1_history):
             if not hasattr(_flush_model, '_plot_episode_idx'):
                 _flush_model._plot_episode_idx = 0

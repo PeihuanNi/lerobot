@@ -54,7 +54,7 @@ case "${SPVLA_PRESET}" in
     PRESET_SPVLA_REFERENCE_ENABLED=false
     PRESET_TOKEN_SELECTION_ENABLED=false
     PRESET_TOKEN_PRUNE_ENABLED=false
-    PRESET_GRAD_SCORE_METHOD=transformer_interpretability
+    PRESET_GRAD_SCORE_METHOD=ace
     PRESET_DYNAMIC_PRUNE_MODE=none
     PRESET_REGION_EVAL_INTERVAL=1
     PRESET_MIN_KEPT_TOKENS=128
@@ -203,14 +203,14 @@ PRUNE_VELOCITY_MAX="${PRUNE_VELOCITY_MAX:-${SCHEDULE_VELOCITY_MAX}}"
 # These are implementation details for mapping SP-VLA's "semantic importance"
 # to this repo's diffusion-VLA architecture. They are not paper-native knobs.
 # -----------------------------------------------------------------------------
-GRAD_SCORE_METHOD="${GRAD_SCORE_METHOD:-${PRESET_GRAD_SCORE_METHOD}}"   # spvla_reference | transformer_interpretability | attn_only
-INTERP_DENOISE_STEP="${INTERP_DENOISE_STEP:-5}"                          # -1 = average all denoise steps
-INTERP_USE_RESIDUAL="${INTERP_USE_RESIDUAL:-true}"
-INTERP_ACTION_START="${INTERP_ACTION_START:-5}"
-INTERP_ACTION_END="${INTERP_ACTION_END:-9}"
-INTERP_VARIANT="${INTERP_VARIANT:-dimension_independent}"               # original | abs_heads | dimension_independent
-INTERP_OBJECTIVE="${INTERP_OBJECTIVE:-action_sample_L1}"                # action_sample_L1 | vector_field_L2
-INTERP_PLOT_ACTIONS_L1="${INTERP_PLOT_ACTIONS_L1:-false}"
+GRAD_SCORE_METHOD="${GRAD_SCORE_METHOD:-${PRESET_GRAD_SCORE_METHOD}}"   # spvla_reference | ace | attn_only
+ACE_DENOISE_STEP="${ACE_DENOISE_STEP:-5}"                               # -1 = average all denoise steps
+ACE_USE_RESIDUAL="${ACE_USE_RESIDUAL:-true}"
+ACE_ACTION_START="${ACE_ACTION_START:-5}"
+ACE_ACTION_END="${ACE_ACTION_END:-9}"
+ACE_VARIANT="${ACE_VARIANT:-dimension_independent}"                    # original | abs_heads | dimension_independent
+ACE_OBJECTIVE="${ACE_OBJECTIVE:-action_sample_L1}"                     # action_sample_L1 | vector_field_L2
+ACE_PLOT_ACTIONS_L1="${ACE_PLOT_ACTIONS_L1:-false}"
 ATTN_NUM_LAYERS="${ATTN_NUM_LAYERS:-6}"
 ATTN_NUM_DENOISE_STEPS="${ATTN_NUM_DENOISE_STEPS:-3}"
 ATTN_SCORE_BETA="${ATTN_SCORE_BETA:-2.0}"
@@ -280,13 +280,13 @@ ARGS=(
   "--policy.token_selection_enabled=${TOKEN_SELECTION_ENABLED}"
   "--policy.token_prune_enabled=${TOKEN_PRUNE_ENABLED}"
   "--policy.grad_score_method=${GRAD_SCORE_METHOD}"
-  "--policy.interp_denoise_step=${INTERP_DENOISE_STEP}"
-  "--policy.interp_use_residual=${INTERP_USE_RESIDUAL}"
-  "--policy.interp_action_start=${INTERP_ACTION_START}"
-  "--policy.interp_action_end=${INTERP_ACTION_END}"
-  "--policy.interp_variant=${INTERP_VARIANT}"
-  "--policy.interp_objective=${INTERP_OBJECTIVE}"
-  "--policy.interp_plot_actions_l1=${INTERP_PLOT_ACTIONS_L1}"
+  "--policy.ace_denoise_step=${ACE_DENOISE_STEP}"
+  "--policy.ace_use_residual=${ACE_USE_RESIDUAL}"
+  "--policy.ace_action_start=${ACE_ACTION_START}"
+  "--policy.ace_action_end=${ACE_ACTION_END}"
+  "--policy.ace_variant=${ACE_VARIANT}"
+  "--policy.ace_objective=${ACE_OBJECTIVE}"
+  "--policy.ace_plot_actions_l1=${ACE_PLOT_ACTIONS_L1}"
   "--policy.attn_num_layers=${ATTN_NUM_LAYERS}"
   "--policy.attn_num_denoise_steps=${ATTN_NUM_DENOISE_STEPS}"
   "--policy.attn_score_beta=${ATTN_SCORE_BETA}"
