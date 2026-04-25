@@ -1,6 +1,5 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-SCORING_STRATEGY="${2:-normal}"  # normal | gradxattn_abs | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision
-OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from strategy
+OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from score config
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_TYPE="pi05"
@@ -18,66 +17,28 @@ ENV_TYPE="libero"
 ENV_TASK="libero_object"
 ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 EVAL_BATCH_SIZE=1
-EVAL_N_EPISODES=50
-MAX_EPISODES_RENDERED=0             # 0 = no video; >0 = save that many mp4s
+EVAL_N_EPISODES=5
+MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s
 
 USE_L1_REGRESSION=false
 USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
-TOKEN_SELECTION_ENABLED=true
-TOKEN_PRUNE_ENABLED=true
+TOKEN_SELECTION_ENABLED=false
+TOKEN_PRUNE_ENABLED=false
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
 GRAD_SCORE_METHOD="ace" # ace | grad_only | action_vision(attn_only alias)
 SCORE_ATTN_SOURCE="action_vision"  # "action_vision" | "vision_text"
-
-
-ACE_VARIANT="abs_heads"
-case "${SCORING_STRATEGY}" in
-  normal|default|manual|gradxattn_abs|gradxattn_abs_heads)
-    GRAD_SCORE_METHOD="ace"
-    ACE_VARIANT="abs_heads"
-    ;;
-  gradxattn_dim|gradxattn_dimension_independent)
-    GRAD_SCORE_METHOD="ace"
-    ACE_VARIANT="dimension_independent"
-    ;;
-  gradxattn_relu)
-    GRAD_SCORE_METHOD="ace"
-    ACE_VARIANT="original"
-    ;;
-  gradxattn_direct)
-    GRAD_SCORE_METHOD="ace"
-    ACE_VARIANT="direct"
-    ;;
-  grad_only_relu)
-    GRAD_SCORE_METHOD="grad_only"
-    ACE_VARIANT="original"
-    ;;
-  grad_only_direct)
-    GRAD_SCORE_METHOD="grad_only"
-    ACE_VARIANT="direct"
-    ;;
-  action_vision|action_vision_direct|attn_only)
-    GRAD_SCORE_METHOD="action_vision"
-    ACE_VARIANT="direct"
-    ;;
-  *)
-    echo "Unknown SCORING_STRATEGY: ${SCORING_STRATEGY}" >&2
-    echo "Valid options: normal | gradxattn_abs | gradxattn_abs_heads | gradxattn_dim | gradxattn_relu | gradxattn_direct | grad_only_relu | grad_only_direct | action_vision | attn_only" >&2
-    exit 1
-    ;;
-esac
+ACE_VARIANT="abs_heads"              # original | abs_heads | direct | dimension_independent
 
 # -- ace --
 ACE_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
 ACE_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
 ACE_ACTION_START=5              # first action step for objective (0-indexed)
 ACE_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
-ACE_VARIANT="${ACE_VARIANT}"     # original = ReLU | abs_heads = mean_h(|g*A|) | direct = signed mean_h(g*A) | dimension_independent = per-action-dim backprop
 ACE_OBJECTIVE="action_sample_L2"    # action_sample_L1 | action_sample_L2 | vector_field_L2
 ACE_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 
@@ -107,7 +68,7 @@ MIN_KEPT_TOKENS=64                 # aggressive (fewer kept)
 MAX_KEPT_TOKENS=128                # conservative (more kept)
 
 # -- Global Active Token Pool --
-DISCARD_PREV_KEPT_RATIO=0.1       # discard highest-scoring 10% from previous frame
+DISCARD_PREV_KEPT_RATIO=0.5       # discard highest-scoring 10% from previous frame
 DISCARD_MODE="middle"              # "top" | "bottom" | "middle" | "random"
 RESET_DISCARD_POOL_ON_GRIPPER_CLOSE=true
 GRIPPER_CLOSE_THRESHOLD=0.0        # action[..., -1] > threshold => schedule full-pool restore
@@ -128,10 +89,13 @@ REGION_EVAL_INTERVAL=2
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Overlay / Visualization
-#    "heatmap" — continuous jet colormap; pruned regions darkened+hatched
-#    "label"   — discrete 5-color overlay
+#    "heatmap"      — continuous jet colormap; pruned regions darkened+hatched
+#    "heatmap_topk" — only top-k high-score regions are colored; others stay raw
+#    "label"        — discrete 5-color overlay
 # ══════════════════════════════════════════════════════════════════════════════
-OVERLAY_MODE="heatmap"             # "heatmap" | "label"
+OVERLAY_MODE="heatmap_topk"             # "heatmap" | "heatmap_topk" | "label"
+OVERLAY_TOPK=0                    # only used by "heatmap_topk"; 0 = no top-k cap
+OVERLAY_SCORE_THRESHOLD=0.0        # only used by "heatmap_topk"; normalized [0, 1]
 OVERLAY_SHOW_SCORES=false
 OVERLAY_SHOW_IDS=false
 SCORE_DEBUG_HEATMAP=false          # debug: no pruning, every frame scored
@@ -148,10 +112,10 @@ WANDB_PROJECT=""
 SEED=7
 
 if [ -z "${RUN_ID_NOTE}" ]; then
-  RUN_ID_NOTE="${SCORING_STRATEGY}"
+  RUN_ID_NOTE="${GRAD_SCORE_METHOD}_${ACE_VARIANT}"
 fi
 if [ -z "${OUTPUT_DIR}" ]; then
-  OUTPUT_DIR="./outputs/fig/${POLICY_TYPE}_${ENV_TASK}_${SCORING_STRATEGY}_${DYNAMIC_PRUNE_MODE}_DISCARD_${DISCARD_PREV_KEPT_RATIO}_${DISCARD_MODE}_INTERVAL_${REGION_EVAL_INTERVAL}_${SCORE_ATTN_SOURCE}_cuda"
+  OUTPUT_DIR="./outputs/figure/${GRAD_SCORE_METHOD}_${ACE_VARIANT}_gt"
 fi
 
 ARGS=(
@@ -194,6 +158,8 @@ ARGS=(
   "--policy.region_eval_interval=${REGION_EVAL_INTERVAL}"
   # 4. Overlay
   "--policy.overlay_mode=${OVERLAY_MODE}"
+  "--policy.overlay_topk=${OVERLAY_TOPK}"
+  "--policy.overlay_score_threshold=${OVERLAY_SCORE_THRESHOLD}"
   "--policy.overlay_show_scores=${OVERLAY_SHOW_SCORES}"
   "--policy.overlay_show_ids=${OVERLAY_SHOW_IDS}"
   "--policy.score_debug_heatmap=${SCORE_DEBUG_HEATMAP}"

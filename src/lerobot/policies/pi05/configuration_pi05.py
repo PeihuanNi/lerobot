@@ -194,12 +194,15 @@ class PI05Config(PreTrainedConfig):
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Overlay / Visualization
     #    overlay_mode selects rendering style:
-    #      "heatmap" — continuous jet colormap; pruned regions darkened+hatched
-    #      "label"   — discrete 5-color overlay (green/yellow/red/blue/transparent)
+    #      "heatmap"      — continuous jet colormap; pruned regions darkened+hatched
+    #      "heatmap_topk" — only top-k high-score regions are colored; others stay raw
+    #      "label"        — discrete 5-color overlay (green/yellow/red/blue/transparent)
     #    score_debug_heatmap overrides everything: forces every-frame scoring,
     #    disables pruning, shows pure heatmap without prune marks.
     # ═══════════════════════════════════════════════════════════════════════
-    overlay_mode: str = "heatmap"       # "heatmap" | "label"
+    overlay_mode: str = "heatmap"       # "heatmap" | "heatmap_topk" | "label"
+    overlay_topk: int = 16
+    overlay_score_threshold: float = 0.0
     overlay_show_scores: bool = False
     overlay_show_ids: bool = False
     score_debug_heatmap: bool = False   # debug: no pruning, every frame scored
@@ -344,9 +347,13 @@ class PI05Config(PreTrainedConfig):
                 valid_action_agg = {"sum", "max"}
                 if self.grad_action_agg not in valid_action_agg:
                     raise ValueError(f"Invalid grad_action_agg: {self.grad_action_agg}")
-            valid_overlay_modes = {"heatmap", "label"}
+            valid_overlay_modes = {"heatmap", "heatmap_topk", "label"}
             if self.overlay_mode not in valid_overlay_modes:
                 raise ValueError(f"Invalid overlay_mode: {self.overlay_mode}")
+            if self.overlay_topk < 0:
+                raise ValueError("overlay_topk must be >= 0")
+            if not 0.0 <= self.overlay_score_threshold <= 1.0:
+                raise ValueError("overlay_score_threshold must be in [0, 1]")
             valid_discard_modes = {"top", "bottom", "middle", "random"}
             if self.discard_mode not in valid_discard_modes:
                 raise ValueError(f"Invalid discard_mode: {self.discard_mode}")

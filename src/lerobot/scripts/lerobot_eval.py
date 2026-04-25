@@ -216,8 +216,42 @@ def _merge_latency_samples(acc: dict[str, list[float]], samples: dict[str, list[
             acc[bucket].extend(float(v) for v in values)
 
 
-def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
-                          keep_grid=None, prune_darken=0.5, prune_stripe_gap=4):
+def _select_heatmap_regions(
+    heatmap_grid: np.ndarray,
+    topk: int | None = None,
+    threshold: float | None = None,
+) -> np.ndarray:
+    mask = np.ones_like(heatmap_grid, dtype=bool)
+
+    if topk is not None and topk > 0:
+        flat = heatmap_grid.reshape(-1)
+        k = min(int(topk), flat.size)
+        if k <= 0:
+            mask &= False
+        elif k < flat.size:
+            topk_mask = np.zeros(flat.size, dtype=bool)
+            topk_idx = np.argpartition(flat, -k)[-k:]
+            topk_mask[topk_idx] = True
+            mask &= topk_mask.reshape(heatmap_grid.shape)
+
+    if threshold is not None:
+        mask &= heatmap_grid >= float(threshold)
+
+    return mask
+
+
+def _apply_heatmap_overlay(
+    img,
+    heatmap_grid,
+    region_scores=None,
+    alpha=0.5,
+    keep_grid=None,
+    prune_darken=0.5,
+    prune_stripe_gap=4,
+    sparse_topk: int | None = None,
+    sparse_threshold: float | None = None,
+    draw_scores: bool = False,
+):
     """Overlay a continuous heatmap (blue→red) on *img* based on *heatmap_grid*.
 
     Args:
@@ -229,6 +263,9 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
                       tokens were pruned while still reading the heatmap colour.
         prune_darken: brightness multiplier for pruned regions (0=black, 1=no change).
         prune_stripe_gap: pixel spacing of diagonal hatching lines.
+        sparse_topk: when set, only the top-k scored regions are colorized.
+        sparse_threshold: optional normalized [0, 1] cutoff applied before coloring.
+        draw_scores: whether to render numeric region scores.
     """
     if heatmap_grid is None:
         return img
@@ -254,13 +291,27 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
         return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
     heat_rgb = _jet_colormap(hm_up)
-    blended = (img_np.astype(np.float32) * (1.0 - alpha)
-               + heat_rgb.astype(np.float32) * alpha).astype(np.uint8)
+    blended = (
+        img_np.astype(np.float32) * (1.0 - alpha) + heat_rgb.astype(np.float32) * alpha
+    ).astype(np.uint8)
+
+    sparse_mode = sparse_topk is not None or sparse_threshold is not None
+    selected_mask = None
+    selected_regions = None
+    if sparse_mode:
+        selected_regions = _select_heatmap_regions(heatmap_grid, sparse_topk, sparse_threshold)
+        if not selected_regions.any():
+            return img_np
+        region_mask_img = Image.fromarray(selected_regions.astype(np.uint8), mode="L")
+        selected_mask = (
+            np.array(region_mask_img.resize((width, height), resample=Image.NEAREST)) > 0
+        )
+        blended[~selected_mask] = img_np[~selected_mask]
 
     # ── Mark pruned regions: darken + diagonal stripe hatching ────────────
-    if keep_grid is not None:
+    if keep_grid is not None and not sparse_mode:
         kg_arr = keep_grid.astype(np.uint8) if keep_grid.dtype != np.uint8 else keep_grid
-        kg_img = Image.fromarray(kg_arr, mode='L').resize((width, height), resample=Image.NEAREST)
+        kg_img = Image.fromarray(kg_arr, mode="L").resize((width, height), resample=Image.NEAREST)
         kg_up = np.array(kg_img)
         pruned_mask = (kg_up == 0)  # True where pruned (keep=0)
 
@@ -281,7 +332,7 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
             blended = blended_f2.astype(np.uint8)
 
     # ── Optionally draw region score numbers ──────────────────────────────
-    if region_scores is None:
+    if region_scores is None or not draw_scores:
         return blended
     if torch.is_tensor(region_scores):
         region_scores = region_scores.detach().cpu().numpy()
@@ -306,6 +357,8 @@ def _apply_heatmap_overlay(img, heatmap_grid, region_scores=None, alpha=0.5,
     score_font = _load_font(score_font_size)
     for r in range(region_h):
         for c in range(region_w):
+            if sparse_mode and selected_regions is not None and not selected_regions[r, c]:
+                continue
             x = int((c + 0.03) * cell_w)
             y = int((r + 0.03) * cell_h)
             score = region_scores[r, c]
@@ -597,9 +650,15 @@ def eval_policy(
     if hasattr(policy, "reset_cuda_latency_stats"):
         policy.reset_cuda_latency_stats()
 
+    overlay_mode = getattr(getattr(policy, "config", None), "overlay_mode", "label")
     overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
     heatmap_debug = bool(getattr(getattr(policy, "config", None), "score_debug_heatmap", False))
-    overlay_heatmap = getattr(getattr(policy, "config", None), "overlay_mode", "label") == "heatmap"
+    overlay_heatmap = overlay_mode in {"heatmap", "heatmap_topk"}
+    sparse_heatmap = overlay_mode == "heatmap_topk"
+    overlay_topk = int(getattr(getattr(policy, "config", None), "overlay_topk", 16))
+    overlay_score_threshold = float(
+        getattr(getattr(policy, "config", None), "overlay_score_threshold", 0.0)
+    )
     show_scores = bool(getattr(getattr(policy, "config", None), "overlay_show_scores", False))
     show_ids = bool(getattr(getattr(policy, "config", None), "overlay_show_ids", False))
     last_overlay_grid = None
@@ -643,12 +702,24 @@ def eval_policy(
                 for idx, frame in enumerate(frames):
                     hm = heatmap_grid[idx] if idx < heatmap_grid.shape[0] else heatmap_grid[0]
                     scores = None
-                    if show_scores and region_scores is not None:
+                    if region_scores is not None:
                         scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
                     kg = None
-                    if keep_grid is not None and not heatmap_debug:
+                    if keep_grid is not None and not heatmap_debug and not sparse_heatmap:
                         kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
-                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                    rendered.append(
+                        _apply_heatmap_overlay(
+                            frame,
+                            hm,
+                            scores,
+                            keep_grid=kg,
+                            sparse_topk=overlay_topk if sparse_heatmap and not heatmap_debug else None,
+                            sparse_threshold=(
+                                overlay_score_threshold if sparse_heatmap and not heatmap_debug else None
+                            ),
+                            draw_scores=show_scores,
+                        )
+                    )
                 frames = rendered
             elif overlay_grid is not None:
                 rendered = []
@@ -668,12 +739,24 @@ def eval_policy(
                 for idx, frame in enumerate(frames):
                     hm = heatmap_grid[idx] if idx < heatmap_grid.shape[0] else heatmap_grid[0]
                     scores = None
-                    if show_scores and region_scores is not None:
+                    if region_scores is not None:
                         scores = region_scores[idx] if idx < region_scores.shape[0] else region_scores[0]
                     kg = None
-                    if keep_grid is not None and not heatmap_debug:
+                    if keep_grid is not None and not heatmap_debug and not sparse_heatmap:
                         kg = keep_grid[idx] if idx < keep_grid.shape[0] else keep_grid[0]
-                    rendered.append(_apply_heatmap_overlay(frame, hm, scores, keep_grid=kg))
+                    rendered.append(
+                        _apply_heatmap_overlay(
+                            frame,
+                            hm,
+                            scores,
+                            keep_grid=kg,
+                            sparse_topk=overlay_topk if sparse_heatmap and not heatmap_debug else None,
+                            sparse_threshold=(
+                                overlay_score_threshold if sparse_heatmap and not heatmap_debug else None
+                            ),
+                            draw_scores=show_scores,
+                        )
+                    )
                 frames = rendered
             elif overlay_grid is not None:
                 rendered = []

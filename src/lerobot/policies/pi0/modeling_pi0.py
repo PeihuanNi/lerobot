@@ -1975,7 +1975,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # ── Build normalised heatmap grids for debug visualisation ──────────
         heatmap_grids = []
-        if cfg.score_debug_heatmap or cfg.overlay_mode == "heatmap":
+        if cfg.score_debug_heatmap or cfg.overlay_mode in {"heatmap", "heatmap_topk"}:
             for idx, sr in enumerate(score_regions):
                 meta = metas[idx]
                 rps = meta.patches_per_side // cfg.region_patch_size
