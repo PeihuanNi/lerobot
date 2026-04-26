@@ -58,6 +58,21 @@ class EvalConfig:
     use_async_envs: bool = False
     # Maximum number of episodes to render as mp4 videos. 0 = no video.
     max_episodes_rendered: int = 10
+    # Profiling backend. Use "pytorch" to emit Chrome/TensorBoard traces.
+    profile_backend: str = "none"
+    # Directory for profiler traces. Relative paths resolve under output_dir.
+    profile_dir: str | None = None
+    # Emit NVTX markers for `nsys` timeline labeling.
+    profile_emit_nvtx: bool = False
+    # Emit `record_function` ranges for PyTorch profiler labeling.
+    profile_emit_record_function: bool = False
+    # `torch.profiler` schedule parameters.
+    profile_wait_steps: int = 1
+    profile_warmup_steps: int = 1
+    profile_active_steps: int = 3
+    profile_repeat: int = 1
+    profile_record_shapes: bool = True
+    profile_with_stack: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
@@ -69,3 +84,9 @@ class EvalConfig:
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
             )
+        valid_backends = {"none", "pytorch"}
+        if self.profile_backend not in valid_backends:
+            raise ValueError(f"Invalid eval.profile_backend: {self.profile_backend}")
+        for field_name in ("profile_wait_steps", "profile_warmup_steps", "profile_active_steps", "profile_repeat"):
+            if getattr(self, field_name) < 0:
+                raise ValueError(f"eval.{field_name} must be >= 0")

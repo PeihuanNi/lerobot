@@ -206,6 +206,7 @@ class PI05Config(PreTrainedConfig):
     overlay_show_scores: bool = False
     overlay_show_ids: bool = False
     score_debug_heatmap: bool = False   # debug: no pruning, every frame scored
+    token_selection_trace: bool = False  # debug: print per-frame token accounting and prune reasons
 
     # ═══════════════════════════════════════════════════════════════════════
     # 5. Logging / Debug

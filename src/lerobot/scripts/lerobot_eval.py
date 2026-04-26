@@ -49,6 +49,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -85,12 +86,33 @@ from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
+from lerobot.utils.profiling import (
+    configure_runtime_profiling,
+    create_torch_profiler,
+    profile_range,
+)
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
     inside_slurm,
 )
+
+
+class _NsysDebugStop(RuntimeError):
+    def __init__(self, phase: str):
+        super().__init__(phase)
+        self.phase = phase
+
+
+def _maybe_nsys_debug_stop(phase: str, device: torch.device | None = None) -> None:
+    target = os.environ.get("LEROBOT_NSYS_DEBUG_STOP_AFTER", "").strip()
+    if target != phase:
+        return
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    logging.warning("Stopping early for nsys debug at phase=%s", phase)
+    raise _NsysDebugStop(phase)
 
 
 def _to_numpy(value):
@@ -458,6 +480,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    profiler=None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -517,34 +540,49 @@ def rollout(
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
-        observation = preprocess_observation(observation)
+        with profile_range("eval.preprocess_observation"):
+            observation = preprocess_observation(observation)
         if return_observations:
             all_observations.append(deepcopy(observation))
 
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
-        observation = add_envs_task(env, observation)
+        with profile_range("eval.add_envs_task"):
+            observation = add_envs_task(env, observation)
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
-        observation = env_preprocessor(observation)
+        with profile_range("eval.env_preprocessor"):
+            observation = env_preprocessor(observation)
 
-        observation = preprocessor(observation)
-        with torch.no_grad():
-            action = policy.select_action(observation)
-        action = postprocessor(action)
+        with profile_range("eval.policy_preprocessor"):
+            observation = preprocessor(observation)
+        with profile_range("eval.policy.select_action"):
+            with torch.no_grad():
+                action = policy.select_action(observation)
+        if step == 0:
+            action_device = action.device if torch.is_tensor(action) else None
+            _maybe_nsys_debug_stop("after_first_select_action", action_device)
+        with profile_range("eval.policy_postprocessor"):
+            action = postprocessor(action)
 
         action_transition = {"action": action}
-        action_transition = env_postprocessor(action_transition)
+        with profile_range("eval.env_postprocessor"):
+            action_transition = env_postprocessor(action_transition)
         action = action_transition["action"]
 
         # Convert to CPU / numpy.
-        action_numpy: np.ndarray = action.to("cpu").numpy()
+        with profile_range("eval.action_to_numpy"):
+            action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
         # Apply the next action.
-        observation, reward, terminated, truncated, info = env.step(action_numpy)
+        with profile_range("eval.env.step"):
+            observation, reward, terminated, truncated, info = env.step(action_numpy)
+        if step == 0:
+            _maybe_nsys_debug_stop("after_first_env_step")
         if render_callback is not None:
-            render_callback(env)
+            with profile_range("eval.render_callback"):
+                render_callback(env)
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available if none of the envs finished.
@@ -568,6 +606,8 @@ def rollout(
             done = np.ones_like(done, dtype=bool)
 
         all_actions.append(torch.from_numpy(action_numpy))
+        if profiler is not None:
+            profiler.step()
         all_rewards.append(torch.from_numpy(reward))
         all_dones.append(torch.from_numpy(done))
         all_successes.append(torch.tensor(successes))
@@ -622,6 +662,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    profiler=None,
 ) -> dict:
     """
     Args:
@@ -799,6 +840,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            profiler=profiler,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -1028,63 +1070,106 @@ def eval_main(cfg: EvalPipelineConfig):
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.use_deterministic_algorithms(True, warn_only=True)
-    import os
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     set_seed(cfg.seed)
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+
+    emit_record_function = cfg.eval.profile_emit_record_function or cfg.eval.profile_backend == "pytorch"
+    configure_runtime_profiling(
+        emit_nvtx=cfg.eval.profile_emit_nvtx,
+        emit_record_function=emit_record_function,
+    )
+
+    def _emit_startup_smoke(tag: str) -> None:
+        # A tiny unconditional CUDA op inside an NVTX range helps distinguish
+        # "markers were never emitted" from "nsys attached but later lost the trace".
+        if not cfg.eval.profile_emit_nvtx or device.type != "cuda":
+            return
+        with profile_range(tag):
+            torch.empty(1, device=device)
+            torch.cuda.synchronize(device)
+
+    _emit_startup_smoke("eval.main.startup_smoke")
+    if cfg.eval.profile_backend != "none" and cfg.env.max_parallel_tasks > 1:
+        logging.warning("Profiling is enabled; forcing env.max_parallel_tasks=1 for a cleaner trace.")
+        cfg.env.max_parallel_tasks = 1
 
     logging.info("Making environment.")
-    envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+    envs = None
+    info = None
+    debug_stop_phase = None
+    try:
+        envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+        _emit_startup_smoke("eval.main.after_env_init")
+        _maybe_nsys_debug_stop("after_env_init", device)
 
-    logging.info("Making policy.")
+        logging.info("Making policy.")
 
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
-    )
-
-    policy.eval()
-
-    # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
-    preprocessor_overrides = {
-        "device_processor": {"device": str(policy.config.device)},
-        "rename_observations_processor": {"rename_map": cfg.rename_map},
-    }
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
-        preprocessor_overrides=preprocessor_overrides,
-    )
-
-    # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
-
-    with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        info = eval_policy_all(
-            envs=envs,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=cfg.eval.max_episodes_rendered,
-            videos_dir=Path(cfg.output_dir) / "videos",
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
+        policy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+            rename_map=cfg.rename_map,
         )
-        print("Overall Aggregated Metrics:")
-        print(info["overall"])
+        _emit_startup_smoke("eval.main.after_policy_init")
+        _maybe_nsys_debug_stop("after_policy_init", device)
 
-        # Print per-suite stats
-        for task_group, task_group_info in info.items():
-            print(f"\nAggregated Metrics for {task_group}:")
-            print(task_group_info)
-    # Close all vec envs
-    close_envs(envs)
+        policy.eval()
+
+        # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
+        preprocessor_overrides = {
+            "device_processor": {"device": str(policy.config.device)},
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=cfg.policy,
+            pretrained_path=cfg.policy.pretrained_path,
+            preprocessor_overrides=preprocessor_overrides,
+        )
+
+        # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
+        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+
+        profiler_cm = create_torch_profiler(cfg.eval, Path(cfg.output_dir))
+        with profiler_cm as profiler:
+            with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+                _emit_startup_smoke("eval.main.before_eval_policy_all")
+                info = eval_policy_all(
+                    envs=envs,
+                    policy=policy,
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    n_episodes=cfg.eval.n_episodes,
+                    max_episodes_rendered=cfg.eval.max_episodes_rendered,
+                    videos_dir=Path(cfg.output_dir) / "videos",
+                    start_seed=cfg.seed,
+                    max_parallel_tasks=cfg.env.max_parallel_tasks,
+                    profiler=profiler,
+                )
+                print("Overall Aggregated Metrics:")
+                print(info["overall"])
+
+                # Print per-suite stats
+                for task_group, task_group_info in info.items():
+                    print(f"\nAggregated Metrics for {task_group}:")
+                    print(task_group_info)
+    except _NsysDebugStop as exc:
+        debug_stop_phase = exc.phase
+        logging.warning("Stopped eval early for nsys debug at phase=%s", debug_stop_phase)
+    finally:
+        # Make sure the last GPU work is visible to external profilers before process teardown.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if envs is not None:
+            close_envs(envs)
+
+    if debug_stop_phase is not None:
+        logging.info("End of eval (nsys debug stop at %s)", debug_stop_phase)
+        return
 
     # Save info
     with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
@@ -1122,6 +1207,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    profiler=None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -1139,6 +1225,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        profiler=profiler,
     )
 
     per_episode = task_result["per_episode"]
@@ -1176,6 +1263,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    profiler=None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -1200,6 +1288,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        profiler=profiler,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -1221,6 +1310,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    profiler=None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1276,6 +1366,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        profiler=profiler,
     )
 
     if max_parallel_tasks <= 1:

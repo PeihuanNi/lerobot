@@ -1,5 +1,8 @@
 CUDA_VISIBLE_DEVICES="$1"  # GPU id(s) passed from CLI, e.g., "0" or "0,1"
-OUTPUT_DIR=""   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from score config
+EXTRA_ARGS=("${@:2}")
+PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_EVAL_MODULE="lerobot.scripts.lerobot_eval"
+OUTPUT_DIR="${OUTPUT_DIR:-}"   # e.g. "./outputs/eval/my_eval"; empty = auto-generate from score config
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_TYPE="pi05"
@@ -15,17 +18,50 @@ ENV_TYPE="libero"
 # ENV_TASK="libero_spatial, libero_object, libero_goal, libero_10"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
 ENV_TASK="libero_object"
-ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
+ENV_TASK_ID="[0]"
 EVAL_BATCH_SIZE=1
-EVAL_N_EPISODES=5
-MAX_EPISODES_RENDERED=50             # 0 = no video; >0 = save that many mp4s
+EVAL_N_EPISODES=1
+MAX_EPISODES_RENDERED=0             # 0 = no video; >0 = save that many mp4s
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. Profiling
+#    PROFILE_MODE:
+#      "none"  - normal eval
+#      "torch" - torch.profiler trace -> output_dir/PROFILE_DIR
+#      "nsys"  - Nsight Systems capture with NVTX ranges
+# ══════════════════════════════════════════════════════════════════════════════
+PROFILE_MODE="nsys"                  # "none" | "torch" | "nsys"
+
+# -- shared profiler labels --
+PROFILE_EMIT_RECORD_FUNCTION=false    # recommended for torch profiler
+PROFILE_EMIT_NVTX=true               # recommended for nsys
+
+# -- torch.profiler --
+PROFILE_DIR="torch_profile"
+PROFILE_WAIT_STEPS=2
+PROFILE_WARMUP_STEPS=2
+PROFILE_ACTIVE_STEPS=6
+PROFILE_REPEAT=1
+PROFILE_RECORD_SHAPES=true
+PROFILE_WITH_STACK=false
+
+# -- nsys --
+NSYS_BIN="${NSYS_BIN:-/usr/local/cuda-12.8/nsight-systems-2024.6.2/bin/nsys}"
+NSYS_OUTPUT="${NSYS_OUTPUT:-}"       # empty => auto-generate under ./outputs/nsys
+NSYS_TRACE="cuda,nvtx,osrt"
+NSYS_SAMPLE="none"                  # matches the confirmed-working smoke test
+NSYS_CAPTURE_RANGE=""                # keep empty unless you want custom capture range
+NSYS_GPU_METRICS_DEVICES="none"      # "none" | "all" | GPU index list, e.g. "0" or "0,1"
+NSYS_FORCE_OVERWRITE=true
+NSYS_SHOW_OUTPUT=false              # smoke test succeeded without -w true
+NSYS_STATS=false                    # run `nsys stats <report>` manually after capture
 
 USE_L1_REGRESSION=false
 USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
-TOKEN_SELECTION_ENABLED=false
-TOKEN_PRUNE_ENABLED=false
+TOKEN_SELECTION_ENABLED=true
+TOKEN_PRUNE_ENABLED=true
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
@@ -115,7 +151,10 @@ if [ -z "${RUN_ID_NOTE}" ]; then
   RUN_ID_NOTE="${GRAD_SCORE_METHOD}_${ACE_VARIANT}"
 fi
 if [ -z "${OUTPUT_DIR}" ]; then
-  OUTPUT_DIR="./outputs/figure/${GRAD_SCORE_METHOD}_${ACE_VARIANT}_gt"
+  OUTPUT_DIR="./outputs/profile/${GRAD_SCORE_METHOD}_${ACE_VARIANT}"
+fi
+if [ -z "${NSYS_OUTPUT}" ]; then
+  NSYS_OUTPUT="./outputs/nsys/${ENV_TASK}_${GRAD_SCORE_METHOD}_${ACE_VARIANT}"
 fi
 
 ARGS=(
@@ -173,12 +212,35 @@ ARGS=(
   # Env / Eval
   "--env.type=${ENV_TYPE}"
   "--env.task=${ENV_TASK}"
-  "--env.task_id=${ENV_TASK_ID}"
+  "--env.task_ids=${ENV_TASK_ID}"
   "--eval.batch_size=${EVAL_BATCH_SIZE}"
   "--eval.n_episodes=${EVAL_N_EPISODES}"
   "--eval.max_episodes_rendered=${MAX_EPISODES_RENDERED}"
   "--policy.compile_model=false"
 )
+
+if [ "${PROFILE_MODE}" = "torch" ]; then
+  ARGS+=(
+    "--eval.profile_backend=pytorch"
+    "--eval.profile_dir=${PROFILE_DIR}"
+    "--eval.profile_emit_record_function=${PROFILE_EMIT_RECORD_FUNCTION}"
+    "--eval.profile_emit_nvtx=${PROFILE_EMIT_NVTX}"
+    "--eval.profile_wait_steps=${PROFILE_WAIT_STEPS}"
+    "--eval.profile_warmup_steps=${PROFILE_WARMUP_STEPS}"
+    "--eval.profile_active_steps=${PROFILE_ACTIVE_STEPS}"
+    "--eval.profile_repeat=${PROFILE_REPEAT}"
+    "--eval.profile_record_shapes=${PROFILE_RECORD_SHAPES}"
+    "--eval.profile_with_stack=${PROFILE_WITH_STACK}"
+  )
+elif [ "${PROFILE_MODE}" = "nsys" ]; then
+  PYTHON_EVAL_MODULE="lerobot.scripts.nsys_eval_bootstrap"
+  ARGS+=(
+    "--eval.profile_backend=none"
+    "--eval.profile_emit_nvtx=${PROFILE_EMIT_NVTX}"
+    "--eval.profile_emit_record_function=false"
+  )
+fi
+
 if [ -n "${POLICY_PATH}" ]; then
   ARGS+=("--policy.path=${POLICY_PATH}")
 else
@@ -194,6 +256,7 @@ fi
 ENV_VARS=(
   "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
   "TOKENIZERS_PARALLELISM=false"
+  "CUBLAS_WORKSPACE_CONFIG=:4096:8"
   "MUJOCO_GL=${MUJOCO_GL}"
   "PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM}"
 )
@@ -207,8 +270,55 @@ if [ -n "${LIBGL_ALWAYS_SOFTWARE}" ]; then
   ENV_VARS+=("LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE}")
 fi
 
-TMPDIR="/home/nipeihuan/tmp"
-mkdir -p "$TMPDIR"
-export TMPDIR TMP TEMP
+# Do not hardcode TMPDIR here. On gpu01, forcing TMPDIR to a home-directory temp
+# path breaks Nsight Systems injection; falling back to the system default tmp dir works.
+if [ "${PROFILE_MODE}" = "nsys" ] && [ "${TMPDIR:-}" = "${HOME}/tmp" ]; then
+  unset TMPDIR TMP TEMP
+fi
 
-env "${ENV_VARS[@]}" lerobot-eval "${ARGS[@]}"
+for env_var in "${ENV_VARS[@]}"; do
+  export "${env_var}"
+done
+
+CMD=("${PYTHON_BIN}" -m "${PYTHON_EVAL_MODULE}" "${ARGS[@]}" "${EXTRA_ARGS[@]}")
+
+if [ "${PROFILE_MODE}" = "nsys" ]; then
+  if [ ! -x "${NSYS_BIN}" ]; then
+    NSYS_BIN="$(command -v nsys 2>/dev/null || true)"
+  fi
+  if [ -z "${NSYS_BIN}" ]; then
+    echo "Error: nsys binary not found. Set NSYS_BIN=/path/to/nsys." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "${NSYS_OUTPUT}")"
+  rm -f "${NSYS_OUTPUT}.sqlite"
+  NSYS_CMD=("${NSYS_BIN}" profile)
+  if [ -n "${NSYS_SAMPLE}" ]; then
+    NSYS_CMD+=(--sample "${NSYS_SAMPLE}")
+  fi
+  if [ "${NSYS_SHOW_OUTPUT}" = "true" ]; then
+    NSYS_CMD+=(-w true)
+  fi
+  if [ "${NSYS_STATS}" = "true" ]; then
+    NSYS_CMD+=(--stats=true)
+  fi
+  NSYS_CMD+=(-t "${NSYS_TRACE}" -o "${NSYS_OUTPUT}")
+  if [ "${NSYS_FORCE_OVERWRITE}" = "true" ]; then
+    NSYS_CMD+=(--force-overwrite true)
+  fi
+  if [ -n "${NSYS_CAPTURE_RANGE}" ]; then
+    NSYS_CMD+=(--capture-range "${NSYS_CAPTURE_RANGE}")
+  fi
+  if [ "${NSYS_GPU_METRICS_DEVICES}" != "none" ]; then
+    NSYS_CMD+=(--gpu-metrics-devices "${NSYS_GPU_METRICS_DEVICES}")
+  fi
+  printf 'Running:'
+  printf ' %q' "${NSYS_CMD[@]}" "${CMD[@]}"
+  printf '\n'
+  "${NSYS_CMD[@]}" "${CMD[@]}"
+else
+  printf 'Running:'
+  printf ' %q' "${CMD[@]}"
+  printf '\n'
+  "${CMD[@]}"
+fi

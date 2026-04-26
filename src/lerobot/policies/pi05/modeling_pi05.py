@@ -28,6 +28,7 @@ from torch import Tensor, nn
 from typing_extensions import Unpack
 
 from lerobot.utils.import_utils import _transformers_available
+from lerobot.utils.profiling import profile_range
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
@@ -640,7 +641,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             "token_selection_unpruned": [],
             "vision_model": [],
             "language_model": [],
+            "vlm_prefix_cache": [],
             "action_expert_denoise": [],
+            "action_expert_run_diffusion": [],
             "ace_total": [],
             "ace_vision_model": [],
             "ace_language_model": [],
@@ -992,56 +995,59 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 noise = self.sample_noise(actions_shape, device)
 
             latency_timer = self._start_cuda_latency_timer()
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+            with profile_range("policy.sample_actions.embed_prefix"):
+                prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-            _, past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
-            )
+            with profile_range("policy.sample_actions.prefix_cache"):
+                _, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks_4d,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    use_cache=True,
+                )
 
             dt = -1.0 / num_steps
 
             x_t = noise
-            for step in range(num_steps):
-                time = 1.0 + step * dt
-                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            with profile_range("policy.sample_actions.denoise_loop"):
+                for step in range(num_steps):
+                    time = 1.0 + step * dt
+                    time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
-                def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                    return self.denoise_step(
-                        prefix_pad_masks=prefix_pad_masks,
-                        past_key_values=past_key_values,
-                        x_t=input_x_t,
-                        timestep=current_timestep,
-                    )
+                    def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                        return self.denoise_step(
+                            prefix_pad_masks=prefix_pad_masks,
+                            past_key_values=past_key_values,
+                            x_t=input_x_t,
+                            timestep=current_timestep,
+                        )
 
-                if self._rtc_enabled():
-                    inference_delay = kwargs.get("inference_delay")
-                    prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                    execution_horizon = kwargs.get("execution_horizon")
+                    if self._rtc_enabled():
+                        inference_delay = kwargs.get("inference_delay")
+                        prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                        execution_horizon = kwargs.get("execution_horizon")
 
-                    v_t = self.rtc_processor.denoise_step(
-                        x_t=x_t,
-                        prev_chunk_left_over=prev_chunk_left_over,
-                        inference_delay=inference_delay,
-                        time=time,
-                        original_denoise_step_partial=denoise_step_partial_call,
-                        execution_horizon=execution_horizon,
-                    )
-                else:
-                    v_t = denoise_step_partial_call(x_t)
+                        v_t = self.rtc_processor.denoise_step(
+                            x_t=x_t,
+                            prev_chunk_left_over=prev_chunk_left_over,
+                            inference_delay=inference_delay,
+                            time=time,
+                            original_denoise_step_partial=denoise_step_partial_call,
+                            execution_horizon=execution_horizon,
+                        )
+                    else:
+                        v_t = denoise_step_partial_call(x_t)
 
-                x_t = x_t + dt * v_t
+                    x_t = x_t + dt * v_t
 
-                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                    self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                    if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                        self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
             self._record_cuda_latency(latency_timer, "baseline")
             return x_t
@@ -1085,6 +1091,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         breakdown_cuda_ms: dict[str, float] = {}
         breakdown_memory_mb: dict[str, float] = {}
         track_ace_breakdown = eval_frame and cfg.grad_score_method == "ace"
+        trace_enabled = bool(getattr(cfg, "token_selection_trace", False))
+
+        def _trace(message: str):
+            if trace_enabled:
+                print(message, flush=True)
+
+        _trace(
+            f"[token_trace][frame={token_state.frame_idx}] "
+            f"eval_frame={eval_frame} score_method={cfg.grad_score_method} "
+            f"token_prune_enabled={cfg.token_prune_enabled} dynamic_mode={cfg.dynamic_prune_mode}"
+        )
+        _trace(
+            "[token_trace] lm_paths: "
+            "prefix_cache=vlm_paligemma.language_model, "
+            "denoise=action_expert.gemma_expert"
+        )
 
         def _accum_cuda_breakdown(bucket: str, elapsed_ms: float):
             if bucket and elapsed_ms > 0:
@@ -1094,26 +1116,38 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if bucket and value_mb > 0:
                 breakdown_memory_mb[bucket] = max(breakdown_memory_mb.get(bucket, 0.0), float(value_mb))
 
+        def _measure_profiled_cuda_section(name: str, fn, *, track_memory: bool = False):
+            def _wrapped():
+                with profile_range(name):
+                    return fn()
+
+            return self._measure_cuda_section(_wrapped, track_memory=track_memory)
+
         image_embs = None
         patch_embs = None
         metas = None
+        prune_debug_rows: list[dict[str, object]] = []
         need_full_image_embs = eval_frame or not cfg.token_prune_enabled or token_state.last_score_token is None
         if need_full_image_embs:
             def _embed_images():
                 with torch.no_grad():
                     return [self.paligemma_with_expert.embed_image(img) for img in images]
 
-            image_embs, image_embed_ms, _ = self._measure_cuda_section(_embed_images)
+            image_embs, image_embed_ms, _ = _measure_profiled_cuda_section(
+                "policy.token_selection.vision_model.embed_image",
+                _embed_images,
+            )
             _accum_cuda_breakdown("vision_model", image_embed_ms)
             if track_ace_breakdown:
                 _accum_cuda_breakdown("ace_vision_model", image_embed_ms)
 
             patch_embs = []
             metas = []
-            for emb in image_embs:
-                patch_emb, meta = split_patch_tokens(emb)
-                patch_embs.append(patch_emb)
-                metas.append(meta)
+            with profile_range("policy.token_selection.vision_model.split_patch_tokens"):
+                for emb in image_embs:
+                    patch_emb, meta = split_patch_tokens(emb)
+                    patch_embs.append(patch_emb)
+                    metas.append(meta)
 
             if token_state.last_score_token is not None:
                 if len(token_state.last_score_token) != len(patch_embs):
@@ -1148,6 +1182,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 masks,
                 image_embs=image_embs,
                 image_pad_masks=image_pad_masks,
+            )
+
+        def _trace_prefix_tokens(prefix_pad_masks: Tensor, image_pad_masks: list[Tensor] | None):
+            if not trace_enabled:
+                return
+            total_prefix = prefix_pad_masks.sum(dim=1).tolist()
+            if image_pad_masks is None:
+                vision_tokens = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
+                for img_idx, meta in enumerate(metas):
+                    tokens_per_valid = meta.num_extra_tokens + meta.num_patches
+                    vision_tokens = vision_tokens + img_masks[img_idx].to(dtype=torch.long) * tokens_per_valid
+            else:
+                vision_tokens = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
+                for pad_mask in image_pad_masks:
+                    vision_tokens = vision_tokens + pad_mask.sum(dim=1).to(dtype=torch.long)
+            language_tokens = masks.sum(dim=1).to(dtype=torch.long)
+            _trace(
+                "[token_trace] prefix_tokens "
+                f"total={total_prefix} vision={vision_tokens.tolist()} language={language_tokens.tolist()}"
             )
 
         def compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks, capture_attn: bool = False):
@@ -1340,7 +1393,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 #   5. Aggregate action->vision relevance into per-token scores.
                 #   6. Accumulate across scored denoise steps, then average.
                 ace_total_timer = self._start_cuda_latency_timer() if track_ace_breakdown else None
-                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
+                    prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
                 _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
                 def _compute_prefix_cache():
                     if _use_prefix_score_attn:
@@ -1358,10 +1413,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         capture_attn=False,
                     )
 
-                (past_key_values, prefix_score_attns), prefix_cache_ms, _ = self._measure_cuda_section(
-                    _compute_prefix_cache
+                (past_key_values, prefix_score_attns), prefix_cache_ms, _ = _measure_profiled_cuda_section(
+                    "policy.token_selection.vlm_paligemma.prefix_cache",
+                    _compute_prefix_cache,
                 )
                 _accum_cuda_breakdown("language_model", prefix_cache_ms)
+                _accum_cuda_breakdown("vlm_prefix_cache", prefix_cache_ms)
                 if track_ace_breakdown:
                     _accum_cuda_breakdown("ace_language_model", prefix_cache_ms)
                 if _use_prefix_score_attn and prefix_score_attns is None:
@@ -1381,129 +1438,156 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 _scored_steps = [s for s in range(num_steps) if _interp_step < 0 or _interp_step == s]
                 _last_scored_step = _scored_steps[-1] if _scored_steps else None
 
-                for _step in range(num_steps):
-                    _time = 1.0 + _step * _dt
-                    _time_t = torch.tensor(_time, dtype=torch.float32, device=device).expand(bsize)
-                    _need_score = (_interp_step < 0 or _interp_step == _step)
+                with profile_range("policy.token_selection.action_expert.run_diffusion"):
+                    for _step in range(num_steps):
+                        _time = 1.0 + _step * _dt
+                        _time_t = torch.tensor(_time, dtype=torch.float32, device=device).expand(bsize)
+                        _need_score = (_interp_step < 0 or _interp_step == _step)
 
-                    if _need_score:
-                        _x_in = x_t.detach().requires_grad_(True)
-                        def _scored_denoise_step():
-                            with torch.enable_grad():
-                                return self.denoise_step(
-                                    prefix_pad_masks=prefix_pad_masks,
-                                    past_key_values=past_key_values,
-                                    x_t=_x_in,
-                                    timestep=_time_t,
-                                    output_attentions=True,
-                                    return_suffix_out=True,
-                                )
+                        if not _need_score:
+                            def _unscored_denoise_step():
+                                with torch.no_grad():
+                                    return self.denoise_step(
+                                        prefix_pad_masks=prefix_pad_masks,
+                                        past_key_values=past_key_values,
+                                        x_t=x_t,
+                                        timestep=_time_t,
+                                    )
 
-                        (_v_raw, _, _step_attns), scored_denoise_ms, _ = self._measure_cuda_section(
-                            _scored_denoise_step
-                        )
-                        _accum_cuda_breakdown("action_expert_denoise", scored_denoise_ms)
-                        if track_ace_breakdown:
-                            _accum_cuda_breakdown(
-                                "ace_action_expert_denoise",
-                                scored_denoise_ms,
+                            _v_t, unscored_denoise_ms, _ = _measure_profiled_cuda_section(
+                                "policy.token_selection.action_expert.unscored_denoise_step",
+                                _unscored_denoise_step,
                             )
-                        with torch.enable_grad():
-                            # ── Action-step subset for objective ──
-                            _a_lo = max(0, cfg.ace_action_start)
-                            _a_hi = cfg.chunk_size if cfg.ace_action_end < 0 else min(cfg.ace_action_end, cfg.chunk_size)
-                            _suffix_attn_list = list(_step_attns)
-                            _score_attn_list = list(prefix_score_attns) if _use_prefix_score_attn else _suffix_attn_list
-                            _retain_score_graph = _use_prefix_score_attn and _step != _last_scored_step
-
-                            # ── Compute objective target ──
-                            if cfg.ace_objective in {"action_sample_L1", "action_sample_L2"}:
-                                # x_0_hat = x_t - t * v_theta
-                                _obj_target = (_x_in[:, _a_lo:_a_hi, :] - _time * _v_raw[:, _a_lo:_a_hi, :]).float()
-                            elif cfg.ace_objective == "vector_field_L2":
-                                _obj_target = _v_raw[:, _a_lo:_a_hi, :].float()
-                            else:
-                                raise ValueError(
-                                    f"Unsupported ace_objective: {cfg.ace_objective}. "
-                                    "Expected one of {'action_sample_L1', 'action_sample_L2', 'vector_field_L2'}."
+                            _accum_cuda_breakdown("action_expert_denoise", unscored_denoise_ms)
+                            if track_ace_breakdown:
+                                _accum_cuda_breakdown(
+                                    "ace_action_expert_denoise",
+                                    unscored_denoise_ms,
                                 )
+                            x_t = x_t.detach() + _dt * _v_t.detach()
+                            continue
 
-                            def _run_interp_backward():
-                                if cfg.ace_variant == "dimension_independent":
-                                    # Per-dimension backprop: A_bar = (1/D) sum_d mean_h(A * |dv_d/dA|)
-                                    _v_sel = _obj_target[:, :, :7]
-                                    _action_dim = _v_sel.shape[-1]
-                                    if cfg.ace_use_residual:
-                                        _dim_A_bars_local = None
+                        if _need_score:
+                            _x_in = x_t.detach().requires_grad_(True)
+                            def _scored_denoise_step():
+                                with torch.enable_grad():
+                                    return self.denoise_step(
+                                        prefix_pad_masks=prefix_pad_masks,
+                                        past_key_values=past_key_values,
+                                        x_t=_x_in,
+                                        timestep=_time_t,
+                                        output_attentions=True,
+                                        return_suffix_out=True,
+                                    )
+
+                            (_v_raw, _, _step_attns), scored_denoise_ms, _ = _measure_profiled_cuda_section(
+                                "policy.token_selection.action_expert.scored_denoise_step",
+                                _scored_denoise_step,
+                            )
+                            _accum_cuda_breakdown("action_expert_denoise", scored_denoise_ms)
+                            if track_ace_breakdown:
+                                _accum_cuda_breakdown(
+                                    "ace_action_expert_denoise",
+                                    scored_denoise_ms,
+                                )
+                            with torch.enable_grad():
+                                # ── Action-step subset for objective ──
+                                _a_lo = max(0, cfg.ace_action_start)
+                                _a_hi = cfg.chunk_size if cfg.ace_action_end < 0 else min(cfg.ace_action_end, cfg.chunk_size)
+                                _suffix_attn_list = list(_step_attns)
+                                _score_attn_list = list(prefix_score_attns) if _use_prefix_score_attn else _suffix_attn_list
+                                _retain_score_graph = _use_prefix_score_attn and _step != _last_scored_step
+
+                            with torch.enable_grad():
+                                # ── Compute objective target ──
+                                if cfg.ace_objective in {"action_sample_L1", "action_sample_L2"}:
+                                    # x_0_hat = x_t - t * v_theta
+                                    _obj_target = (_x_in[:, _a_lo:_a_hi, :] - _time * _v_raw[:, _a_lo:_a_hi, :]).float()
+                                elif cfg.ace_objective == "vector_field_L2":
+                                    _obj_target = _v_raw[:, _a_lo:_a_hi, :].float()
+                                else:
+                                    raise ValueError(
+                                        f"Unsupported ace_objective: {cfg.ace_objective}. "
+                                        "Expected one of {'action_sample_L1', 'action_sample_L2', 'vector_field_L2'}."
+                                    )
+
+                                def _run_interp_backward():
+                                    if cfg.ace_variant == "dimension_independent":
+                                        # Per-dimension backprop: A_bar = (1/D) sum_d mean_h(A * |dv_d/dA|)
+                                        _v_sel = _obj_target[:, :, :7]
+                                        _action_dim = _v_sel.shape[-1]
+                                        if cfg.ace_use_residual:
+                                            _dim_A_bars_local = None
+                                            for _d in range(_action_dim):
+                                                _obj_d = _v_sel[:, :, _d].sum()
+                                                _gs_local = _grad_with_zero_for_unused(
+                                                    _obj_d,
+                                                    _score_attn_list,
+                                                    retain_graph=_retain_score_graph or (_d < _action_dim - 1),
+                                                    allow_unused_zero=_use_prefix_score_attn,
+                                                )
+                                                if _dim_A_bars_local is None:
+                                                    _dim_A_bars_local = [
+                                                        _combine_dim_independent(_score_attn_list[l], _gs_local[l])
+                                                        for l in range(len(_score_attn_list))
+                                                    ]
+                                                else:
+                                                    for l in range(len(_score_attn_list)):
+                                                        _dim_A_bars_local[l] = _dim_A_bars_local[l] + _combine_dim_independent(
+                                                            _score_attn_list[l], _gs_local[l]
+                                                        )
+                                            for l in range(len(_score_attn_list)):
+                                                _dim_A_bars_local[l] = _dim_A_bars_local[l] / _action_dim
+                                            return _dim_A_bars_local, None, None, None, None
+
+                                        _last_attn_local = _score_attn_list[-1]
+                                        _dim_A_bar_local = None
                                         for _d in range(_action_dim):
                                             _obj_d = _v_sel[:, :, _d].sum()
-                                            _gs_local = _grad_with_zero_for_unused(
+                                            _gd_local = _grad_with_zero_for_unused(
                                                 _obj_d,
-                                                _score_attn_list,
+                                                _last_attn_local,
                                                 retain_graph=_retain_score_graph or (_d < _action_dim - 1),
                                                 allow_unused_zero=_use_prefix_score_attn,
                                             )
-                                            if _dim_A_bars_local is None:
-                                                _dim_A_bars_local = [
-                                                    _combine_dim_independent(_score_attn_list[l], _gs_local[l])
-                                                    for l in range(len(_score_attn_list))
-                                                ]
-                                            else:
-                                                for l in range(len(_score_attn_list)):
-                                                    _dim_A_bars_local[l] = _dim_A_bars_local[l] + _combine_dim_independent(
-                                                        _score_attn_list[l], _gs_local[l]
-                                                    )
-                                        for l in range(len(_score_attn_list)):
-                                            _dim_A_bars_local[l] = _dim_A_bars_local[l] / _action_dim
-                                        return _dim_A_bars_local, None, None, None, None
+                                            _c = _combine_dim_independent(_last_attn_local, _gd_local)
+                                            _dim_A_bar_local = _c if _dim_A_bar_local is None else _dim_A_bar_local + _c
+                                        _dim_A_bar_local = _dim_A_bar_local / _action_dim
+                                        return None, _dim_A_bar_local, None, None, _last_attn_local
 
-                                    _last_attn_local = _score_attn_list[-1]
-                                    _dim_A_bar_local = None
-                                    for _d in range(_action_dim):
-                                        _obj_d = _v_sel[:, :, _d].sum()
-                                        _gd_local = _grad_with_zero_for_unused(
-                                            _obj_d,
-                                            _last_attn_local,
-                                            retain_graph=_retain_score_graph or (_d < _action_dim - 1),
+                                    if cfg.ace_objective == "action_sample_L1":
+                                        _obj = _obj_target.abs().sum()
+                                    else:
+                                        _obj = (_obj_target ** 2).sum()
+                                    if cfg.ace_use_residual:
+                                        _grads_local = _grad_with_zero_for_unused(
+                                            _obj,
+                                            _score_attn_list,
+                                            retain_graph=_retain_score_graph,
                                             allow_unused_zero=_use_prefix_score_attn,
                                         )
-                                        _c = _combine_dim_independent(_last_attn_local, _gd_local)
-                                        _dim_A_bar_local = _c if _dim_A_bar_local is None else _dim_A_bar_local + _c
-                                    _dim_A_bar_local = _dim_A_bar_local / _action_dim
-                                    return None, _dim_A_bar_local, None, None, _last_attn_local
+                                        return None, None, _grads_local, None, None
 
-                                if cfg.ace_objective == "action_sample_L1":
-                                    _obj = _obj_target.abs().sum()
-                                else:
-                                    _obj = (_obj_target ** 2).sum()
-                                if cfg.ace_use_residual:
-                                    _grads_local = _grad_with_zero_for_unused(
+                                    _last_attn_local = _score_attn_list[-1]
+                                    _grad_last_local = _grad_with_zero_for_unused(
                                         _obj,
-                                        _score_attn_list,
+                                        _last_attn_local,
                                         retain_graph=_retain_score_graph,
                                         allow_unused_zero=_use_prefix_score_attn,
                                     )
-                                    return None, None, _grads_local, None, None
+                                    return None, None, None, _grad_last_local, _last_attn_local
 
-                                _last_attn_local = _score_attn_list[-1]
-                                _grad_last_local = _grad_with_zero_for_unused(
-                                    _obj,
-                                    _last_attn_local,
-                                    retain_graph=_retain_score_graph,
-                                    allow_unused_zero=_use_prefix_score_attn,
+                                (
+                                    _dim_A_bars,
+                                    _dim_A_bar,
+                                    _grads,
+                                    _grad_last,
+                                    _last_attn,
+                                ), backward_ms, backward_memory = _measure_profiled_cuda_section(
+                                    "policy.token_selection.action_expert.ace_backward",
+                                    _run_interp_backward,
+                                    track_memory=True,
                                 )
-                                return None, None, None, _grad_last_local, _last_attn_local
-
-                            (
-                                _dim_A_bars,
-                                _dim_A_bar,
-                                _grads,
-                                _grad_last,
-                                _last_attn,
-                            ), backward_ms, backward_memory = self._measure_cuda_section(
-                                _run_interp_backward,
-                                track_memory=True,
-                            )
                             if track_ace_breakdown:
                                 _accum_cuda_breakdown("ace_backward", backward_ms)
                                 _set_memory_breakdown(
@@ -1603,26 +1687,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                 _score_accum = _score_accum + _step_score
                             _score_count += 1
 
-                        _v_t = _v_raw.detach()
-                    else:
-                        def _unscored_denoise_step():
-                            with torch.no_grad():
-                                return self.denoise_step(
-                                    prefix_pad_masks=prefix_pad_masks,
-                                    past_key_values=past_key_values,
-                                    x_t=x_t,
-                                    timestep=_time_t,
-                                )
+                            _v_t = _v_raw.detach()
 
-                        _v_t, unscored_denoise_ms, _ = self._measure_cuda_section(_unscored_denoise_step)
-                        _accum_cuda_breakdown("action_expert_denoise", unscored_denoise_ms)
-                        if track_ace_breakdown:
-                            _accum_cuda_breakdown(
-                                "ace_action_expert_denoise",
-                                unscored_denoise_ms,
-                            )
-
-                    x_t = x_t.detach() + _dt * _v_t.detach()
+                        x_t = x_t.detach() + _dt * _v_t.detach()
 
                 # Average across scored steps
                 if _score_count > 1:
@@ -1647,7 +1714,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
 
             elif cfg.grad_score_method == "attn_only":
-                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
+                    prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
                 _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
                 past_key_values, prefix_score_attns = compute_prefix_cache(
                     prefix_embs,
@@ -1655,11 +1724,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     prefix_att_masks,
                     capture_attn=_use_prefix_score_attn,
                 )
-                x_t, _, last_attn = run_diffusion(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    capture_attn=not _use_prefix_score_attn,
-                )
+                with profile_range("policy.token_selection.action_expert.run_diffusion"):
+                    x_t, _, last_attn = run_diffusion(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        capture_attn=not _use_prefix_score_attn,
+                    )
                 score_attns = prefix_score_attns if _use_prefix_score_attn else last_attn
                 if score_attns is None:
                     raise ValueError("Missing attention output for attention-based scoring.")
@@ -1753,6 +1823,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             token_state.pending_global_pool_restore = False
         for idx, score_token in enumerate(score_tokens):
             meta = metas[idx]
+            _discarded_regions = 0
             score_region = compute_region_scores(score_token, meta.patches_per_side, cfg.region_patch_size)
             if eval_frame and cfg.grad_region_ema > 0 and token_state.last_score_region is not None:
                 score_region = (
@@ -1802,6 +1873,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         _prev_scores, _prev_kept_regions, cfg.discard_prev_kept_ratio, _max_discard,
                         mode=cfg.discard_mode
                     )
+                    _discarded_regions = int(_discard_mask.sum().item())
                     # Permanently remove from global active pool
                     token_state.global_active_region_masks[idx] &= ~_discard_mask
             
@@ -1941,6 +2013,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             clipped_regions.append(clipped_region)
             keep_token_masks.append(keep_token)
 
+            _score_source = (
+                f"eval:{cfg.grad_score_method}"
+                if eval_frame
+                else ("cached_prev_scores" if token_state.last_score_token is not None else "fallback:token_norm")
+            )
+            prune_debug_rows.append(
+                {
+                    "image_idx": idx,
+                    "patch_tokens": int(meta.num_patches),
+                    "extra_tokens": int(meta.num_extra_tokens),
+                    "valid_regions": valid_masks[idx].sum(dim=1).tolist(),
+                    "kept_regions": keep_region.sum(dim=1).tolist(),
+                    "kept_patch_tokens": keep_token.sum(dim=1).tolist(),
+                    "total_patch_tokens": int(keep_token.shape[1]),
+                    "score_source": _score_source,
+                    "dynamic_mode": cfg.dynamic_prune_mode,
+                    "target_keep_tokens": [int(_eff_min), int(_eff_max)],
+                    "evict_mode": cfg.discard_mode,
+                    "evict_ratio": float(cfg.discard_prev_kept_ratio),
+                    "evicted_regions": _discarded_regions,
+                }
+            )
+
         # ── Build normalised heatmap grids for debug visualisation ──────────
         heatmap_grids = []
         if cfg.score_debug_heatmap or cfg.overlay_mode in {"heatmap", "heatmap_topk"}:
@@ -1997,23 +2092,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if not cfg.score_debug_heatmap and not eval_frame and cfg.token_prune_enabled:
             image_embs = []
             image_pad_masks = []
-            with torch.no_grad():
-                for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
-                    pruned_embs, pruned_pad_mask = self.paligemma_with_expert.embed_image_pruned(
-                        img, keep_mask, img_mask
-                    )
-                    image_embs.append(pruned_embs)
-                    image_pad_masks.append(pruned_pad_mask)
+            with profile_range("policy.token_selection.pruned_vision_model"):
+                with torch.no_grad():
+                    for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
+                        with profile_range("policy.token_selection.pruned_vision_model.embed_pruned_vision_tokens"):
+                            pruned_embs, pruned_pad_mask = self.paligemma_with_expert.embed_image_pruned(
+                                img, keep_mask, img_mask
+                            )
+                        image_embs.append(pruned_embs)
+                        image_pad_masks.append(pruned_pad_mask)
 
         if actions is None:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
-            past_key_values, _ = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
-            with torch.no_grad():
-                actions, _, _ = run_diffusion(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                )
-                actions = actions.detach()
+            with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
+                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
+            _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=image_pad_masks)
+            with profile_range("policy.token_selection.vlm_paligemma.prefix_cache"):
+                past_key_values, _ = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+            with profile_range("policy.token_selection.action_expert.run_diffusion"):
+                with torch.no_grad():
+                    actions, _, _ = run_diffusion(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                    )
+                    actions = actions.detach()
 
         token_state.last_score_token = [score.detach() for score in score_tokens]
         token_state.last_score_region = [score.detach() for score in score_regions]
@@ -2058,6 +2159,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 "prune": f"{_prune_pct:.1f}%",
                 "eval": "Y" if eval_frame else "N",
             }
+
+        if trace_enabled:
+            _trace(
+                f"[token_trace][frame={token_state.frame_idx}] "
+                f"need_full_image_embs={need_full_image_embs} eval_frame={eval_frame} "
+                f"pruned_vision_applied={bool(not eval_frame and cfg.token_prune_enabled and image_pad_masks is not None)}"
+            )
+            for row in prune_debug_rows:
+                _trace(
+                    "[token_trace][vision_prune] "
+                    f"img={row['image_idx']} tokens={row['patch_tokens']}+{row['extra_tokens']} "
+                    f"kept={row['kept_patch_tokens']}/{row['total_patch_tokens']} "
+                    f"regions_kept={row['kept_regions']} valid_regions={row['valid_regions']} "
+                    f"score_source={row['score_source']} dynamic={row['dynamic_mode']} "
+                    f"target_keep_tokens={row['target_keep_tokens']} "
+                    f"evict={row['evict_mode']}:{row['evict_ratio']} evicted_regions={row['evicted_regions']}"
+                )
 
         _need_l1 = (cfg.ace_plot_actions_l1
                      or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel", "velocity"))
@@ -2222,6 +2340,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+
+        if getattr(self.config, "token_selection_trace", False):
+            frame_idx = self._token_selection_state.frame_idx if self._token_selection_state is not None else -1
+            last_frame = getattr(self, "_trace_last_denoise_frame", None)
+            if frame_idx != last_frame:
+                print(
+                    "[token_trace][denoise] "
+                    f"frame={frame_idx} prefix_len={prefix_len} suffix_len={suffix_len} "
+                    f"chunk_size={self.config.chunk_size}",
+                    flush=True,
+                )
+                self._trace_last_denoise_frame = frame_idx
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
