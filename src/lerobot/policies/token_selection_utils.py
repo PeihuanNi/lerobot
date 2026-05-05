@@ -24,6 +24,8 @@ from typing import Iterable
 import torch
 from torch import Tensor, nn
 
+from lerobot.utils.profiling import profile_range
+
 
 @dataclass
 class PatchGridMeta:
@@ -228,15 +230,16 @@ def apply_min_max_constraints(
     clipped_mask = torch.zeros_like(keep_pre, dtype=torch.bool)
     order = torch.argsort(score_region, dim=-1, descending=True)
     for batch_idx in range(batch_size):
+        finite_order = order[batch_idx][torch.isfinite(score_region[batch_idx, order[batch_idx]])]
         keep_count = int(keep_mask[batch_idx].sum().item())
         if keep_count < min_regions:
             needed = min_regions - keep_count
-            add_indices = [idx for idx in order[batch_idx].tolist() if not keep_mask[batch_idx, idx]][:needed]
+            add_indices = [idx for idx in finite_order.tolist() if not keep_mask[batch_idx, idx]][:needed]
             if add_indices:
                 keep_mask[batch_idx, add_indices] = True
         keep_count = int(keep_mask[batch_idx].sum().item())
         if keep_count > max_regions:
-            top = order[batch_idx, :max_regions]
+            top = finite_order[:max_regions]
             new_keep = torch.zeros_like(keep_mask[batch_idx])
             new_keep[top] = True
             clipped = keep_mask[batch_idx] & ~new_keep
@@ -432,6 +435,145 @@ def prune_image_embeddings(
     return pruned_embs, pruned_pad_masks
 
 
+def compact_prefix_inputs(
+    prefix_embs: Tensor,
+    prefix_pad_masks: Tensor,
+    prefix_att_masks: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Drop prefix columns that are padding for the whole batch."""
+    if prefix_pad_masks.ndim != 2:
+        raise ValueError(f"prefix_pad_masks must have shape [B, L], got {tuple(prefix_pad_masks.shape)}")
+    if prefix_embs.ndim != 3:
+        raise ValueError(f"prefix_embs must have shape [B, L, D], got {tuple(prefix_embs.shape)}")
+    if prefix_att_masks.ndim != 2:
+        raise ValueError(f"prefix_att_masks must have shape [B, L], got {tuple(prefix_att_masks.shape)}")
+    if prefix_embs.shape[:2] != prefix_pad_masks.shape or prefix_att_masks.shape != prefix_pad_masks.shape:
+        raise ValueError(
+            "prefix_embs, prefix_pad_masks and prefix_att_masks have incompatible sequence shapes: "
+            f"{tuple(prefix_embs.shape)}, {tuple(prefix_pad_masks.shape)}, {tuple(prefix_att_masks.shape)}"
+        )
+
+    keep_idx = torch.nonzero(prefix_pad_masks.any(dim=0), as_tuple=False).squeeze(-1)
+    return (
+        prefix_embs.index_select(1, keep_idx),
+        prefix_pad_masks.index_select(1, keep_idx),
+        prefix_att_masks.index_select(1, keep_idx),
+    )
+
+
+def embed_images_for_token_selection(
+    embed_image,
+    images: list[Tensor],
+    *,
+    parallel_streams: bool = True,
+) -> list[Tensor]:
+    """Embed actual token-selection cameras without touching baseline inference."""
+    if len(images) <= 1:
+        return [embed_image(img) for img in images]
+
+    first_shape = images[0].shape
+    if parallel_streams and all(img.shape == first_shape for img in images):
+        batch_sizes = [img.shape[0] for img in images]
+        image_batch = torch.cat(images, dim=0)
+        image_embs = embed_image(image_batch)
+        return list(image_embs.split(batch_sizes, dim=0))
+
+    if parallel_streams and images[0].is_cuda:
+        device = images[0].device
+        current_stream = torch.cuda.current_stream(device)
+        streams = [torch.cuda.Stream(device=device) for _ in images]
+        outputs: list[Tensor | None] = [None] * len(images)
+        for stream in streams:
+            stream.wait_stream(current_stream)
+        for idx, (stream, img) in enumerate(zip(streams, images, strict=True)):
+            with torch.cuda.stream(stream):
+                outputs[idx] = embed_image(img)
+        for stream in streams:
+            current_stream.wait_stream(stream)
+        embedded = []
+        for out in outputs:
+            if out is None:
+                raise RuntimeError("Missing image embedding output.")
+            out.record_stream(current_stream)
+            embedded.append(out)
+        return embedded
+
+    return [embed_image(img) for img in images]
+
+
+def embed_pruned_images_for_token_selection(
+    embed_image_pruned,
+    images: list[Tensor],
+    keep_token_masks: list[Tensor],
+    img_masks: list[Tensor],
+    *,
+    parallel_streams: bool = True,
+) -> tuple[list[Tensor], list[Tensor]]:
+    """Embed pruned token-selection cameras without touching baseline inference."""
+    if len(images) <= 1:
+        image_embs = []
+        image_pad_masks = []
+        for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
+            pruned_embs, pruned_pad_mask = embed_image_pruned(img, keep_mask, img_mask)
+            image_embs.append(pruned_embs)
+            image_pad_masks.append(pruned_pad_mask)
+        return image_embs, image_pad_masks
+
+    first_image_shape = images[0].shape
+    first_keep_shape = keep_token_masks[0].shape
+    first_mask_shape = img_masks[0].shape
+    can_batch = (
+        parallel_streams
+        and all(img.shape == first_image_shape for img in images)
+        and all(keep_mask.shape == first_keep_shape for keep_mask in keep_token_masks)
+        and all(img_mask.shape == first_mask_shape for img_mask in img_masks)
+    )
+    if can_batch:
+        batch_sizes = [img.shape[0] for img in images]
+        image_batch = torch.cat(images, dim=0)
+        keep_mask_batch = torch.cat(keep_token_masks, dim=0)
+        img_mask_batch = torch.cat(img_masks, dim=0)
+        pruned_embs, pruned_pad_mask = embed_image_pruned(image_batch, keep_mask_batch, img_mask_batch)
+        return (
+            list(pruned_embs.split(batch_sizes, dim=0)),
+            list(pruned_pad_mask.split(batch_sizes, dim=0)),
+        )
+
+    if not parallel_streams or not images[0].is_cuda:
+        image_embs = []
+        image_pad_masks = []
+        for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
+            pruned_embs, pruned_pad_mask = embed_image_pruned(img, keep_mask, img_mask)
+            image_embs.append(pruned_embs)
+            image_pad_masks.append(pruned_pad_mask)
+        return image_embs, image_pad_masks
+
+    device = images[0].device
+    current_stream = torch.cuda.current_stream(device)
+    streams = [torch.cuda.Stream(device=device) for _ in images]
+    outputs: list[tuple[Tensor, Tensor] | None] = [None] * len(images)
+    for stream in streams:
+        stream.wait_stream(current_stream)
+    for idx, (stream, img, keep_mask, img_mask) in enumerate(
+        zip(streams, images, keep_token_masks, img_masks, strict=True)
+    ):
+        with torch.cuda.stream(stream):
+            outputs[idx] = embed_image_pruned(img, keep_mask, img_mask)
+    for stream in streams:
+        current_stream.wait_stream(stream)
+
+    image_embs = []
+    image_pad_masks = []
+    for output in outputs:
+        if output is None:
+            raise RuntimeError("Missing pruned image embedding output.")
+        output[0].record_stream(current_stream)
+        output[1].record_stream(current_stream)
+        image_embs.append(output[0])
+        image_pad_masks.append(output[1])
+    return image_embs, image_pad_masks
+
+
 def embed_pruned_vision_tokens(
     pixel_values: Tensor,
     keep_masks: Tensor,
@@ -447,8 +589,9 @@ def embed_pruned_vision_tokens(
 
     patch_dtype = patch_embedding.weight.dtype
     pos_dtype = position_embedding.weight.dtype
-    patch_embeds = patch_embedding(pixel_values.to(dtype=patch_dtype))
-    patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+    with profile_range("policy.token_selection.pruned_vision_model.patch_embed_dense"):
+        patch_embeds = patch_embedding(pixel_values.to(dtype=patch_dtype))
+        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
     batch_size, num_patches, _ = patch_embeds.shape
     if keep_masks.shape != (batch_size, num_patches):
@@ -456,9 +599,10 @@ def embed_pruned_vision_tokens(
             f"keep_masks shape {tuple(keep_masks.shape)} does not match patch sequence {(batch_size, num_patches)}"
         )
 
-    position_ids = torch.arange(num_patches, device=patch_embeds.device)
-    patch_embeds = patch_embeds.to(dtype=pos_dtype)
-    patch_embeds = patch_embeds + position_embedding(position_ids).unsqueeze(0).to(dtype=pos_dtype)
+    with profile_range("policy.token_selection.pruned_vision_model.add_pos_embedding"):
+        position_ids = torch.arange(num_patches, device=patch_embeds.device)
+        patch_embeds = patch_embeds.to(dtype=pos_dtype)
+        patch_embeds = patch_embeds + position_embedding(position_ids).unsqueeze(0).to(dtype=pos_dtype)
 
     encoder_dtype = None
     encoder_layers = getattr(encoder, "layers", None)
@@ -475,45 +619,66 @@ def embed_pruned_vision_tokens(
     post_layernorm_dtype = getattr(post_layernorm, "weight", None)
     if post_layernorm_dtype is not None:
         post_layernorm_dtype = post_layernorm_dtype.dtype
-    projected_samples: list[Tensor] = []
-    lengths: list[int] = []
+    projected_samples: list[Tensor | None] = [None] * batch_size
+    lengths: list[int] = [0] * batch_size
+    grouped_keep_indices: dict[int, list[tuple[int, Tensor]]] = {}
 
     for batch_idx in range(batch_size):
-        if not bool(img_masks[batch_idx].item()):
-            projected_samples.append(patch_embeds.new_zeros((0, projected_dim)))
-            lengths.append(0)
+        sample_keep_mask = keep_masks[batch_idx] & img_masks[batch_idx]
+        keep_idx = torch.nonzero(sample_keep_mask, as_tuple=False).squeeze(-1)
+        length = int(keep_idx.shape[0])
+        lengths[batch_idx] = length
+        if length == 0:
+            projected_samples[batch_idx] = patch_embeds.new_zeros((0, projected_dim))
             continue
+        grouped_keep_indices.setdefault(length, []).append((batch_idx, keep_idx))
 
-        keep_idx = torch.nonzero(keep_masks[batch_idx], as_tuple=False).squeeze(-1)
-        if keep_idx.numel() == 0:
-            projected_samples.append(patch_embeds.new_zeros((0, projected_dim)))
-            lengths.append(0)
-            continue
-
-        hidden_states = patch_embeds[batch_idx : batch_idx + 1].index_select(1, keep_idx)
+    for length, group in grouped_keep_indices.items():
+        with profile_range("policy.token_selection.pruned_vision_model.noncontig_gather"):
+            batch_indices = torch.tensor(
+                [batch_idx for batch_idx, _ in group],
+                dtype=torch.long,
+                device=patch_embeds.device,
+            )
+            keep_indices = torch.stack([keep_idx for _, keep_idx in group], dim=0)
+            hidden_states = patch_embeds[batch_indices[:, None], keep_indices]
         if encoder_dtype is not None:
             hidden_states = hidden_states.to(dtype=encoder_dtype)
-        encoder_outputs = encoder(inputs_embeds=hidden_states)
+        with profile_range("policy.token_selection.pruned_vision_model.pruned_vit_forward"):
+            encoder_outputs = encoder(inputs_embeds=hidden_states)
         if isinstance(encoder_outputs, tuple):
             hidden_states = encoder_outputs[0]
         else:
             hidden_states = encoder_outputs.last_hidden_state
         if post_layernorm_dtype is not None:
             hidden_states = hidden_states.to(dtype=post_layernorm_dtype)
-        hidden_states = post_layernorm(hidden_states)
+        with profile_range("policy.token_selection.pruned_vision_model.post_layernorm"):
+            hidden_states = post_layernorm(hidden_states)
         if projector_dtype is not None:
             hidden_states = hidden_states.to(dtype=projector_dtype)
-        hidden_states = projector(hidden_states).squeeze(0)
-        projected_samples.append(hidden_states)
-        lengths.append(hidden_states.shape[0])
+        with profile_range("policy.token_selection.pruned_vision_model.projector"):
+            hidden_states = projector(hidden_states)
+        for group_idx, (batch_idx, _) in enumerate(group):
+            projected_samples[batch_idx] = hidden_states[group_idx]
 
     max_len = max(lengths) if lengths else 0
-    out_dtype = next((sample.dtype for sample in projected_samples if sample.numel() > 0), patch_embeds.dtype)
-    padded = torch.zeros((batch_size, max_len, projected_dim), dtype=out_dtype, device=patch_embeds.device)
-    pad_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=patch_embeds.device)
-    for batch_idx, length in enumerate(lengths):
-        if length > 0:
-            padded[batch_idx, :length] = projected_samples[batch_idx]
-            pad_mask[batch_idx, :length] = True
+    out_dtype = next(
+        (
+            sample.dtype
+            for sample in projected_samples
+            if sample is not None and sample.numel() > 0
+        ),
+        patch_embeds.dtype,
+    )
+    with profile_range("policy.token_selection.pruned_vision_model.pad_output"):
+        padded = torch.zeros((batch_size, max_len, projected_dim), dtype=out_dtype, device=patch_embeds.device)
+        pad_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=patch_embeds.device)
+        for batch_idx, length in enumerate(lengths):
+            if length > 0:
+                projected_sample = projected_samples[batch_idx]
+                if projected_sample is None:
+                    raise RuntimeError("Missing pruned vision output for non-empty token selection.")
+                padded[batch_idx, :length] = projected_sample
+                pad_mask[batch_idx, :length] = True
 
     return padded, pad_mask

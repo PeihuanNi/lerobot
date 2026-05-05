@@ -692,7 +692,7 @@ def eval_policy(
         policy.reset_cuda_latency_stats()
 
     overlay_mode = getattr(getattr(policy, "config", None), "overlay_mode", "label")
-    overlay_enabled = bool(getattr(getattr(policy, "config", None), "token_selection_enabled", False))
+    overlay_enabled = bool(getattr(getattr(policy, "config", None), "overlay_enabled", True))
     heatmap_debug = bool(getattr(getattr(policy, "config", None), "score_debug_heatmap", False))
     overlay_heatmap = overlay_mode in {"heatmap", "heatmap_topk"}
     sparse_heatmap = overlay_mode == "heatmap_topk"
@@ -1085,6 +1085,8 @@ def eval_main(cfg: EvalPipelineConfig):
     def _emit_startup_smoke(tag: str) -> None:
         # A tiny unconditional CUDA op inside an NVTX range helps distinguish
         # "markers were never emitted" from "nsys attached but later lost the trace".
+        if os.environ.get("LEROBOT_NSYS_DISABLE_SYNC", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return
         if not cfg.eval.profile_emit_nvtx or device.type != "cuda":
             return
         with profile_range(tag):
@@ -1162,7 +1164,7 @@ def eval_main(cfg: EvalPipelineConfig):
         logging.warning("Stopped eval early for nsys debug at phase=%s", debug_stop_phase)
     finally:
         # Make sure the last GPU work is visible to external profilers before process teardown.
-        if device.type == "cuda":
+        if device.type == "cuda" and os.environ.get("LEROBOT_NSYS_DISABLE_SYNC", "").strip().lower() not in {"1", "true", "yes", "on"}:
             torch.cuda.synchronize(device)
         if envs is not None:
             close_envs(envs)

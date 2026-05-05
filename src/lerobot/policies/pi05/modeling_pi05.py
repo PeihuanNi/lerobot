@@ -17,7 +17,6 @@
 import builtins
 import logging
 import math
-import time
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
@@ -51,9 +50,12 @@ from lerobot.policies.token_selection_utils import (
     apply_min_max_constraints,
     build_overlay,
     build_overlay_labels,
+    compact_prefix_inputs,
     compute_relative_deviation,
     compute_region_scores,
     discard_top_scoring_regions,
+    embed_images_for_token_selection,
+    embed_pruned_images_for_token_selection,
     embed_pruned_vision_tokens,
     expand_region_mask,
     infer_patch_grid,
@@ -355,6 +357,7 @@ class PaliGemmaWithExpertModel(
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
         image_size: int = DEFAULT_IMAGE_SIZE,
+        attn_implementation: str = "eager",
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -372,6 +375,8 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
         vlm_config_hf.text_config.torch_dtype = "float32"
         vlm_config_hf.text_config.vocab_size = 257152
+        vlm_config_hf._attn_implementation = attn_implementation  # noqa: SLF001
+        vlm_config_hf.text_config._attn_implementation = attn_implementation  # noqa: SLF001
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
         vlm_config_hf.vision_config.image_size = image_size
@@ -393,12 +398,17 @@ class PaliGemmaWithExpertModel(
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
+        action_expert_config_hf._attn_implementation = attn_implementation  # noqa: SLF001
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
+
+    def set_attention_implementation(self, attn_implementation: str) -> None:
+        self.paligemma.language_model.config._attn_implementation = attn_implementation  # noqa: SLF001
+        self.gemma_expert.model.config._attn_implementation = attn_implementation  # noqa: SLF001
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
@@ -576,7 +586,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_adarms=[False, True],
             precision=config.dtype,
             image_size=config.image_resolution[0],
+            attn_implementation=config.attn_implementation,
         )
+        self.paligemma_with_expert.set_attention_implementation(config.attn_implementation)
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -633,108 +645,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self._token_selection_state.reset()
 
     def reset_cuda_latency_stats(self):
-        self._cuda_latency_ms = {
-            "overall": [],
-            "baseline": [],
-            "scoring_frame": [],
-            "pruned_frame": [],
-            "token_selection_unpruned": [],
-            "vision_model": [],
-            "language_model": [],
-            "vlm_prefix_cache": [],
-            "action_expert_denoise": [],
-            "action_expert_run_diffusion": [],
-            "ace_total": [],
-            "ace_vision_model": [],
-            "ace_language_model": [],
-            "ace_action_expert_denoise": [],
-            "ace_backward": [],
-        }
-        self._cuda_memory_mb = {
-            "ace_backward_peak_allocated": [],
-            "ace_backward_peak_reserved": [],
-        }
+        self._cuda_latency_ms = {}
+        self._cuda_memory_mb = {}
 
     def get_cuda_latency_samples(self) -> dict[str, list[float]]:
-        return {
-            bucket: list(samples)
-            for bucket, samples in self._cuda_latency_ms.items()
-            if samples
-        }
+        return {}
 
     def get_cuda_memory_samples(self) -> dict[str, list[float]]:
-        return {
-            bucket: list(samples)
-            for bucket, samples in self._cuda_memory_mb.items()
-            if samples
-        }
-
-    def _start_cuda_latency_timer(self):
-        device = next(self.parameters()).device
-        if device.type != "cuda":
-            return None
-        torch.cuda.synchronize(device)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        return device, start, end
-
-    def _finish_cuda_latency_timer(self, timer):
-        if timer is None:
-            return None
-        device, start, end = timer
-        end.record()
-        torch.cuda.synchronize(device)
-        return float(start.elapsed_time(end))
-
-    def _record_cuda_latency(self, timer, *buckets: str):
-        elapsed_ms = self._finish_cuda_latency_timer(timer)
-        if elapsed_ms is None:
-            return
-        self._cuda_latency_ms["overall"].append(elapsed_ms)
-        for bucket in buckets:
-            if bucket and bucket in self._cuda_latency_ms:
-                self._cuda_latency_ms[bucket].append(elapsed_ms)
+        return {}
 
     def _measure_cuda_section(self, fn, *, track_memory: bool = False):
-        device = next(self.parameters()).device
-        if device.type != "cuda":
-            start_time = time.perf_counter()
-            result = fn()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            return result, elapsed_ms, {
-                "peak_allocated_mb": 0.0,
-                "peak_reserved_mb": 0.0,
-            }
-
-        torch.cuda.synchronize(device)
-        baseline_allocated = baseline_reserved = 0
-        if track_memory:
-            baseline_allocated = int(torch.cuda.memory_allocated(device))
-            baseline_reserved = int(torch.cuda.memory_reserved(device))
-            torch.cuda.reset_peak_memory_stats(device)
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
         result = fn()
-        end_event.record()
-        torch.cuda.synchronize(device)
-
-        peak_allocated_mb = peak_reserved_mb = 0.0
-        if track_memory:
-            peak_allocated_mb = max(
-                0.0,
-                (float(torch.cuda.max_memory_allocated(device)) - float(baseline_allocated)) / (1024.0 * 1024.0),
-            )
-            peak_reserved_mb = max(
-                0.0,
-                (float(torch.cuda.max_memory_reserved(device)) - float(baseline_reserved)) / (1024.0 * 1024.0),
-            )
-
-        return result, float(start_event.elapsed_time(end_event)), {
-            "peak_allocated_mb": peak_allocated_mb,
-            "peak_reserved_mb": peak_reserved_mb,
+        return result, 0.0, {
+            "peak_allocated_mb": 0.0,
+            "peak_reserved_mb": 0.0,
         }
 
     def _save_actions_l1_plot(self, state, episode_idx):
@@ -779,10 +703,105 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
         return func(*args, **kwargs)
 
-    def _prepare_attention_masks_4d(self, att_2d_masks):
+    def _prepare_attention_masks_4d(self, att_2d_masks, dtype: torch.dtype | None = None):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        if dtype is None:
+            dtype = torch.float32
+        zero = torch.zeros((), dtype=dtype, device=att_2d_masks.device)
+        mask_value = torch.tensor(OPENPI_ATTENTION_MASK_VALUE, dtype=dtype, device=att_2d_masks.device)
+        return torch.where(att_2d_masks_4d, zero, mask_value)
+
+    def _language_attention_dtype(self) -> torch.dtype:
+        language_model = self.paligemma_with_expert.paligemma.language_model
+        if len(language_model.layers) == 0:
+            return torch.float32
+        return language_model.layers[0].self_attn.q_proj.weight.dtype
+
+    def _expert_attention_dtype(self) -> torch.dtype:
+        expert_model = self.paligemma_with_expert.gemma_expert.model
+        if len(expert_model.layers) == 0:
+            return torch.float32
+        return expert_model.layers[0].self_attn.q_proj.weight.dtype
+
+    def _prepare_denoise_static_inputs(self, prefix_pad_masks: Tensor) -> tuple[Tensor, Tensor]:
+        batch_size, prefix_len = prefix_pad_masks.shape
+        suffix_len = self.config.chunk_size
+        device = prefix_pad_masks.device
+        suffix_pad_masks = torch.ones(batch_size, suffix_len, dtype=torch.bool, device=device)
+        suffix_att_masks = torch.zeros(batch_size, suffix_len, dtype=torch.bool, device=device)
+        suffix_att_masks[:, 0] = True
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(
+            full_att_2d_masks,
+            dtype=self._expert_attention_dtype(),
+        )
+        return full_att_2d_masks_4d, position_ids
+
+    def _forward_action_expert_last_layer_for_ace(
+        self,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ):
+        """Run only the final expert layer with autograd for last-layer ACE scoring."""
+        with torch.no_grad():
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+
+            suffix_len = suffix_pad_masks.shape[1]
+            batch_size = prefix_pad_masks.shape[0]
+            prefix_len = prefix_pad_masks.shape[1]
+
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            model = self.paligemma_with_expert.gemma_expert.model
+            if len(model.layers) > 0 and model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+                suffix_embs = suffix_embs.to(torch.bfloat16)
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks, dtype=suffix_embs.dtype)
+            position_embeddings = model.rotary_emb(suffix_embs, position_ids)
+            hidden_states = suffix_embs
+            for layer in model.layers[:-1]:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=full_att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=False,
+                    use_cache=False,
+                    position_embeddings=position_embeddings,
+                    adarms_cond=adarms_cond,
+                )[0]
+            hidden_states = hidden_states.detach()
+            position_embeddings = tuple(emb.detach() for emb in position_embeddings)
+
+        prev_attn_impl = model.config._attn_implementation  # noqa: SLF001
+        model.config._attn_implementation = "eager"  # noqa: SLF001
+        try:
+            hidden_states, last_attn = model.layers[-1](
+                hidden_states,
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=True,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+                adarms_cond=adarms_cond,
+            )
+        finally:
+            model.config._attn_implementation = prev_attn_impl  # noqa: SLF001
+        suffix_out, _ = model.norm(hidden_states, adarms_cond)
+        suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t, suffix_out, (last_attn,)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -930,7 +949,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks, dtype=self._language_attention_dtype())
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -994,14 +1013,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )  # Use config max_action_dim for internal processing
                 noise = self.sample_noise(actions_shape, device)
 
-            latency_timer = self._start_cuda_latency_timer()
             with profile_range("policy.sample_actions.embed_prefix"):
                 prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
+                prefix_att_2d_masks,
+                dtype=self._language_attention_dtype(),
+            )
 
             with profile_range("policy.sample_actions.prefix_cache"):
                 _, past_key_values = self.paligemma_with_expert.forward(
@@ -1049,7 +1069,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                         self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
-            self._record_cuda_latency(latency_timer, "baseline")
             return x_t
 
     def _sample_actions_with_token_selection(
@@ -1087,7 +1106,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             eval_frame = token_state.frame_idx % eval_interval == 0
 
-        latency_timer = self._start_cuda_latency_timer()
         breakdown_cuda_ms: dict[str, float] = {}
         breakdown_memory_mb: dict[str, float] = {}
         track_ace_breakdown = eval_frame and cfg.grad_score_method == "ace"
@@ -1104,7 +1122,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         _trace(
             "[token_trace] lm_paths: "
-            "prefix_cache=vlm_paligemma.language_model, "
+            "prefix_cache=embed_prefix+vlm_paligemma.language_model, "
             "denoise=action_expert.gemma_expert"
         )
 
@@ -1129,37 +1147,44 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prune_debug_rows: list[dict[str, object]] = []
         need_full_image_embs = eval_frame or not cfg.token_prune_enabled or token_state.last_score_token is None
         if need_full_image_embs:
-            def _embed_images():
-                with torch.no_grad():
-                    return [self.paligemma_with_expert.embed_image(img) for img in images]
+            with profile_range("policy.token_selection.vision_model"):
+                def _embed_images():
+                    with torch.no_grad():
+                        if cfg.grad_score_method == "ace" and cfg.ace_parallel_vit_streams:
+                            return embed_images_for_token_selection(
+                                self.paligemma_with_expert.embed_image,
+                                images,
+                                parallel_streams=True,
+                            )
+                        return [self.paligemma_with_expert.embed_image(img) for img in images]
 
-            image_embs, image_embed_ms, _ = _measure_profiled_cuda_section(
-                "policy.token_selection.vision_model.embed_image",
-                _embed_images,
-            )
-            _accum_cuda_breakdown("vision_model", image_embed_ms)
-            if track_ace_breakdown:
-                _accum_cuda_breakdown("ace_vision_model", image_embed_ms)
+                image_embs, image_embed_ms, _ = _measure_profiled_cuda_section(
+                    "policy.token_selection.vision_model.vit_forward",
+                    _embed_images,
+                )
+                _accum_cuda_breakdown("vision_model", image_embed_ms)
+                if track_ace_breakdown:
+                    _accum_cuda_breakdown("ace_vision_model", image_embed_ms)
 
-            patch_embs = []
-            metas = []
-            with profile_range("policy.token_selection.vision_model.split_patch_tokens"):
-                for emb in image_embs:
-                    patch_emb, meta = split_patch_tokens(emb)
-                    patch_embs.append(patch_emb)
-                    metas.append(meta)
+                patch_embs = []
+                metas = []
+                with profile_range("policy.token_selection.vision_preprocess.split_patch_tokens"):
+                    for emb in image_embs:
+                        patch_emb, meta = split_patch_tokens(emb)
+                        patch_embs.append(patch_emb)
+                        metas.append(meta)
 
-            if token_state.last_score_token is not None:
-                if len(token_state.last_score_token) != len(patch_embs):
-                    token_state.reset()
-                else:
-                    for idx, score in enumerate(token_state.last_score_token):
-                        if score.shape[0] != bsize or score.shape[1] != patch_embs[idx].shape[1]:
-                            token_state.reset()
-                            break
+                if token_state.last_score_token is not None:
+                    if len(token_state.last_score_token) != len(patch_embs):
+                        token_state.reset()
+                    else:
+                        for idx, score in enumerate(token_state.last_score_token):
+                            if score.shape[0] != bsize or score.shape[1] != patch_embs[idx].shape[1]:
+                                token_state.reset()
+                                break
 
-            if not eval_frame and token_state.last_score_token is None:
-                eval_frame = True
+                if not eval_frame and token_state.last_score_token is None:
+                    eval_frame = True
         else:
             metas = [infer_patch_grid(score.shape[1]) for score in token_state.last_score_token]
 
@@ -1175,7 +1200,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         def build_prefix(image_embs, image_pad_masks=None):
-            return self.embed_prefix(
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 images,
                 img_masks,
                 tokens,
@@ -1183,39 +1208,70 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 image_embs=image_embs,
                 image_pad_masks=image_pad_masks,
             )
+            return compact_prefix_inputs(prefix_embs, prefix_pad_masks, prefix_att_masks)
 
         def _trace_prefix_tokens(prefix_pad_masks: Tensor, image_pad_masks: list[Tensor] | None):
             if not trace_enabled:
                 return
-            total_prefix = prefix_pad_masks.sum(dim=1).tolist()
+            # Keep tensors on device and only convert to CPU lists when actually tracing/logging
+            total_prefix_tensor = prefix_pad_masks.sum(dim=1)
+            prefix_seq_len = prefix_pad_masks.shape[1]
             if image_pad_masks is None:
-                vision_tokens = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
+                vision_tokens_tensor = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
                 for img_idx, meta in enumerate(metas):
                     tokens_per_valid = meta.num_extra_tokens + meta.num_patches
-                    vision_tokens = vision_tokens + img_masks[img_idx].to(dtype=torch.long) * tokens_per_valid
+                    vision_tokens_tensor = vision_tokens_tensor + img_masks[img_idx].to(dtype=torch.long) * tokens_per_valid
             else:
-                vision_tokens = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
+                vision_tokens_tensor = torch.zeros_like(prefix_pad_masks[:, 0], dtype=torch.long)
                 for pad_mask in image_pad_masks:
-                    vision_tokens = vision_tokens + pad_mask.sum(dim=1).to(dtype=torch.long)
-            language_tokens = masks.sum(dim=1).to(dtype=torch.long)
-            _trace(
-                "[token_trace] prefix_tokens "
-                f"total={total_prefix} vision={vision_tokens.tolist()} language={language_tokens.tolist()}"
-            )
+                    vision_tokens_tensor = vision_tokens_tensor + pad_mask.sum(dim=1).to(dtype=torch.long)
+            language_tokens_tensor = masks.sum(dim=1).to(dtype=torch.long)
+            try:
+                _trace(
+                    "[token_trace] prefix_tokens "
+                    f"seq_len={prefix_seq_len} total={total_prefix_tensor.cpu().tolist()} "
+                    f"vision={vision_tokens_tensor.cpu().tolist()} language={language_tokens_tensor.cpu().tolist()}"
+                )
+            except Exception:
+                _trace(f"[token_trace] prefix_tokens frame={token_state.frame_idx}")
 
         def compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks, capture_attn: bool = False):
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-            output = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
-                output_attentions=capture_attn,
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
+                prefix_att_2d_masks,
+                dtype=self._language_attention_dtype(),
             )
+            language_model = self.paligemma_with_expert.paligemma.language_model
+            prev_attn_impl = language_model.config._attn_implementation  # noqa: SLF001
+            prev_is_causal = None
+            attention_mask = prefix_att_2d_masks_4d
+            if (
+                not capture_attn
+                and prev_attn_impl == "sdpa"
+                and prefix_pad_masks.shape[0] == 1
+            ):
+                attention_mask = None
+                prev_is_causal = [layer.self_attn.is_causal for layer in language_model.layers]
+                for layer in language_model.layers:
+                    layer.self_attn.is_causal = False
+            if capture_attn:
+                language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            try:
+                output = self.paligemma_with_expert.forward(
+                    attention_mask=attention_mask,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None],
+                    use_cache=True,
+                    output_attentions=capture_attn,
+                )
+            finally:
+                if capture_attn:
+                    language_model.config._attn_implementation = prev_attn_impl  # noqa: SLF001
+                if prev_is_causal is not None:
+                    for layer, is_causal in zip(language_model.layers, prev_is_causal, strict=True):
+                        layer.self_attn.is_causal = is_causal
             if capture_attn:
                 _, past_key_values, prefix_attns = output
                 return past_key_values, prefix_attns
@@ -1227,14 +1283,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             past_key_values,
             capture_attn: bool = False,
         ):
+            # print(f"Running diffusion with Past key values shape: {past_key_values[0][0].shape}")
             dt = -1.0 / num_steps
             x_t = noise
             last_attn = None
             last_v_t = None
+            denoise_static_inputs = self._prepare_denoise_static_inputs(prefix_pad_masks)
+            time_grid = torch.linspace(
+                1.0,
+                1.0 + (num_steps - 1) * dt,
+                steps=num_steps,
+                device=device,
+                dtype=torch.float32,
+            )[:, None].expand(num_steps, bsize)
+            _attn_start = num_steps - max(1, min(cfg.attn_num_denoise_steps, num_steps))
             for step in range(num_steps):
                 time = 1.0 + step * dt
-                time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-                _attn_start = num_steps - max(1, min(cfg.attn_num_denoise_steps, num_steps))
+                time_tensor = time_grid[step]
                 want_attn = capture_attn and step >= _attn_start
 
                 def denoise_step_call(input_x_t, current_timestep=time_tensor):
@@ -1244,6 +1309,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         x_t=input_x_t,
                         timestep=current_timestep,
                         output_attentions=want_attn,
+                        denoise_static_inputs=denoise_static_inputs,
                     )
 
                 if want_attn:
@@ -1266,13 +1332,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                             past_key_values=past_key_values,
                             x_t=x,
                             timestep=time_tensor,
+                            denoise_static_inputs=denoise_static_inputs,
                         ),
                         execution_horizon=execution_horizon,
                     )
                 else:
                     v_t = v_t_raw
 
-                x_t = x_t + dt * v_t
+                x_t = x_t.detach()
+                x_t.add_(v_t.detach(), alpha=dt)
 
                 if want_attn:
                     if last_attn is None:
@@ -1345,10 +1413,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         def _build_text_query_selection(query_len: int) -> tuple[Tensor, Tensor]:
             text_start = sum(meta.num_extra_tokens + meta.num_patches for meta in metas)
-            text_idx = torch.arange(text_start, text_start + masks.shape[1], device=device)
-            if text_idx.numel() > 0 and query_len > 0:
-                text_idx = text_idx[text_idx < query_len]
-            text_query_mask = masks[:, : text_idx.numel()].to(device=device, dtype=torch.bool)
+            text_end = min(query_len, prefix_pad_masks.shape[1])
+            text_idx = torch.arange(text_start, text_end, device=device)
+            text_query_mask = prefix_pad_masks[:, text_idx].to(device=device, dtype=torch.bool)
             return text_idx, text_query_mask
 
         def _masked_query_mean(value: Tensor, query_mask: Tensor | None = None) -> Tensor:
@@ -1392,35 +1459,32 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 #   4. Combine gradients with attention (GradxAttn) or use grads directly.
                 #   5. Aggregate action->vision relevance into per-token scores.
                 #   6. Accumulate across scored denoise steps, then average.
-                ace_total_timer = self._start_cuda_latency_timer() if track_ace_breakdown else None
-                with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
-                    prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
-                _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
-                _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
-                def _compute_prefix_cache():
-                    if _use_prefix_score_attn:
-                        with torch.enable_grad():
-                            return compute_prefix_cache(
-                                prefix_embs,
-                                prefix_pad_masks,
-                                prefix_att_masks,
-                                capture_attn=True,
-                            )
-                    return compute_prefix_cache(
-                        prefix_embs,
-                        prefix_pad_masks,
-                        prefix_att_masks,
-                        capture_attn=False,
-                    )
+                with profile_range("policy.token_selection.prefix_cache"):
+                    with profile_range("policy.token_selection.prefix_cache.embed_prefix"):
+                        prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                    _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
+                    _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
 
-                (past_key_values, prefix_score_attns), prefix_cache_ms, _ = _measure_profiled_cuda_section(
-                    "policy.token_selection.vlm_paligemma.prefix_cache",
-                    _compute_prefix_cache,
-                )
-                _accum_cuda_breakdown("language_model", prefix_cache_ms)
-                _accum_cuda_breakdown("vlm_prefix_cache", prefix_cache_ms)
-                if track_ace_breakdown:
-                    _accum_cuda_breakdown("ace_language_model", prefix_cache_ms)
+                    def _compute_prefix_cache():
+                        if _use_prefix_score_attn:
+                            with torch.enable_grad():
+                                return compute_prefix_cache(
+                                    prefix_embs,
+                                    prefix_pad_masks,
+                                    prefix_att_masks,
+                                    capture_attn=True,
+                                )
+                        return compute_prefix_cache(
+                            prefix_embs,
+                            prefix_pad_masks,
+                            prefix_att_masks,
+                            capture_attn=False,
+                        )
+
+                    (past_key_values, prefix_score_attns), prefix_cache_ms, _ = _measure_profiled_cuda_section(
+                        "policy.token_selection.prefix_cache.language_model.full_eval",
+                        _compute_prefix_cache,
+                    )
                 if _use_prefix_score_attn and prefix_score_attns is None:
                     raise ValueError("Missing prefix attentions for vision_text scoring.")
                 if _use_prefix_score_attn and not any(attn.requires_grad for attn in prefix_score_attns):
@@ -1428,30 +1492,54 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
                 _interp_step = cfg.ace_denoise_step  # -1 = avg all steps, >=0 = specific
                 _dt = -1.0 / num_steps
+                _time_grid = torch.linspace(
+                    1.0,
+                    1.0 + (num_steps - 1) * _dt,
+                    steps=num_steps,
+                    device=device,
+                    dtype=torch.float32,
+                )[:, None].expand(num_steps, bsize)
+                _denoise_static_inputs = self._prepare_denoise_static_inputs(prefix_pad_masks)
                 x_t = noise.clone()
                 _score_accum = None  # [B, total_vis_tokens]
                 _score_count = 0
+                _a_lo = max(0, cfg.ace_action_start)
+                _a_hi = cfg.chunk_size if cfg.ace_action_end < 0 else min(cfg.ace_action_end, cfg.chunk_size)
                 _n_layers = max(1, min(
                     cfg.attn_num_layers,
                     len(self.paligemma_with_expert.gemma_expert.model.layers),
                 ))
                 _scored_steps = [s for s in range(num_steps) if _interp_step < 0 or _interp_step == s]
                 _last_scored_step = _scored_steps[-1] if _scored_steps else None
+                _is_prefix_score_attn = _use_prefix_score_attn
+                _score_layout_ready = False
+                _query_key_offset = 0
+                _vis_idx_t = None
+                _text_idx_t = None
+                _text_query_mask = None
+                _q_a_start = None
+                _q_a_end = None
+                _sel_alen = None
+                _has_vis = False
+                _has_text = False
+                _has_action_sel = False
 
                 with profile_range("policy.token_selection.action_expert.run_diffusion"):
                     for _step in range(num_steps):
                         _time = 1.0 + _step * _dt
-                        _time_t = torch.tensor(_time, dtype=torch.float32, device=device).expand(bsize)
+                        _time_t = _time_grid[_step]
                         _need_score = (_interp_step < 0 or _interp_step == _step)
 
                         if not _need_score:
                             def _unscored_denoise_step():
+                                # print(f"Unscored denoise step with past key values: {past_key_values[0][0].shape}")
                                 with torch.no_grad():
                                     return self.denoise_step(
                                         prefix_pad_masks=prefix_pad_masks,
                                         past_key_values=past_key_values,
                                         x_t=x_t,
                                         timestep=_time_t,
+                                        denoise_static_inputs=_denoise_static_inputs,
                                     )
 
                             _v_t, unscored_denoise_ms, _ = _measure_profiled_cuda_section(
@@ -1464,13 +1552,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                     "ace_action_expert_denoise",
                                     unscored_denoise_ms,
                                 )
-                            x_t = x_t.detach() + _dt * _v_t.detach()
+                            x_t = x_t.detach()
+                            x_t.add_(_v_t.detach(), alpha=_dt)
                             continue
 
                         if _need_score:
-                            _x_in = x_t.detach().requires_grad_(True)
+                            # print(f"Scored denoise step with past key values: {past_key_values[0][0].shape}")
+                            _fast_last_layer_ace = (
+                                not cfg.ace_use_residual
+                                and cfg.score_attn_source == "action_vision"
+                                and cfg.ace_variant != "dimension_independent"
+                            )
+                            _x_in = (
+                                x_t.detach()
+                                if _fast_last_layer_ace
+                                else x_t.detach().requires_grad_(True)
+                            )
                             def _scored_denoise_step():
                                 with torch.enable_grad():
+                                    if _fast_last_layer_ace:
+                                        return self._forward_action_expert_last_layer_for_ace(
+                                            prefix_pad_masks=prefix_pad_masks,
+                                            past_key_values=past_key_values,
+                                            x_t=_x_in,
+                                            timestep=_time_t,
+                                        )
                                     return self.denoise_step(
                                         prefix_pad_masks=prefix_pad_masks,
                                         past_key_values=past_key_values,
@@ -1478,6 +1584,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                         timestep=_time_t,
                                         output_attentions=True,
                                         return_suffix_out=True,
+                                        denoise_static_inputs=_denoise_static_inputs,
                                     )
 
                             (_v_raw, _, _step_attns), scored_denoise_ms, _ = _measure_profiled_cuda_section(
@@ -1492,10 +1599,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                 )
                             with torch.enable_grad():
                                 # ── Action-step subset for objective ──
-                                _a_lo = max(0, cfg.ace_action_start)
-                                _a_hi = cfg.chunk_size if cfg.ace_action_end < 0 else min(cfg.ace_action_end, cfg.chunk_size)
-                                _suffix_attn_list = list(_step_attns)
-                                _score_attn_list = list(prefix_score_attns) if _use_prefix_score_attn else _suffix_attn_list
+                                _suffix_attn_list = _step_attns
+                                _score_attn_list = prefix_score_attns if _use_prefix_score_attn else _suffix_attn_list
                                 _retain_score_graph = _use_prefix_score_attn and _step != _last_scored_step
 
                             with torch.enable_grad():
@@ -1512,53 +1617,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                     )
 
                                 def _run_interp_backward():
-                                    if cfg.ace_variant == "dimension_independent":
-                                        # Per-dimension backprop: A_bar = (1/D) sum_d mean_h(A * |dv_d/dA|)
-                                        _v_sel = _obj_target[:, :, :7]
-                                        _action_dim = _v_sel.shape[-1]
-                                        if cfg.ace_use_residual:
-                                            _dim_A_bars_local = None
-                                            for _d in range(_action_dim):
-                                                _obj_d = _v_sel[:, :, _d].sum()
-                                                _gs_local = _grad_with_zero_for_unused(
-                                                    _obj_d,
-                                                    _score_attn_list,
-                                                    retain_graph=_retain_score_graph or (_d < _action_dim - 1),
-                                                    allow_unused_zero=_use_prefix_score_attn,
-                                                )
-                                                if _dim_A_bars_local is None:
-                                                    _dim_A_bars_local = [
-                                                        _combine_dim_independent(_score_attn_list[l], _gs_local[l])
-                                                        for l in range(len(_score_attn_list))
-                                                    ]
-                                                else:
-                                                    for l in range(len(_score_attn_list)):
-                                                        _dim_A_bars_local[l] = _dim_A_bars_local[l] + _combine_dim_independent(
-                                                            _score_attn_list[l], _gs_local[l]
-                                                        )
-                                            for l in range(len(_score_attn_list)):
-                                                _dim_A_bars_local[l] = _dim_A_bars_local[l] / _action_dim
-                                            return _dim_A_bars_local, None, None, None, None
-
-                                        _last_attn_local = _score_attn_list[-1]
-                                        _dim_A_bar_local = None
-                                        for _d in range(_action_dim):
-                                            _obj_d = _v_sel[:, :, _d].sum()
-                                            _gd_local = _grad_with_zero_for_unused(
-                                                _obj_d,
-                                                _last_attn_local,
-                                                retain_graph=_retain_score_graph or (_d < _action_dim - 1),
-                                                allow_unused_zero=_use_prefix_score_attn,
-                                            )
-                                            _c = _combine_dim_independent(_last_attn_local, _gd_local)
-                                            _dim_A_bar_local = _c if _dim_A_bar_local is None else _dim_A_bar_local + _c
-                                        _dim_A_bar_local = _dim_A_bar_local / _action_dim
-                                        return None, _dim_A_bar_local, None, None, _last_attn_local
-
+                                    # Simplified single-backward implementation:
+                                    # Use an objective norm (L1 or L2) over the selected action target
+                                    # and compute gradients in one pass to avoid multiple backward calls.
                                     if cfg.ace_objective == "action_sample_L1":
                                         _obj = _obj_target.abs().sum()
                                     else:
                                         _obj = (_obj_target ** 2).sum()
+
                                     if cfg.ace_use_residual:
                                         _grads_local = _grad_with_zero_for_unused(
                                             _obj,
@@ -1576,6 +1642,96 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                         allow_unused_zero=_use_prefix_score_attn,
                                     )
                                     return None, None, None, _grad_last_local, _last_attn_local
+
+                                def _compute_step_score_from_backward_outputs(
+                                    _dim_A_bars,
+                                    _dim_A_bar,
+                                    _grads,
+                                    _grad_last,
+                                    _last_attn,
+                                ):
+                                    if cfg.ace_use_residual:
+                                        # ── Residual propagation: R^l = R^{l-1} @ Â^l ──
+                                        _num_score_layers = len(_score_attn_list)
+                                        _diag = torch.arange(_query_len, device=device)
+                                        # R: [B, query_len, total_len] — identity init
+                                        _R = torch.zeros(bsize, _query_len, _total_len,
+                                                         device=device, dtype=torch.float32)
+                                        _R[:, _diag, _query_key_offset + _diag] = 1.0
+
+                                        for _ell in range(_num_score_layers):
+                                            if cfg.ace_variant == "dimension_independent":
+                                                _A_bar = _dim_A_bars[_ell]
+                                            else:
+                                                _A_bar = _combine_attn_and_grad(_score_attn_list[_ell], _grads[_ell])
+                                            _A_hat = _A_bar.clone()
+                                            _A_hat[:, _diag, _query_key_offset + _diag] += 1.0
+                                            _A_hat = _safe_row_normalize(_A_hat)
+                                            # R_new = R @ Â_full
+                                            _R_s = _R[:, :, _query_key_offset:]
+                                            _R_p = _R[:, :, :_query_key_offset] + torch.bmm(
+                                                _R_s, _A_hat[:, :, :_query_key_offset]
+                                            )
+                                            _R_sf = torch.bmm(_R_s, _A_hat[:, :, _query_key_offset:])
+                                            _R = torch.cat([_R_p, _R_sf], dim=-1)
+
+                                        if _is_prefix_score_attn:
+                                            if _has_vis and _has_text:
+                                                _step_score = _R[:, _text_idx_t, :][:, :, _vis_idx_t]
+                                                _step_score = _masked_query_mean(_step_score, _text_query_mask)
+                                                _step_score = _apply_ace_variant(_step_score)
+                                            else:
+                                                _step_score = None
+                                        else:
+                                            # Extract action→vision relevance (selected action subset)
+                                            if _has_vis and _has_action_sel:
+                                                _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                                _step_score = _step_score.mean(dim=1)
+                                                _step_score = _apply_ace_variant(_step_score)
+                                            else:
+                                                _step_score = None
+                                    else:
+                                        # -- Last-layer scoring --
+                                        if cfg.ace_variant == "dimension_independent":
+                                            _A_bar = _dim_A_bar
+                                        else:
+                                            _A_bar = _combine_attn_and_grad(_last_attn, _grad_last)
+
+                                        if _is_prefix_score_attn:
+                                            if _has_vis and _has_text:
+                                                _step_score = _A_bar[:, _text_idx_t, :][:, :, _vis_idx_t]
+                                                _step_score = _masked_query_mean(_step_score, _text_query_mask)
+                                                _step_score = _apply_ace_variant(_step_score)
+                                            else:
+                                                _step_score = None
+                                        else:
+                                            if _has_vis and _has_action_sel:
+                                                _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
+                                                _step_score = _step_score.mean(dim=1)
+                                                _step_score = _apply_ace_variant(_step_score)
+                                            else:
+                                                _step_score = None
+
+                                    return _step_score
+
+                                if not _score_layout_ready:
+                                    _ref_A = _score_attn_list[-1]
+                                    _query_len = _ref_A.shape[2]
+                                    _total_len = _ref_A.shape[3]
+                                    _query_key_offset = 0 if _is_prefix_score_attn else (_total_len - _query_len)
+                                    _vis_idx_t = _build_vision_indices(_total_len)
+                                    _has_vis = _vis_idx_t.numel() > 0
+                                    if _is_prefix_score_attn:
+                                        _text_idx_t, _text_query_mask = _build_text_query_selection(_query_len)
+                                        _has_text = _text_idx_t is not None and _text_idx_t.numel() > 0
+                                    else:
+                                        _action_end = _query_len
+                                        _action_start = max(0, _action_end - cfg.chunk_size)
+                                        _q_a_start = _action_start + _a_lo
+                                        _q_a_end = _action_start + _a_hi
+                                        _sel_alen = _a_hi - _a_lo
+                                        _has_action_sel = _sel_alen > 0
+                                    _score_layout_ready = True
 
                                 (
                                     _dim_A_bars,
@@ -1598,87 +1754,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                                     "ace_backward_peak_reserved",
                                     backward_memory["peak_reserved_mb"],
                                 )
-
-                        # -- build query/key selections for the chosen scoring source --
-                        _ref_A = _score_attn_list[-1]
-                        _query_len = _ref_A.shape[2]
-                        _total_len = _ref_A.shape[3]
-                        _query_key_offset = 0 if _use_prefix_score_attn else (_total_len - _query_len)
-                        _vis_idx_t = _build_vision_indices(_total_len)
-                        _text_idx_t = None
-                        _text_query_mask = None
-                        if _use_prefix_score_attn:
-                            _text_idx_t, _text_query_mask = _build_text_query_selection(_query_len)
-                        else:
-                            _action_len = cfg.chunk_size
-                            _action_end = _query_len
-                            _action_start = max(0, _action_end - _action_len)
-                            # Narrow to user-selected action-step subset
-                            _q_a_start = _action_start + _a_lo
-                            _q_a_end = _action_start + _a_hi
-                            _sel_alen = _a_hi - _a_lo
-
-                        if cfg.ace_use_residual:
-                            # ── Residual propagation: R^l = R^{l-1} @ Â^l ──
-                            _num_score_layers = len(_score_attn_list)
-                            _diag = torch.arange(_query_len, device=device)
-                            # R: [B, query_len, total_len] — identity init
-                            _R = torch.zeros(bsize, _query_len, _total_len,
-                                             device=device, dtype=torch.float32)
-                            _R[:, _diag, _query_key_offset + _diag] = 1.0
-
-                            for _ell in range(_num_score_layers):
-                                if cfg.ace_variant == "dimension_independent":
-                                    _A_bar = _dim_A_bars[_ell]
-                                else:
-                                    _A_bar = _combine_attn_and_grad(_score_attn_list[_ell], _grads[_ell])
-                                _A_hat = _A_bar.clone()
-                                _A_hat[:, _diag, _query_key_offset + _diag] += 1.0
-                                _A_hat = _safe_row_normalize(_A_hat)
-                                # R_new = R @ Â_full
-                                _R_s = _R[:, :, _query_key_offset:]
-                                _R_p = _R[:, :, :_query_key_offset] + torch.bmm(
-                                    _R_s, _A_hat[:, :, :_query_key_offset]
-                                )
-                                _R_sf = torch.bmm(_R_s, _A_hat[:, :, _query_key_offset:])
-                                _R = torch.cat([_R_p, _R_sf], dim=-1)
-
-                            if _use_prefix_score_attn:
-                                if _vis_idx_t.numel() > 0 and _text_idx_t is not None and _text_idx_t.numel() > 0:
-                                    _step_score = _R[:, _text_idx_t, :][:, :, _vis_idx_t]
-                                    _step_score = _masked_query_mean(_step_score, _text_query_mask)
-                                    _step_score = _apply_ace_variant(_step_score)
-                                else:
-                                    _step_score = None
-                            else:
-                                # Extract action→vision relevance (selected action subset)
-                                if _vis_idx_t.numel() > 0 and _sel_alen > 0:
-                                    _step_score = _R[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
-                                    _step_score = _step_score.mean(dim=1)
-                                    _step_score = _apply_ace_variant(_step_score)
-                                else:
-                                    _step_score = None
-                        else:
-                            # -- Last-layer scoring --
-                            if cfg.ace_variant == "dimension_independent":
-                                _A_bar = _dim_A_bar
-                            else:
-                                _A_bar = _combine_attn_and_grad(_last_attn, _grad_last)
-
-                            if _use_prefix_score_attn:
-                                if _vis_idx_t.numel() > 0 and _text_idx_t is not None and _text_idx_t.numel() > 0:
-                                    _step_score = _A_bar[:, _text_idx_t, :][:, :, _vis_idx_t]
-                                    _step_score = _masked_query_mean(_step_score, _text_query_mask)
-                                    _step_score = _apply_ace_variant(_step_score)
-                                else:
-                                    _step_score = None
-                            else:
-                                if _vis_idx_t.numel() > 0 and _sel_alen > 0:
-                                    _step_score = _A_bar[:, _q_a_start:_q_a_end, :][:, :, _vis_idx_t]
-                                    _step_score = _step_score.mean(dim=1)
-                                    _step_score = _apply_ace_variant(_step_score)
-                                else:
-                                    _step_score = None
+                        _step_score = _compute_step_score_from_backward_outputs(
+                            _dim_A_bars,
+                            _dim_A_bar,
+                            _grads,
+                            _grad_last,
+                            _last_attn,
+                        )
 
                         if _step_score is not None:
                             if _score_accum is None:
@@ -1689,7 +1771,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
                             _v_t = _v_raw.detach()
 
-                        x_t = x_t.detach() + _dt * _v_t.detach()
+                        x_t = x_t.detach()
+                        x_t.add_(_v_t.detach(), alpha=_dt)
 
                 # Average across scored steps
                 if _score_count > 1:
@@ -1707,23 +1790,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         score_tokens.append(_score_accum[:, _start:_end])
                         _start = _end
                 actions = x_t.detach()
-                if track_ace_breakdown:
-                    ace_total_ms = self._finish_cuda_latency_timer(ace_total_timer)
-                    if ace_total_ms is not None:
-                        breakdown_cuda_ms["ace_total"] = float(ace_total_ms)
 
 
             elif cfg.grad_score_method == "attn_only":
-                with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
-                    prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
-                _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
-                _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
-                past_key_values, prefix_score_attns = compute_prefix_cache(
-                    prefix_embs,
-                    prefix_pad_masks,
-                    prefix_att_masks,
-                    capture_attn=_use_prefix_score_attn,
-                )
+                with profile_range("policy.token_selection.prefix_cache"):
+                    with profile_range("policy.token_selection.prefix_cache.embed_prefix"):
+                        prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs)
+                    _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=None)
+                    _use_prefix_score_attn = cfg.score_attn_source == "vision_text"
+                    with profile_range("policy.token_selection.prefix_cache.language_model.full_eval"):
+                        past_key_values, prefix_score_attns = compute_prefix_cache(
+                            prefix_embs,
+                            prefix_pad_masks,
+                            prefix_att_masks,
+                            capture_attn=_use_prefix_score_attn,
+                        )
                 with profile_range("policy.token_selection.action_expert.run_diffusion"):
                     x_t, _, last_attn = run_diffusion(
                         prefix_pad_masks=prefix_pad_masks,
@@ -1811,6 +1892,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         keep_token_masks = []
         overlay_labels = []
         overlay_grids = []
+        overlay_enabled = bool(getattr(cfg, "overlay_enabled", True))
         if token_state.global_active_region_masks is None:
             token_state.global_active_region_masks = [torch.ones_like(vm) for vm in valid_masks]
         _restore_global_pool_now = (
@@ -2004,9 +2086,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             keep_token = expand_region_mask(keep_region, meta.patches_per_side, cfg.region_patch_size)
             important_token = expand_region_mask(important_region, meta.patches_per_side, cfg.region_patch_size)
             clipped_token = expand_region_mask(clipped_region, meta.patches_per_side, cfg.region_patch_size)
-            overlay_label = build_overlay_labels(keep_token, important_token, clipped_token)
-            overlay_labels.append(overlay_label)
-            overlay_grids.append(overlay_label.view(bsize, meta.patches_per_side, meta.patches_per_side))
+            if overlay_enabled:
+                overlay_label = build_overlay_labels(keep_token, important_token, clipped_token)
+                overlay_labels.append(overlay_label)
+                overlay_grids.append(overlay_label.view(bsize, meta.patches_per_side, meta.patches_per_side))
             score_regions.append(score_region)
             important_regions.append(important_region)
             keep_regions.append(keep_region)
@@ -2023,9 +2106,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     "image_idx": idx,
                     "patch_tokens": int(meta.num_patches),
                     "extra_tokens": int(meta.num_extra_tokens),
-                    "valid_regions": valid_masks[idx].sum(dim=1).tolist(),
-                    "kept_regions": keep_region.sum(dim=1).tolist(),
-                    "kept_patch_tokens": keep_token.sum(dim=1).tolist(),
+                    # Keep as tensors to avoid GPU->CPU sync in hot path; convert when tracing
+                    "valid_regions": valid_masks[idx].sum(dim=1),
+                    "kept_regions": keep_region.sum(dim=1),
+                    "kept_patch_tokens": keep_token.sum(dim=1),
                     "total_patch_tokens": int(keep_token.shape[1]),
                     "score_source": _score_source,
                     "dynamic_mode": cfg.dynamic_prune_mode,
@@ -2038,7 +2122,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # ── Build normalised heatmap grids for debug visualisation ──────────
         heatmap_grids = []
-        if cfg.score_debug_heatmap or cfg.overlay_mode in {"heatmap", "heatmap_topk"}:
+        if overlay_enabled and (cfg.score_debug_heatmap or cfg.overlay_mode in {"heatmap", "heatmap_topk"}):
             for idx, sr in enumerate(score_regions):
                 meta = metas[idx]
                 rps = meta.patches_per_side // cfg.region_patch_size
@@ -2053,7 +2137,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )
                 heatmap_grids.append(sr_norm.view(-1, rps, rps))
 
-        if eval_frame and (cfg.overlay_show_scores or cfg.overlay_show_ids):
+        if overlay_enabled and eval_frame and (cfg.overlay_show_scores or cfg.overlay_show_ids):
             base_dir = cfg.local_log_dir or cfg.rollout_dir
             if base_dir:
                 out_dir = Path(base_dir)
@@ -2090,24 +2174,41 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         image_pad_masks = None
         if not cfg.score_debug_heatmap and not eval_frame and cfg.token_prune_enabled:
-            image_embs = []
-            image_pad_masks = []
             with profile_range("policy.token_selection.pruned_vision_model"):
                 with torch.no_grad():
-                    for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
-                        with profile_range("policy.token_selection.pruned_vision_model.embed_pruned_vision_tokens"):
-                            pruned_embs, pruned_pad_mask = self.paligemma_with_expert.embed_image_pruned(
-                                img, keep_mask, img_mask
+                    with profile_range("policy.token_selection.pruned_vision_model.embed_pruned_vision_tokens"):
+                        if cfg.grad_score_method == "ace":
+                            image_embs, image_pad_masks = embed_pruned_images_for_token_selection(
+                                self.paligemma_with_expert.embed_image_pruned,
+                                images,
+                                keep_token_masks,
+                                img_masks,
+                                parallel_streams=cfg.ace_parallel_vit_streams,
                             )
-                        image_embs.append(pruned_embs)
-                        image_pad_masks.append(pruned_pad_mask)
+                        else:
+                            image_embs = []
+                            image_pad_masks = []
+                            for img, keep_mask, img_mask in zip(images, keep_token_masks, img_masks, strict=True):
+                                pruned_embs, pruned_pad_mask = self.paligemma_with_expert.embed_image_pruned(
+                                    img,
+                                    keep_mask,
+                                    img_mask,
+                                )
+                                image_embs.append(pruned_embs)
+                                image_pad_masks.append(pruned_pad_mask)
 
         if actions is None:
-            with profile_range("policy.token_selection.vlm_paligemma.build_prefix"):
-                prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
-            _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=image_pad_masks)
-            with profile_range("policy.token_selection.vlm_paligemma.prefix_cache"):
-                past_key_values, _ = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
+            with profile_range("policy.token_selection.prefix_cache"):
+                with profile_range("policy.token_selection.prefix_cache.embed_prefix"):
+                    prefix_embs, prefix_pad_masks, prefix_att_masks = build_prefix(image_embs, image_pad_masks)
+                _trace_prefix_tokens(prefix_pad_masks, image_pad_masks=image_pad_masks)
+                lm_range = (
+                    "policy.token_selection.prefix_cache.language_model.pruned"
+                    if image_pad_masks is not None
+                    else "policy.token_selection.prefix_cache.language_model.full"
+                )
+                with profile_range(lm_range):
+                    past_key_values, _ = compute_prefix_cache(prefix_embs, prefix_pad_masks, prefix_att_masks)
             with profile_range("policy.token_selection.action_expert.run_diffusion"):
                 with torch.no_grad():
                     actions, _, _ = run_diffusion(
@@ -2167,15 +2268,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 f"pruned_vision_applied={bool(not eval_frame and cfg.token_prune_enabled and image_pad_masks is not None)}"
             )
             for row in prune_debug_rows:
-                _trace(
-                    "[token_trace][vision_prune] "
-                    f"img={row['image_idx']} tokens={row['patch_tokens']}+{row['extra_tokens']} "
-                    f"kept={row['kept_patch_tokens']}/{row['total_patch_tokens']} "
-                    f"regions_kept={row['kept_regions']} valid_regions={row['valid_regions']} "
-                    f"score_source={row['score_source']} dynamic={row['dynamic_mode']} "
-                    f"target_keep_tokens={row['target_keep_tokens']} "
-                    f"evict={row['evict_mode']}:{row['evict_ratio']} evicted_regions={row['evicted_regions']}"
-                )
+                try:
+                    kept_regions = (
+                        row['kept_regions'].cpu().tolist()
+                        if isinstance(row.get('kept_regions'), torch.Tensor)
+                        else row.get('kept_regions')
+                    )
+                    valid_regions = (
+                        row['valid_regions'].cpu().tolist()
+                        if isinstance(row.get('valid_regions'), torch.Tensor)
+                        else row.get('valid_regions')
+                    )
+                    kept_patch_tokens = (
+                        row['kept_patch_tokens'].cpu().tolist()
+                        if isinstance(row.get('kept_patch_tokens'), torch.Tensor)
+                        else row.get('kept_patch_tokens')
+                    )
+                    _trace(
+                        "[token_trace][vision_prune] "
+                        f"img={row['image_idx']} tokens={row['patch_tokens']}+{row['extra_tokens']} "
+                        f"kept={kept_patch_tokens}/{row['total_patch_tokens']} "
+                        f"regions_kept={kept_regions} valid_regions={valid_regions} "
+                        f"score_source={row['score_source']} dynamic={row['dynamic_mode']} "
+                        f"target_keep_tokens={row['target_keep_tokens']} "
+                        f"evict={row['evict_mode']}:{row['evict_ratio']} evicted_regions={row['evicted_regions']}"
+                    )
+                except Exception:
+                    _trace(
+                        "[token_trace][vision_prune] "
+                        f"img={row['image_idx']} tokens={row['patch_tokens']}+{row['extra_tokens']} "
+                        f"kept={row.get('kept_patch_tokens')}"
+                    )
 
         _need_l1 = (cfg.ace_plot_actions_l1
                      or cfg.dynamic_prune_mode in ("l1_threshold", "ema", "accel", "velocity"))
@@ -2310,17 +2433,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if _act.numel() > 0 and (_act[..., -1] > cfg.gripper_close_threshold).any().item():
                 token_state.pending_global_pool_restore = True
 
-        for bucket, elapsed_ms in breakdown_cuda_ms.items():
-            if bucket in self._cuda_latency_ms:
-                self._cuda_latency_ms[bucket].append(float(elapsed_ms))
-        for bucket, peak_mb in breakdown_memory_mb.items():
-            if bucket in self._cuda_memory_mb:
-                self._cuda_memory_mb[bucket].append(float(peak_mb))
-
-        latency_bucket = "scoring_frame" if eval_frame else (
-            "pruned_frame" if cfg.token_prune_enabled else "token_selection_unpruned"
-        )
-        self._record_cuda_latency(latency_timer, latency_bucket)
         token_state.frame_idx += 1
 
         return actions
@@ -2333,11 +2445,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         timestep,
         output_attentions: bool = False,
         return_suffix_out: bool = False,
+        denoise_static_inputs: tuple[Tensor, Tensor] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
 
-        suffix_len = suffix_pad_masks.shape[1]
+        suffix_len = suffix_embs.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
@@ -2353,36 +2466,47 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 )
                 self._trace_last_denoise_frame = frame_idx
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        attentions = None
-        if output_attentions:
-            outputs_embeds, _, attentions = self.paligemma_with_expert.forward(
-                attention_mask=full_att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=[None, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-                output_attentions=True,
+        if denoise_static_inputs is None:
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(
+                full_att_2d_masks,
+                dtype=self._expert_attention_dtype(),
             )
         else:
-            outputs_embeds, _ = self.paligemma_with_expert.forward(
-                attention_mask=full_att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=[None, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
+            full_att_2d_masks_4d, position_ids = denoise_static_inputs
+
+        attentions = None
+        expert_model = self.paligemma_with_expert.gemma_expert.model
+        prev_attn_impl = expert_model.config._attn_implementation  # noqa: SLF001
+        if output_attentions:
+            expert_model.config._attn_implementation = "eager"  # noqa: SLF001
+        try:
+            if output_attentions:
+                outputs_embeds, _, attentions = self.paligemma_with_expert.forward(
+                    attention_mask=full_att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=[None, suffix_embs],
+                    use_cache=False,
+                    adarms_cond=[None, adarms_cond],
+                    output_attentions=True,
+                )
+            else:
+                outputs_embeds, _ = self.paligemma_with_expert.forward(
+                    attention_mask=full_att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=[None, suffix_embs],
+                    use_cache=False,
+                    adarms_cond=[None, adarms_cond],
+                )
+        finally:
+            if output_attentions:
+                expert_model.config._attn_implementation = prev_attn_impl  # noqa: SLF001
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -2710,8 +2834,6 @@ class PI05Policy(PreTrainedPolicy):
         device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-
         if len(present_img_keys) == 0:
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. "
@@ -2752,13 +2874,6 @@ class PI05Policy(PreTrainedPolicy):
             # Create mask (all ones for real images)
             bsize = img.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            img_masks.append(mask)
-
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
-            images.append(img)
             img_masks.append(mask)
 
         return images, img_masks

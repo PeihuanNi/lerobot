@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import runpy
 import sys
+import os
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -20,6 +21,8 @@ import torch.cuda.nvtx as nvtx
 
 def _emit_cuda_nvtx_smoke() -> None:
     if not torch.cuda.is_available():
+        return
+    if os.environ.get("LEROBOT_NSYS_DISABLE_SYNC", "").strip().lower() in {"1", "true", "yes", "on"}:
         return
 
     device = torch.device("cuda")

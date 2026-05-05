@@ -42,6 +42,7 @@ class PI05Config(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
+    attn_implementation: str = "eager"  # ACE eval can opt into "sdpa" for pruned prefix LM speedups.
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
@@ -86,6 +87,7 @@ class PI05Config(PreTrainedConfig):
     ace_variant: str = "original"   # "original" = ReLU | "abs_heads" = mean_h(|g*A|) | "direct" = signed mean_h(g*A) | "dimension_independent" = per-dim backprop
     ace_objective: str = "vector_field_L2"  # "action_sample_L1" | "action_sample_L2" | "vector_field_L2"
     ace_plot_actions_l1: bool = False  # save per-episode action L1 norm curve
+    ace_parallel_vit_streams: bool = True  # ACE-only: parallelize/batch multi-camera ViT work.
 
     # -- Shared attention params --
     attn_num_layers: int = 1       # avg attention over last N Expert layers (1=last only, 18=all)
@@ -197,9 +199,11 @@ class PI05Config(PreTrainedConfig):
     #      "heatmap"      — continuous jet colormap; pruned regions darkened+hatched
     #      "heatmap_topk" — only top-k high-score regions are colored; others stay raw
     #      "label"        — discrete 5-color overlay (green/yellow/red/blue/transparent)
+    #    overlay_enabled disables overlay state extraction/rendering entirely.
     #    score_debug_heatmap overrides everything: forces every-frame scoring,
     #    disables pruning, shows pure heatmap without prune marks.
     # ═══════════════════════════════════════════════════════════════════════
+    overlay_enabled: bool = True
     overlay_mode: str = "heatmap"       # "heatmap" | "heatmap_topk" | "label"
     overlay_topk: int = 16
     overlay_score_threshold: float = 0.0
@@ -321,6 +325,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        valid_attn_implementations = {"eager", "sdpa", "flash_attention_2"}
+        if self.attn_implementation not in valid_attn_implementations:
+            raise ValueError(f"Invalid attn_implementation: {self.attn_implementation}")
 
         if self.token_selection_enabled:
             valid_grad_methods = {

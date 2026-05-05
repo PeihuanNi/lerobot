@@ -6,6 +6,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-}"   # e.g. "./outputs/eval/my_eval"; empty = auto-gen
 # POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_PATH="/home/nipeihuan/models/pi05_libero_finetuned"
 POLICY_TYPE="pi05"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"  # empty => sdpa only for ACE token-selection, eager otherwise.
+ACE_PARALLEL_VIT_STREAMS="${ACE_PARALLEL_VIT_STREAMS:-true}"  # ACE-only multi-camera ViT parallelism.
 N_ACTION_STEPS=10 # available action chunk
 
 MUJOCO_GL="egl"
@@ -17,11 +19,11 @@ LIBGL_ALWAYS_SOFTWARE=""
 ENV_TYPE="libero"
 # ENV_TASK="libero_spatial, libero_object, libero_goal, libero_10"
 # ENV_TASK_ID="[0,1,2,3,4,5,6,7,8,9]"
-ENV_TASK="libero_object"
+ENV_TASK="libero_10"
 ENV_TASK_ID="[0]"
 EVAL_BATCH_SIZE=1
-EVAL_N_EPISODES=1
-MAX_EPISODES_RENDERED=0             # 0 = no video; >0 = save that many mp4s
+EVAL_N_EPISODES=10
+MAX_EPISODES_RENDERED=10             # 0 = no video; >0 = save that many mp4s
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0. Profiling
@@ -60,22 +62,29 @@ USE_L1_REGRESSION=false
 USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
-TOKEN_SELECTION_ENABLED=true
-TOKEN_PRUNE_ENABLED=true
+TOKEN_SELECTION_ENABLED="${TOKEN_SELECTION_ENABLED:-true}"  # Allow override via env var
+TOKEN_PRUNE_ENABLED="${TOKEN_PRUNE_ENABLED:-true}"  # Allow override via env var
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
 # ══════════════════════════════════════════════════════════════════════════════
-GRAD_SCORE_METHOD="ace" # ace | grad_only | action_vision(attn_only alias)
+GRAD_SCORE_METHOD="${GRAD_SCORE_METHOD:-ace}" # ace | grad_only | action_vision(attn_only alias)
 SCORE_ATTN_SOURCE="action_vision"  # "action_vision" | "vision_text"
 ACE_VARIANT="abs_heads"              # original | abs_heads | direct | dimension_independent
+if [ -z "${ATTN_IMPLEMENTATION}" ]; then
+  if [ "${TOKEN_SELECTION_ENABLED}" = "true" ] && [ "${GRAD_SCORE_METHOD}" = "ace" ]; then
+    ATTN_IMPLEMENTATION="sdpa"
+  else
+    ATTN_IMPLEMENTATION="eager"
+  fi
+fi
 
 # -- ace --
 ACE_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
-ACE_USE_RESIDUAL=true          # true = full Chefer residual propagation across all layers
+ACE_USE_RESIDUAL=false         # true = full Chefer residual propagation across all layers; false is cheaper
 ACE_ACTION_START=5              # first action step for objective (0-indexed)
 ACE_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
-ACE_OBJECTIVE="action_sample_L2"    # action_sample_L1 | action_sample_L2 | vector_field_L2
+ACE_OBJECTIVE="action_sample_L1"    # action_sample_L1 | action_sample_L2 | vector_field_L2
 ACE_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 
 # -- Shared attention params --
@@ -101,7 +110,7 @@ GRAD_KEEP_PREV=false
 DYNAMIC_PRUNE_MODE="accel"  # "none" | "l1_threshold" | "ema" | "accel" | "velocity"
 PRUNE_RATIO=96                     # fixed kept-token count (when mode="none")
 MIN_KEPT_TOKENS=64                 # aggressive (fewer kept)
-MAX_KEPT_TOKENS=128                # conservative (more kept)
+MAX_KEPT_TOKENS=64                # conservative (more kept)
 
 # -- Global Active Token Pool --
 DISCARD_PREV_KEPT_RATIO=0.5       # discard highest-scoring 10% from previous frame
@@ -129,8 +138,9 @@ REGION_EVAL_INTERVAL=2
 #    "heatmap_topk" — only top-k high-score regions are colored; others stay raw
 #    "label"        — discrete 5-color overlay
 # ══════════════════════════════════════════════════════════════════════════════
-OVERLAY_MODE="heatmap_topk"             # "heatmap" | "heatmap_topk" | "label"
-OVERLAY_TOPK=0                    # only used by "heatmap_topk"; 0 = no top-k cap
+OVERLAY_ENABLED=true                 # false = disable overlay extraction/rendering for timing comparisons
+OVERLAY_MODE="heatmap_topk"                    # "heatmap" | "heatmap_topk" | "label"; label avoids heatmap-grid work when not rendering
+OVERLAY_TOPK=64                    # only used by "heatmap_topk"; 0 = no top-k cap
 OVERLAY_SCORE_THRESHOLD=0.0        # only used by "heatmap_topk"; normalized [0, 1]
 OVERLAY_SHOW_SCORES=false
 OVERLAY_SHOW_IDS=false
@@ -159,6 +169,7 @@ fi
 
 ARGS=(
   "--policy.n_action_steps=${N_ACTION_STEPS}"
+  "--policy.attn_implementation=${ATTN_IMPLEMENTATION}"
   "--policy.use_l1_regression=${USE_L1_REGRESSION}"
   "--policy.use_diffusion=${USE_DIFFUSION}"
   "--policy.num_inference_steps=${NUM_INFERENCE_STEPS}"
@@ -173,6 +184,7 @@ ARGS=(
   "--policy.ace_variant=${ACE_VARIANT}"
   "--policy.ace_objective=${ACE_OBJECTIVE}"
   "--policy.ace_plot_actions_l1=${ACE_PLOT_ACTIONS_L1}"
+  "--policy.ace_parallel_vit_streams=${ACE_PARALLEL_VIT_STREAMS}"
   "--policy.attn_num_layers=${ATTN_NUM_LAYERS}"
   "--policy.attn_num_denoise_steps=${ATTN_NUM_DENOISE_STEPS}"
   "--policy.attn_score_beta=${ATTN_SCORE_BETA}"
@@ -196,6 +208,7 @@ ARGS=(
   # 3. Eval Interval
   "--policy.region_eval_interval=${REGION_EVAL_INTERVAL}"
   # 4. Overlay
+  "--policy.overlay_enabled=${OVERLAY_ENABLED}"
   "--policy.overlay_mode=${OVERLAY_MODE}"
   "--policy.overlay_topk=${OVERLAY_TOPK}"
   "--policy.overlay_score_threshold=${OVERLAY_SCORE_THRESHOLD}"
@@ -260,6 +273,9 @@ ENV_VARS=(
   "MUJOCO_GL=${MUJOCO_GL}"
   "PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM}"
 )
+if [ "${PROFILE_MODE}" = "nsys" ]; then
+  ENV_VARS+=("LEROBOT_NSYS_DISABLE_SYNC=true")
+fi
 if [ -n "${EGL_PLATFORM}" ]; then
   ENV_VARS+=("EGL_PLATFORM=${EGL_PLATFORM}")
 fi
