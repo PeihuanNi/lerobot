@@ -266,7 +266,7 @@ def _apply_heatmap_overlay(
     img,
     heatmap_grid,
     region_scores=None,
-    alpha=0.5,
+    alpha=0.3,
     keep_grid=None,
     prune_darken=0.5,
     prune_stripe_gap=4,
@@ -313,10 +313,16 @@ def _apply_heatmap_overlay(
         return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
     heat_rgb = _jet_colormap(hm_up)
-    blended = (
-        img_np.astype(np.float32) * (1.0 - alpha) + heat_rgb.astype(np.float32) * alpha
-    ).astype(np.uint8)
 
+    # ── Build pruned mask up front (pixel-level) ─────────────────────────
+    pruned_mask = None
+    if keep_grid is not None:
+        kg_arr = keep_grid.astype(np.uint8) if keep_grid.dtype != np.uint8 else keep_grid
+        kg_img = Image.fromarray(kg_arr, mode="L").resize((width, height), resample=Image.NEAREST)
+        kg_up = np.array(kg_img)
+        pruned_mask = (kg_up == 0)  # True where pruned (keep=0)
+
+    # ── Blend heatmap ONLY onto kept regions ─────────────────────────────
     sparse_mode = sparse_topk is not None or sparse_threshold is not None
     selected_mask = None
     selected_regions = None
@@ -328,15 +334,23 @@ def _apply_heatmap_overlay(
         selected_mask = (
             np.array(region_mask_img.resize((width, height), resample=Image.NEAREST)) > 0
         )
-        blended[~selected_mask] = img_np[~selected_mask]
 
-    # ── Mark pruned regions: darken + diagonal stripe hatching ────────────
-    if keep_grid is not None and not sparse_mode:
-        kg_arr = keep_grid.astype(np.uint8) if keep_grid.dtype != np.uint8 else keep_grid
-        kg_img = Image.fromarray(kg_arr, mode="L").resize((width, height), resample=Image.NEAREST)
-        kg_up = np.array(kg_img)
-        pruned_mask = (kg_up == 0)  # True where pruned (keep=0)
+    # Kept mask: regions that get heatmap color
+    kept_mask = np.ones((height, width), dtype=bool)
+    if pruned_mask is not None:
+        kept_mask &= ~pruned_mask
+    if selected_mask is not None:
+        kept_mask &= selected_mask
 
+    blended = img_np.astype(np.float32)
+    if kept_mask.any():
+        blended[kept_mask] = (
+            blended[kept_mask] * (1.0 - alpha) + heat_rgb[kept_mask].astype(np.float32) * alpha
+        )
+    blended = blended.astype(np.uint8)
+
+    # ── Pruned regions: darken + diagonal stripe hatching ─────────────────
+    if pruned_mask is not None and not sparse_mode:
         # 1) Darken pruned pixels
         blended_f = blended.astype(np.float32)
         blended_f[pruned_mask] *= prune_darken
@@ -348,9 +362,9 @@ def _apply_heatmap_overlay(
             yy, xx = np.mgrid[:height, :width]
             stripe = ((xx + yy) % prune_stripe_gap) < max(1, prune_stripe_gap // 3)
             stripe_mask = pruned_mask & stripe
-            # Blend stripe colour (white, 40% opacity) onto the darkened image
+            # Blend stripe colour (white, 15% opacity) onto the darkened image
             blended_f2 = blended.astype(np.float32)
-            blended_f2[stripe_mask] = blended_f2[stripe_mask] * 0.6 + 255.0 * 0.4
+            blended_f2[stripe_mask] = blended_f2[stripe_mask] * 0.85 + 255.0 * 0.15
             blended = blended_f2.astype(np.uint8)
 
     # ── Optionally draw region score numbers ──────────────────────────────
@@ -406,12 +420,15 @@ def _apply_overlay(img, overlay_grid, region_scores=None, alpha=0.35, show_ids=F
     overlay_labels = np.array(overlay_img)
 
     overlay_colors = np.zeros_like(img_np)
-    overlay_colors[overlay_labels == 0] = (0, 255, 0)       # green: not important
+    overlay_colors[overlay_labels == 0] = (0, 255, 0)       # green: not important (pruned)
     overlay_colors[overlay_labels == 1] = (255, 255, 0)     # yellow: gate-protected (important + cosine-static)
     overlay_colors[overlay_labels == 2] = (255, 0, 0)       # red: important foreground
     overlay_colors[overlay_labels == 3] = (0, 0, 255)       # blue: important but pruned as bg (gate didn't protect)
 
-    blended = (img_np.astype(np.float32) * (1.0 - alpha) + overlay_colors.astype(np.float32) * alpha).astype(
+    # Kept regions (label 1-3): original alpha; pruned regions (label 0): low alpha
+    pruned_alpha = 0.15
+    per_pixel_alpha = np.where(overlay_labels[..., None] >= 1, alpha, pruned_alpha).astype(np.float32)
+    blended = (img_np.astype(np.float32) * (1.0 - per_pixel_alpha) + overlay_colors.astype(np.float32) * per_pixel_alpha).astype(
         np.uint8
     )
     # label=4 (pruned bg): transparent — restore original image

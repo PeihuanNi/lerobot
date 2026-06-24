@@ -22,7 +22,7 @@ ENV_TYPE="libero"
 ENV_TASK="libero_10"
 ENV_TASK_ID="[0]"
 EVAL_BATCH_SIZE=1
-EVAL_N_EPISODES=10
+EVAL_N_EPISODES=1
 MAX_EPISODES_RENDERED=10             # 0 = no video; >0 = save that many mp4s
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,8 +62,8 @@ USE_L1_REGRESSION=false
 USE_DIFFUSION=true
 NUM_INFERENCE_STEPS=10 # denoise step
 
-TOKEN_SELECTION_ENABLED="${TOKEN_SELECTION_ENABLED:-true}"  # Allow override via env var
-TOKEN_PRUNE_ENABLED="${TOKEN_PRUNE_ENABLED:-true}"  # Allow override via env var
+TOKEN_SELECTION_ENABLED="${TOKEN_SELECTION_ENABLED:-false}"  # Allow override via env var
+TOKEN_PRUNE_ENABLED="${TOKEN_PRUNE_ENABLED:-false}"  # Allow override via env var
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Scoring Method
@@ -81,7 +81,7 @@ fi
 
 # -- ace --
 ACE_DENOISE_STEP=5            # -1 = avg all denoise steps; >=0 = specific step     ######## -1
-ACE_USE_RESIDUAL=false         # true = full Chefer residual propagation across all layers; false is cheaper
+ACE_USE_RESIDUAL=true         # true = full Chefer residual propagation across all layers; false is cheaper
 ACE_ACTION_START=5              # first action step for objective (0-indexed)
 ACE_ACTION_END=9               # last action step (exclusive); -1 = all (chunk_size)
 ACE_OBJECTIVE="action_sample_L1"    # action_sample_L1 | action_sample_L2 | vector_field_L2
@@ -91,7 +91,7 @@ ACE_PLOT_ACTIONS_L1=false              # save per-episode action L1 norm curve
 ATTN_NUM_LAYERS=6                  # avg over last N Expert layers (1=last, 18=all)
 ATTN_NUM_DENOISE_STEPS=3           # avg over last N denoise steps (1=last, 10=all)
 ATTN_SCORE_BETA=2.0
-GRAD_ACTION_AGG="max"              # sum | max
+GRAD_ACTION_AGG="sum"              # sum | max
 
 # -- General scoring --
 GRAD_REGION_EMA=0.0                # EMA smoothing (0=none)
@@ -130,7 +130,7 @@ REGION_PATCH_SIZE=1
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Eval Interval
 # ══════════════════════════════════════════════════════════════════════════════
-REGION_EVAL_INTERVAL=2
+REGION_EVAL_INTERVAL=3
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Overlay / Visualization
@@ -139,7 +139,7 @@ REGION_EVAL_INTERVAL=2
 #    "label"        — discrete 5-color overlay
 # ══════════════════════════════════════════════════════════════════════════════
 OVERLAY_ENABLED=true                 # false = disable overlay extraction/rendering for timing comparisons
-OVERLAY_MODE="heatmap_topk"                    # "heatmap" | "heatmap_topk" | "label"; label avoids heatmap-grid work when not rendering
+OVERLAY_MODE="heatmap"                    # "heatmap" | "heatmap_topk" | "label"; label avoids heatmap-grid work when not rendering
 OVERLAY_TOPK=64                    # only used by "heatmap_topk"; 0 = no top-k cap
 OVERLAY_SCORE_THRESHOLD=0.0        # only used by "heatmap_topk"; normalized [0, 1]
 OVERLAY_SHOW_SCORES=false

@@ -1174,6 +1174,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                         patch_embs.append(patch_emb)
                         metas.append(meta)
 
+                # Zero out evicted token embeddings so they don't participate
+                # in ACE scoring or prefix construction on eval frames.
+                if eval_frame and token_state.global_active_region_masks is not None:
+                    for idx, emb in enumerate(image_embs):
+                        gam = token_state.global_active_region_masks[idx]  # [B, num_regions]
+                        if gam.all():
+                            continue
+                        meta = metas[idx]
+                        evict_tok = expand_region_mask(
+                            ~gam, meta.patches_per_side, cfg.region_patch_size
+                        )  # [B, num_patches], True = evicted
+                        full_mask = torch.zeros(
+                            bsize, emb.shape[1], dtype=torch.bool, device=emb.device
+                        )
+                        full_mask[:, meta.num_extra_tokens:meta.num_extra_tokens + meta.num_patches] = evict_tok
+                        emb[full_mask] = 0.0
+
                 if token_state.last_score_token is not None:
                     if len(token_state.last_score_token) != len(patch_embs):
                         token_state.reset()
